@@ -1,0 +1,13 @@
+/bin/
+/dist/
+/coverage.out
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.DS_Store
+.idea/
+.vscode/
+.env
+.env.*
+!.env.example
+

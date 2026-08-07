@@ -1,0 +1,73 @@
+version: 2
+
+project_name: orchigram
+
+before:
+  hooks:
+    - go mod tidy
+    - make generate
+
+builds:
+  - id: orchigram
+    main: ./cmd/orchigram
+    binary: orchigram
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w
+      - -X github.com/alexrett/orchigram/internal/version.Version={{.Version}}
+      - -X github.com/alexrett/orchigram/internal/version.Commit={{.Commit}}
+      - -X github.com/alexrett/orchigram/internal/version.Date={{.Date}}
+  - id: agent-command
+    main: ./cmd/orchigram-plugin-agent-command
+    binary: orchigram-plugin-agent-command
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+  - id: exec
+    main: ./cmd/orchigram-plugin-exec
+    binary: orchigram-plugin-exec
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+  - id: http
+    main: ./cmd/orchigram-plugin-http
+    binary: orchigram-plugin-http
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+  - id: github
+    main: ./cmd/orchigram-plugin-github
+    binary: orchigram-plugin-github
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+
+archives:
+  - id: core
+    ids: [orchigram]
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+  - id: plugins
+    ids: [agent-command, exec, http, github]
+    formats: [tar.gz]
+    name_template: "{{ .Binary }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+sboms:
+  - artifacts: archive
+
+changelog:
+  use: git
+
+release:
+  draft: true
+

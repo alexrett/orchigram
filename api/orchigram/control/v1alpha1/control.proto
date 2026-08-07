@@ -1,0 +1,208 @@
+syntax = "proto3";
+
+package orchigram.control.v1alpha1;
+
+option go_package = "github.com/alexrett/orchigram/gen/orchigram/control/v1alpha1;controlv1alpha1";
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+message RequestMeta {
+  string request_id = 1;
+  string context = 2;
+}
+
+message ResourceKey {
+  string kind = 1;
+  string namespace = 2;
+  string name = 3;
+  string uid = 4;
+}
+
+message ResourceDocument {
+  ResourceKey key = 1;
+  uint64 resource_version = 2;
+  uint64 generation = 3;
+  bytes json = 4;
+}
+
+message ApplyRequest {
+  RequestMeta meta = 1;
+  bytes document = 2;
+  uint64 expected_resource_version = 3;
+  bool dry_run = 4;
+}
+
+message ApplyResponse {
+  ResourceDocument resource = 1;
+  repeated Diagnostic diagnostics = 2;
+}
+
+message GetRequest { ResourceKey key = 1; }
+message ListRequest {
+  string kind = 1;
+  string namespace = 2;
+  map<string, string> labels = 3;
+  uint32 limit = 4;
+  string continue_token = 5;
+}
+message ListResponse {
+  repeated ResourceDocument resources = 1;
+  string continue_token = 2;
+  uint64 revision = 3;
+}
+message DeleteRequest {
+  RequestMeta meta = 1;
+  ResourceKey key = 2;
+  uint64 expected_resource_version = 3;
+}
+message WatchRequest {
+  string kind = 1;
+  string namespace = 2;
+  uint64 after_revision = 3;
+}
+message ResourceEvent {
+  uint64 revision = 1;
+  string type = 2;
+  ResourceDocument resource = 3;
+  google.protobuf.Timestamp observed_at = 4;
+}
+message ExportRequest { repeated ResourceKey keys = 1; }
+message ExportResponse { bytes yaml = 1; }
+
+message Diagnostic {
+  enum Severity {
+    SEVERITY_UNSPECIFIED = 0;
+    SEVERITY_INFO = 1;
+    SEVERITY_WARNING = 2;
+    SEVERITY_ERROR = 3;
+  }
+  Severity severity = 1;
+  string path = 2;
+  string code = 3;
+  string message = 4;
+}
+
+message CompileRequest { bytes flow = 1; }
+message CompileResponse {
+  bytes execution_plan_json = 1;
+  string plan_hash = 2;
+  repeated Diagnostic diagnostics = 3;
+}
+message PreviewGraphRequest { bytes flow_or_plan = 1; }
+message GraphNode { string id = 1; string label = 2; string action = 3; }
+message GraphEdge { string from = 1; string to = 2; string condition = 3; }
+message PreviewGraphResponse { repeated GraphNode nodes = 1; repeated GraphEdge edges = 2; repeated Diagnostic diagnostics = 3; }
+
+message StartRunRequest {
+  RequestMeta meta = 1;
+  string flow = 2;
+  bytes input_json = 3;
+  string idempotency_key = 4;
+  string trigger_receipt_uid = 5;
+}
+message RunRef { string uid = 1; }
+message RunRequest { string uid = 1; }
+message ListRunsRequest { string flow = 1; string phase = 2; uint32 limit = 3; }
+message RunSummary {
+  string uid = 1;
+  string flow = 2;
+  string phase = 3;
+  string plan_hash = 4;
+  string interpreter_version = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+message ListRunsResponse { repeated RunSummary runs = 1; }
+message WatchRunRequest { string uid = 1; uint64 after_sequence = 2; }
+message RunEvent {
+  uint64 sequence = 1;
+  string run_uid = 2;
+  string node_id = 3;
+  uint32 attempt = 4;
+  string type = 5;
+  bytes payload_json = 6;
+  google.protobuf.Timestamp occurred_at = 7;
+}
+message ApprovalRequest { RequestMeta meta = 1; string run_uid = 2; string node_id = 3; string reason = 4; }
+message CancelRunRequest { RequestMeta meta = 1; string run_uid = 2; string reason = 3; }
+message ReconcileRequest { string run_uid = 1; }
+
+message TriggerRequest { string uid = 1; }
+message NextOccurrencesRequest { string uid = 1; uint32 count = 2; }
+message Occurrence { string identity = 1; google.protobuf.Timestamp scheduled_at = 2; }
+message NextOccurrencesResponse { repeated Occurrence occurrences = 1; }
+message ReceiptRequest { string trigger_uid = 1; uint32 limit = 2; }
+message TriggerReceipt {
+  string uid = 1;
+  string trigger_uid = 2;
+  string occurrence_id = 3;
+  string run_uid = 4;
+  bool deduplicated = 5;
+  google.protobuf.Timestamp accepted_at = 6;
+}
+message ReceiptResponse { repeated TriggerReceipt receipts = 1; }
+
+message PluginUploadRequest { RequestMeta meta = 1; bytes bundle_chunk = 2; bool final = 3; }
+message PluginInstallResponse { string name = 1; string version = 2; string digest = 3; repeated Diagnostic diagnostics = 4; }
+message PluginRequest { string name = 1; string version = 2; }
+message PluginInfo { string name = 1; string version = 2; string digest = 3; string state = 4; repeated string capabilities = 5; }
+message ListPluginsResponse { repeated PluginInfo plugins = 1; }
+message DoctorResponse { repeated Diagnostic diagnostics = 1; }
+
+message SystemInfo {
+  string version = 1;
+  string protocol_version = 2;
+  string hostname = 3;
+  string os = 4;
+  string architecture = 5;
+  int64 process_id = 6;
+  google.protobuf.Timestamp started_at = 7;
+  repeated string capabilities = 8;
+}
+message HealthResponse { bool ready = 1; repeated Diagnostic diagnostics = 2; }
+message BackupRequest { string destination = 1; }
+message BackupResponse { string path = 1; string sha256 = 2; }
+
+service ResourceService {
+  rpc Apply(ApplyRequest) returns (ApplyResponse);
+  rpc Validate(ApplyRequest) returns (ApplyResponse);
+  rpc Get(GetRequest) returns (ResourceDocument);
+  rpc List(ListRequest) returns (ListResponse);
+  rpc Delete(DeleteRequest) returns (google.protobuf.Empty);
+  rpc Watch(WatchRequest) returns (stream ResourceEvent);
+  rpc Export(ExportRequest) returns (ExportResponse);
+}
+service FlowService {
+  rpc Compile(CompileRequest) returns (CompileResponse);
+  rpc PreviewGraph(PreviewGraphRequest) returns (PreviewGraphResponse);
+}
+service RunService {
+  rpc Start(StartRunRequest) returns (RunRef);
+  rpc List(ListRunsRequest) returns (ListRunsResponse);
+  rpc WatchEvents(WatchRunRequest) returns (stream RunEvent);
+  rpc Approve(ApprovalRequest) returns (google.protobuf.Empty);
+  rpc Reject(ApprovalRequest) returns (google.protobuf.Empty);
+  rpc Cancel(CancelRunRequest) returns (google.protobuf.Empty);
+  rpc Reconcile(ReconcileRequest) returns (RunSummary);
+}
+service TriggerService {
+  rpc Next(NextOccurrencesRequest) returns (NextOccurrencesResponse);
+  rpc Enable(TriggerRequest) returns (google.protobuf.Empty);
+  rpc Disable(TriggerRequest) returns (google.protobuf.Empty);
+  rpc Receipts(ReceiptRequest) returns (ReceiptResponse);
+}
+service PluginService {
+  rpc Install(stream PluginUploadRequest) returns (PluginInstallResponse);
+  rpc Enable(PluginRequest) returns (google.protobuf.Empty);
+  rpc Disable(PluginRequest) returns (google.protobuf.Empty);
+  rpc List(google.protobuf.Empty) returns (ListPluginsResponse);
+  rpc Describe(PluginRequest) returns (PluginInfo);
+  rpc Doctor(PluginRequest) returns (DoctorResponse);
+}
+service SystemService {
+  rpc Info(google.protobuf.Empty) returns (SystemInfo);
+  rpc Health(google.protobuf.Empty) returns (HealthResponse);
+  rpc Backup(BackupRequest) returns (BackupResponse);
+}
+
