@@ -2,9 +2,9 @@
 
 ## Foundation
 
-- [ ] FND-01: Clean Apache-2.0 Go repository with reproducible protobuf generation.
-- [ ] FND-02: Control and plugin APIs are versioned, linted, and backward-compatibility checked.
-- [ ] FND-03: Linux/macOS amd64/arm64 builds for core and four plugins.
+- [x] FND-01: Clean Apache-2.0 Go repository with reproducible protobuf generation.
+- [x] FND-02: Control and plugin APIs are versioned, linted, and backward-compatibility checked.
+- [x] FND-03: Linux/macOS amd64/arm64 builds for core and four plugins.
 
 ## Resource and execution core
 
@@ -43,4 +43,3 @@
 - [ ] PUB-01: Tests, secret scan, license inventory, SBOM, reproducible artifacts and attestations.
 - [ ] PUB-02: Backup/restore, active-run upgrade, plugin rollback, clean Ubuntu installation.
 - [ ] PUB-03: Documentation reproduces both end-to-end tracers before public v0.1.0.
-
