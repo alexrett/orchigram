@@ -1,11 +1,11 @@
 # Project state
 
 Status: executing
-Current phase: 5 of 7
-Current plan: 05-01
-Progress: 4/7 plans
+Current phase: 6 of 7
+Current plan: 06-01
+Progress: 5/7 plans
 Last activity: 2026-08-08
-Current focus: GitHub issue-to-PR SDLC tracer
+Current focus: k9s-level TUI, SSH contexts, and hardened remote installation
 
 ## Decisions
 
@@ -16,6 +16,7 @@ Current focus: GitHub issue-to-PR SDLC tracer
 - Phase 2 fixed the immutable plan, transactional outbox, durable approval, and stateless TUI execution boundaries.
 - Phase 3 fixed immutable bundle, AutoMTLS plugin process, redaction, and process-tree cancellation boundaries.
 - Phase 4 fixed native schedule identities, durable webhook/provider acknowledgements, and declarative output mappings.
+- Phase 5 fixed GitHub issue-event cursors, run-isolated git workspaces, deterministic branches, and mutation reconciliation.
 
 ## Blockers
 

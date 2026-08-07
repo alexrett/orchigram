@@ -28,9 +28,9 @@
 
 ## GitHub tracer
 
-- [ ] GIT-01: GitHub issue polling with stable cursor/event identity.
-- [ ] GIT-02: Isolated workspace plan/approval/implement/test/push/PR workflow.
-- [ ] GIT-03: Hidden-marker and deterministic-branch reconciliation prevents duplicate mutations.
+- [x] GIT-01: GitHub issue polling with stable cursor/event identity.
+- [x] GIT-02: Isolated workspace plan/approval/implement/test/push/PR workflow.
+- [x] GIT-03: Hidden-marker and deterministic-branch reconciliation prevents duplicate mutations.
 
 ## Operator surface
 
