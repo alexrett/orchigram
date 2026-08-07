@@ -8,10 +8,10 @@
 
 ## Resource and execution core
 
-- [ ] CORE-01: Strict resources with metadata, CAS revisions, generations, events, and audit.
-- [ ] CORE-02: Strict Flow compilation, CEL validation, finite-cycle validation, canonical plan hash.
-- [ ] CORE-03: Durable trigger receipt plus transactional outbox and one Run UID per occurrence.
-- [ ] CORE-04: Pinned execution plan, durable approvals, cancellation, events, and recovery.
+- [x] CORE-01: Strict resources with metadata, CAS revisions, generations, events, and audit.
+- [x] CORE-02: Strict Flow compilation, CEL validation, finite-cycle validation, canonical plan hash.
+- [x] CORE-03: Durable trigger receipt plus transactional outbox and one Run UID per occurrence.
+- [x] CORE-04: Pinned execution plan, durable approvals, cancellation, events, and recovery.
 
 ## Plugins
 

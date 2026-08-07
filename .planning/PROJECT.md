@@ -30,6 +30,6 @@ Install one Go distribution on a server, connect through a Unix socket or an SSH
 
 ## Current state
 
-Phase 1 complete: repository and protocol foundation verified. Phase 2 is implementing the manual durable walking skeleton.
+Phases 1-2 complete: the repository/protocol foundation and restart-safe manual walking skeleton are verified. Phase 3 is implementing isolated production plugins and agent execution.
 
-Last updated: 2026-08-07
+Last updated: 2026-08-08
