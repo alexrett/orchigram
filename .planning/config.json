@@ -1,0 +1,14 @@
+{
+  "mode": "yolo",
+  "response_language": "Russian",
+  "planning": {
+    "commit_docs": true
+  },
+  "workflow": {
+    "use_worktrees": false,
+    "parallelization": false,
+    "inline_plan_threshold": 99,
+    "test_gate_timeout": 900
+  }
+}
+
