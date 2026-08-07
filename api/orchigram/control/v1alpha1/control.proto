@@ -141,7 +141,15 @@ message TriggerReceipt {
   bool deduplicated = 5;
   google.protobuf.Timestamp accepted_at = 6;
 }
-message ReceiptResponse { repeated TriggerReceipt receipts = 1; }
+message TriggerSkip {
+  string occurrence_id = 1;
+  string reason = 2;
+  google.protobuf.Timestamp scheduled_at = 3;
+}
+message ReceiptResponse {
+  repeated TriggerReceipt receipts = 1;
+  repeated TriggerSkip skips = 2;
+}
 
 message PluginUploadRequest { RequestMeta meta = 1; bytes bundle_chunk = 2; bool final = 3; }
 message PluginInstallResponse { string name = 1; string version = 2; string digest = 3; repeated Diagnostic diagnostics = 4; }
@@ -205,4 +213,3 @@ service SystemService {
   rpc Health(google.protobuf.Empty) returns (HealthResponse);
   rpc Backup(BackupRequest) returns (BackupResponse);
 }
-

@@ -72,6 +72,21 @@ func runWithApplication(ctx context.Context, client *clientpkg.Client, applicati
 			application.SetFocus(graph)
 		})
 	}
+	triggers, err := client.Resources.List(ctx, &controlv1alpha1.ListRequest{Kind: "Trigger", Namespace: "default", Limit: 200})
+	if err != nil {
+		return err
+	}
+	navigation.AddItem("Triggers", "", 0, nil)
+	for _, item := range triggers.GetResources() {
+		item := item
+		navigation.AddItem("  "+item.GetKey().GetName(), "", 0, func() {
+			currentRun = ""
+			if cancelRunWatch != nil {
+				cancelRunWatch()
+			}
+			openTriggerDetail(ctx, application, pages, client, item, inspector, events, navigation)
+		})
+	}
 	runs, err := client.Runs.List(ctx, &controlv1alpha1.ListRunsRequest{Limit: 200})
 	if err != nil {
 		return err
@@ -168,6 +183,76 @@ func runWithApplication(ctx context.Context, client *clientpkg.Client, applicati
 	})
 	go func() { <-ctx.Done(); application.QueueUpdateDraw(application.Stop) }()
 	return application.SetRoot(pages, true).SetFocus(navigation).Run()
+}
+
+func openTriggerDetail(ctx context.Context, application *tview.Application, pages *tview.Pages, client *clientpkg.Client, document *controlv1alpha1.ResourceDocument, inspector, events *tview.TextView, returnFocus tview.Primitive) {
+	trigger, err := resource.DecodeTrigger(document.GetJson())
+	if err != nil {
+		events.SetText("[red]" + escape(err.Error()))
+		return
+	}
+	source := "unknown"
+	switch {
+	case trigger.Spec.Schedule != nil:
+		source = fmt.Sprintf("schedule %s (%s)", trigger.Spec.Schedule.Cron, valueOr(trigger.Spec.Schedule.Timezone, "UTC"))
+	case trigger.Spec.Webhook != nil:
+		source = "webhook (bearer SecretRef: " + trigger.Spec.Webhook.BearerSecretRef + ")"
+	case trigger.Spec.Provider != nil:
+		source = "provider " + trigger.Spec.Provider.Plugin
+	}
+	detail := fmt.Sprintf("[yellow::b]%s[-:-:-]\n\n[gray]UID[-]     %s\n[gray]Flow[-]    %s\n[gray]Source[-]  %s", escape(trigger.Metadata.Name), escape(trigger.Metadata.UID), escape(trigger.Spec.Flow), escape(source))
+	if trigger.Spec.Schedule != nil {
+		response, nextErr := client.Triggers.Next(ctx, &controlv1alpha1.NextOccurrencesRequest{Uid: trigger.Metadata.UID, Count: 1})
+		if nextErr == nil && len(response.GetOccurrences()) > 0 {
+			detail += "\n[gray]Next[-]    " + response.GetOccurrences()[0].GetScheduledAt().AsTime().Format(time.RFC3339)
+		}
+	}
+	receipts, receiptsErr := client.Triggers.Receipts(ctx, &controlv1alpha1.ReceiptRequest{TriggerUid: trigger.Metadata.UID, Limit: 1})
+	if receiptsErr == nil {
+		if len(receipts.GetReceipts()) > 0 {
+			last := receipts.GetReceipts()[0]
+			detail += fmt.Sprintf("\n[gray]Last run[-] %s\n[gray]Receipt[-]  %s", escape(last.GetRunUid()), escape(last.GetOccurrenceId()))
+		}
+		if len(receipts.GetSkips()) > 0 {
+			last := receipts.GetSkips()[0]
+			detail += fmt.Sprintf("\n[gray]Last skip[-] %s (%s)", escape(last.GetReason()), last.GetScheduledAt().AsTime().Format(time.RFC3339))
+		}
+	}
+	inspector.SetText(detail)
+	modal := tview.NewModal().SetText(tview.Escape(fmt.Sprintf("Trigger %s\n\nFlow: %s\nSource: %s\n\nEnable/Disable changes durable controller state without rewriting YAML.", trigger.Metadata.Name, trigger.Spec.Flow, source))).AddButtons([]string{"Enable", "Disable", "Close"})
+	modal.SetDoneFunc(func(buttonIndex int, _ string) {
+		if buttonIndex < 2 {
+			operationContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			request := &controlv1alpha1.TriggerRequest{Uid: trigger.Metadata.UID}
+			var operationErr error
+			if buttonIndex == 0 {
+				_, operationErr = client.Triggers.Enable(operationContext, request)
+			} else {
+				_, operationErr = client.Triggers.Disable(operationContext, request)
+			}
+			if operationErr != nil {
+				events.SetText("[red]" + escape(operationErr.Error()))
+			} else {
+				state := "enabled"
+				if buttonIndex == 1 {
+					state = "disabled"
+				}
+				events.SetText("[green]Trigger " + escape(trigger.Metadata.Name) + " " + state)
+			}
+		}
+		pages.RemovePage("trigger")
+		application.SetFocus(returnFocus)
+	})
+	pages.AddPage("trigger", centered(modal, 76, 18), true, true)
+	application.SetFocus(modal)
+}
+
+func valueOr(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
 }
 
 func watchRun(ctx context.Context, application *tview.Application, client *clientpkg.Client, graph *Graph, events *tview.TextView, runUID string) {

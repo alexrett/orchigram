@@ -414,10 +414,20 @@ type Receipt struct {
 	RunUID       string
 	Deduplicated bool
 	AcceptedAt   time.Time
+	Existing     bool
 }
 
 // AcceptTrigger persists a receipt and outbox command in one transaction.
 func (s *Store) AcceptTrigger(ctx context.Context, triggerUID, occurrenceID, flowName, namespace string, input json.RawMessage, deduplicated bool) (Receipt, error) {
+	return s.acceptTrigger(ctx, triggerUID, occurrenceID, flowName, namespace, input, deduplicated, "", "")
+}
+
+// AcceptProviderTrigger persists receipt, outbox, and provider cursor atomically.
+func (s *Store) AcceptProviderTrigger(ctx context.Context, triggerUID, occurrenceID, flowName, namespace string, input json.RawMessage, cursor string) (Receipt, error) {
+	return s.acceptTrigger(ctx, triggerUID, occurrenceID, flowName, namespace, input, true, cursor, occurrenceID)
+}
+
+func (s *Store) acceptTrigger(ctx context.Context, triggerUID, occurrenceID, flowName, namespace string, input json.RawMessage, deduplicated bool, providerCursor, providerEventID string) (Receipt, error) {
 	if namespace == "" {
 		namespace = resource.DefaultNamespace
 	}
@@ -431,6 +441,12 @@ func (s *Store) AcceptTrigger(ctx context.Context, triggerUID, occurrenceID, flo
 	defer func() { _ = tx.Rollback() }()
 	existing, err := receiptByOccurrence(ctx, tx, triggerUID, occurrenceID)
 	if err == nil {
+		existing.Existing = true
+		if providerCursor != "" {
+			if err := upsertProviderCursor(ctx, tx, triggerUID, providerCursor, providerEventID, s.timestamp()); err != nil {
+				return Receipt{}, err
+			}
+		}
 		return existing, tx.Commit()
 	}
 	if !errors.Is(err, ErrNotFound) {
@@ -447,10 +463,20 @@ func (s *Store) AcceptTrigger(ctx context.Context, triggerUID, occurrenceID, flo
 	if _, err := tx.ExecContext(ctx, `INSERT INTO outbox(command_type,aggregate_uid,idempotency_key,payload_json,state,available_at) VALUES(?,?,?,?,?,?)`, "start-run", receipt.RunUID, payload.IdempotencyKey, payloadJSON, "pending", now); err != nil {
 		return Receipt{}, err
 	}
+	if providerCursor != "" {
+		if err := upsertProviderCursor(ctx, tx, triggerUID, providerCursor, providerEventID, now); err != nil {
+			return Receipt{}, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return Receipt{}, err
 	}
 	return receipt, nil
+}
+
+func upsertProviderCursor(ctx context.Context, tx *sql.Tx, triggerUID, cursor, eventID, now string) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO provider_cursors(trigger_uid,cursor,provider_event_id,acknowledged_at) VALUES(?,?,?,?) ON CONFLICT(trigger_uid) DO UPDATE SET cursor=excluded.cursor,provider_event_id=excluded.provider_event_id,acknowledged_at=excluded.acknowledged_at`, triggerUID, cursor, eventID, now)
+	return err
 }
 
 func receiptByOccurrence(ctx context.Context, tx *sql.Tx, triggerUID, occurrenceID string) (Receipt, error) {
@@ -458,6 +484,24 @@ func receiptByOccurrence(ctx context.Context, tx *sql.Tx, triggerUID, occurrence
 	var deduplicated int
 	var accepted string
 	if err := tx.QueryRowContext(ctx, `SELECT uid,trigger_uid,occurrence_id,run_uid,deduplicated,accepted_at FROM trigger_receipts WHERE trigger_uid=? AND occurrence_id=?`, triggerUID, occurrenceID).Scan(&receipt.UID, &receipt.TriggerUID, &receipt.OccurrenceID, &receipt.RunUID, &deduplicated, &accepted); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Receipt{}, ErrNotFound
+		}
+		return Receipt{}, err
+	}
+	receipt.Deduplicated = deduplicated == 1
+	receipt.AcceptedAt, _ = time.Parse(time.RFC3339Nano, accepted)
+	return receipt, nil
+}
+
+// ReceiptByOccurrence returns the durable receipt for a stable trigger identity.
+// Controllers use this read before concurrency checks so replaying the same
+// occurrence advances its cursor instead of being misclassified as overlap.
+func (s *Store) ReceiptByOccurrence(ctx context.Context, triggerUID, occurrenceID string) (Receipt, error) {
+	var receipt Receipt
+	var deduplicated int
+	var accepted string
+	if err := s.db.QueryRowContext(ctx, `SELECT uid,trigger_uid,occurrence_id,run_uid,deduplicated,accepted_at FROM trigger_receipts WHERE trigger_uid=? AND occurrence_id=?`, triggerUID, occurrenceID).Scan(&receipt.UID, &receipt.TriggerUID, &receipt.OccurrenceID, &receipt.RunUID, &deduplicated, &accepted); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Receipt{}, ErrNotFound
 		}
@@ -846,6 +890,186 @@ func (s *Store) ListPlugins(ctx context.Context) ([]PluginRecord, error) {
 		result = append(result, record)
 	}
 	return result, rows.Err()
+}
+
+// TriggerState is the durable controller cursor for one resource generation.
+type TriggerState struct {
+	TriggerUID string
+	Generation uint64
+	Enabled    bool
+	CursorAt   time.Time
+}
+
+// TriggerSkip is a durable non-run occurrence decision.
+type TriggerSkip struct {
+	TriggerUID   string
+	OccurrenceID string
+	Reason       string
+	ScheduledAt  time.Time
+}
+
+// EnsureTriggerState creates a cursor or resets it when the resource generation changes.
+func (s *Store) EnsureTriggerState(ctx context.Context, triggerUID string, generation uint64, enabled bool, initialCursor time.Time) (TriggerState, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return TriggerState{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var state TriggerState
+	var enabledValue int
+	var cursor string
+	err = tx.QueryRowContext(ctx, `SELECT trigger_uid,generation,enabled,cursor_at FROM trigger_states WHERE trigger_uid=?`, triggerUID).Scan(&state.TriggerUID, &state.Generation, &enabledValue, &cursor)
+	if errors.Is(err, sql.ErrNoRows) {
+		now := s.timestamp()
+		if _, err := tx.ExecContext(ctx, `INSERT INTO trigger_states(trigger_uid,generation,enabled,cursor_at,updated_at) VALUES(?,?,?,?,?)`, triggerUID, generation, boolInt(enabled), initialCursor.UTC().Format(time.RFC3339Nano), now); err != nil {
+			return TriggerState{}, err
+		}
+		state = TriggerState{TriggerUID: triggerUID, Generation: generation, Enabled: enabled, CursorAt: initialCursor.UTC()}
+		return state, tx.Commit()
+	}
+	if err != nil {
+		return TriggerState{}, err
+	}
+	state.Enabled = enabledValue == 1
+	state.CursorAt, _ = time.Parse(time.RFC3339Nano, cursor)
+	if state.Generation != generation {
+		if _, err := tx.ExecContext(ctx, `UPDATE trigger_states SET generation=?,enabled=?,cursor_at=?,updated_at=? WHERE trigger_uid=?`, generation, boolInt(enabled), initialCursor.UTC().Format(time.RFC3339Nano), s.timestamp(), triggerUID); err != nil {
+			return TriggerState{}, err
+		}
+		state.Generation, state.Enabled, state.CursorAt = generation, enabled, initialCursor.UTC()
+	}
+	return state, tx.Commit()
+}
+
+// TriggerState returns the durable controller state for one trigger.
+func (s *Store) TriggerState(ctx context.Context, triggerUID string) (TriggerState, error) {
+	var state TriggerState
+	var enabledValue int
+	var cursor string
+	if err := s.db.QueryRowContext(ctx, `SELECT trigger_uid,generation,enabled,cursor_at FROM trigger_states WHERE trigger_uid=?`, triggerUID).Scan(&state.TriggerUID, &state.Generation, &enabledValue, &cursor); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return TriggerState{}, ErrNotFound
+		}
+		return TriggerState{}, err
+	}
+	state.Enabled = enabledValue == 1
+	state.CursorAt, _ = time.Parse(time.RFC3339Nano, cursor)
+	return state, nil
+}
+
+// AdvanceTriggerCursor durably records the latest evaluated scheduled instant.
+func (s *Store) AdvanceTriggerCursor(ctx context.Context, triggerUID string, cursor time.Time) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE trigger_states SET cursor_at=?,updated_at=? WHERE trigger_uid=?`, cursor.UTC().Format(time.RFC3339Nano), s.timestamp(), triggerUID)
+	if err != nil {
+		return err
+	}
+	changed, _ := result.RowsAffected()
+	if changed == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetTriggerEnabled applies an operator override without modifying resource spec.
+func (s *Store) SetTriggerEnabled(ctx context.Context, triggerUID string, enabled bool) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE trigger_states SET enabled=?,updated_at=? WHERE trigger_uid=?`, boolInt(enabled), s.timestamp(), triggerUID)
+	if err != nil {
+		return err
+	}
+	changed, _ := result.RowsAffected()
+	if changed == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// RecordTriggerSkip idempotently records a missed or concurrency-forbidden occurrence.
+func (s *Store) RecordTriggerSkip(ctx context.Context, triggerUID, occurrenceID, reason string, scheduledAt time.Time) error {
+	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO trigger_skips(trigger_uid,occurrence_id,reason,scheduled_at,recorded_at) VALUES(?,?,?,?,?)`, triggerUID, occurrenceID, reason, scheduledAt.UTC().Format(time.RFC3339Nano), s.timestamp())
+	return err
+}
+
+// TriggerSkips returns recent missed or concurrency-forbidden occurrences.
+func (s *Store) TriggerSkips(ctx context.Context, triggerUID string, limit int) ([]TriggerSkip, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT trigger_uid,occurrence_id,reason,scheduled_at FROM trigger_skips WHERE trigger_uid=? ORDER BY scheduled_at DESC LIMIT ?`, triggerUID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	result := []TriggerSkip{}
+	for rows.Next() {
+		var skip TriggerSkip
+		var scheduled string
+		if err := rows.Scan(&skip.TriggerUID, &skip.OccurrenceID, &skip.Reason, &scheduled); err != nil {
+			return nil, err
+		}
+		skip.ScheduledAt, _ = time.Parse(time.RFC3339Nano, scheduled)
+		result = append(result, skip)
+	}
+	return result, rows.Err()
+}
+
+// HasActiveRunForTrigger reports whether a receipt has a non-terminal local run.
+func (s *Store) HasActiveRunForTrigger(ctx context.Context, triggerUID string) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM trigger_receipts tr LEFT JOIN runs r ON r.trigger_receipt_uid=tr.uid WHERE tr.trigger_uid=? AND (r.uid IS NULL OR r.phase NOT IN ('succeeded','failed','rejected','cancelled'))`, triggerUID).Scan(&count)
+	return count > 0, err
+}
+
+// TriggerReceipts returns recent durable acknowledgements for one trigger.
+func (s *Store) TriggerReceipts(ctx context.Context, triggerUID string, limit int) ([]Receipt, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT uid,trigger_uid,occurrence_id,run_uid,deduplicated,accepted_at FROM trigger_receipts WHERE trigger_uid=? ORDER BY accepted_at DESC LIMIT ?`, triggerUID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	result := []Receipt{}
+	for rows.Next() {
+		var receipt Receipt
+		var deduplicated int
+		var accepted string
+		if err := rows.Scan(&receipt.UID, &receipt.TriggerUID, &receipt.OccurrenceID, &receipt.RunUID, &deduplicated, &accepted); err != nil {
+			return nil, err
+		}
+		receipt.Deduplicated = deduplicated == 1
+		receipt.AcceptedAt, _ = time.Parse(time.RFC3339Nano, accepted)
+		result = append(result, receipt)
+	}
+	return result, rows.Err()
+}
+
+// ProviderCursor returns the last durably acknowledged provider cursor.
+func (s *Store) ProviderCursor(ctx context.Context, triggerUID string) (string, string, error) {
+	var cursor, eventID string
+	if err := s.db.QueryRowContext(ctx, `SELECT cursor,provider_event_id FROM provider_cursors WHERE trigger_uid=?`, triggerUID).Scan(&cursor, &eventID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", nil
+		}
+		return "", "", err
+	}
+	return cursor, eventID, nil
+}
+
+// ResourceByUID returns one editable resource by immutable identity.
+func (s *Store) ResourceByUID(ctx context.Context, kind, uid string) (resource.Document, error) {
+	var data []byte
+	if err := s.db.QueryRowContext(ctx, `SELECT spec_json FROM resources WHERE kind=? AND uid=?`, kind, uid).Scan(&data); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return resource.Document{}, ErrNotFound
+		}
+		return resource.Document{}, err
+	}
+	document, err := resource.DecodeStrict(data)
+	if err != nil {
+		return resource.Document{}, err
+	}
+	return document, nil
 }
 
 // ApprovalState returns the persisted decision.

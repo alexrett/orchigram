@@ -222,6 +222,9 @@ func (c *Compiler) Compile(input resource.Flow) (ExecutionPlan, []Diagnostic) {
 	for id := range nodes {
 		sort.Strings(adjacency[id])
 	}
+	for i, node := range input.Spec.Nodes {
+		diagnostics = append(diagnostics, validateMappings(i, node, nodes)...)
+	}
 	components := stronglyConnected(sortedKeys(nodes), adjacency)
 	for _, component := range components {
 		cyclic := len(component) > 1
@@ -265,6 +268,48 @@ func (c *Compiler) Compile(input resource.Flow) (ExecutionPlan, []Diagnostic) {
 		plan.PlanHash = hex.EncodeToString(digest[:])
 	}
 	return plan, diagnostics
+}
+
+func validateMappings(nodeIndex int, node resource.FlowNode, nodes map[string]resource.FlowNode) []Diagnostic {
+	raw, exists := node.With["mappings"]
+	if !exists {
+		return nil
+	}
+	path := fmt.Sprintf("spec.nodes[%d].with.mappings", nodeIndex)
+	items, ok := raw.([]any)
+	if !ok {
+		return []Diagnostic{{Path: path, Code: "invalid_mapping", Message: "must be a list of {from,to} mappings"}}
+	}
+	diagnostics := []Diagnostic{}
+	for index, item := range items {
+		itemPath := fmt.Sprintf("%s[%d]", path, index)
+		mapping, ok := item.(map[string]any)
+		if !ok {
+			diagnostics = append(diagnostics, Diagnostic{Path: itemPath, Code: "invalid_mapping", Message: "must be an object"})
+			continue
+		}
+		for key := range mapping {
+			if key != "from" && key != "to" {
+				diagnostics = append(diagnostics, Diagnostic{Path: itemPath + "." + key, Code: "unknown_field", Message: "only from and to are allowed"})
+			}
+		}
+		from, fromOK := mapping["from"].(string)
+		to, toOK := mapping["to"].(string)
+		if !fromOK || from == "" || (from != "input" && !strings.HasPrefix(from, "input.") && !strings.HasPrefix(from, "nodes.")) {
+			diagnostics = append(diagnostics, Diagnostic{Path: itemPath + ".from", Code: "invalid_source", Message: "must start with input or nodes.<nodeID>"})
+		} else if strings.HasPrefix(from, "nodes.") {
+			parts := strings.Split(from, ".")
+			if len(parts) < 2 {
+				diagnostics = append(diagnostics, Diagnostic{Path: itemPath + ".from", Code: "invalid_source", Message: "node output path is incomplete"})
+			} else if _, exists := nodes[parts[1]]; !exists {
+				diagnostics = append(diagnostics, Diagnostic{Path: itemPath + ".from", Code: "unknown_node", Message: fmt.Sprintf("node %q does not exist", parts[1])})
+			}
+		}
+		if !toOK || !strings.HasPrefix(to, "/") || to == "/" {
+			diagnostics = append(diagnostics, Diagnostic{Path: itemPath + ".to", Code: "invalid_target", Message: "must be a non-root JSON pointer"})
+		}
+	}
+	return diagnostics
 }
 
 func validAction(action string) bool {

@@ -15,10 +15,12 @@ import (
 	"github.com/alexrett/orchigram/internal/config"
 	"github.com/alexrett/orchigram/internal/engine"
 	"github.com/alexrett/orchigram/internal/flow"
+	"github.com/alexrett/orchigram/internal/httpingress"
 	"github.com/alexrett/orchigram/internal/orchestrator"
 	"github.com/alexrett/orchigram/internal/pluginmanager"
 	"github.com/alexrett/orchigram/internal/server"
 	"github.com/alexrett/orchigram/internal/store"
+	triggercontroller "github.com/alexrett/orchigram/internal/trigger"
 	"google.golang.org/grpc"
 )
 
@@ -29,6 +31,8 @@ type Daemon struct {
 	engine       *engine.Adapter
 	orchestrator *orchestrator.Orchestrator
 	plugins      *pluginmanager.Manager
+	triggers     *triggercontroller.Controller
+	httpIngress  *httpingress.Server
 	grpc         *grpc.Server
 	listener     net.Listener
 	closeOnce    sync.Once
@@ -76,19 +80,33 @@ func Open(ctx context.Context, cfg config.Config, executor engine.TaskExecutor) 
 	}
 	compiler := flow.NewCompiler(plugins)
 	control := orchestrator.New(state, compiler, durable)
+	triggers := triggercontroller.NewController(state, plugins)
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(2<<20),
 		grpc.MaxSendMsgSize(8<<20),
 	)
-	server.NewAPI(state, compiler, control, durable, plugins).Register(grpcServer)
-	return &Daemon{config: cfg, store: state, engine: durable, orchestrator: control, plugins: plugins, grpc: grpcServer, listener: listener}, nil
+	server.NewAPI(state, compiler, control, durable, plugins, triggers).Register(grpcServer)
+	ingress, err := httpingress.Listen(ctx, cfg.HTTP.Listen, state, plugins)
+	if err != nil {
+		_ = listener.Close()
+		_ = durable.Close()
+		plugins.Close()
+		_ = state.Close()
+		return nil, err
+	}
+	return &Daemon{config: cfg, store: state, engine: durable, orchestrator: control, plugins: plugins, triggers: triggers, httpIngress: ingress, grpc: grpcServer, listener: listener}, nil
 }
 
 // Serve starts reconciliation and serves until context cancellation or failure.
 func (d *Daemon) Serve(ctx context.Context) error {
 	d.orchestrator.Start(ctx)
+	d.triggers.Start(ctx)
 	serveError := make(chan error, 1)
 	go func() { serveError <- d.grpc.Serve(d.listener) }()
+	var ingressErrors <-chan error
+	if d.httpIngress != nil {
+		ingressErrors = d.httpIngress.Errors()
+	}
 	select {
 	case <-ctx.Done():
 		graceful := make(chan struct{})
@@ -108,6 +126,12 @@ func (d *Daemon) Serve(ctx context.Context) error {
 		}
 		_ = d.Close()
 		return fmt.Errorf("serve gRPC: %w", err)
+	case err := <-ingressErrors:
+		if err == nil && ctx.Err() != nil {
+			return d.Close()
+		}
+		_ = d.Close()
+		return fmt.Errorf("serve webhook ingress: %w", err)
 	}
 }
 
@@ -117,6 +141,9 @@ func (d *Daemon) Close() error {
 	d.closeOnce.Do(func() {
 		if d.listener != nil {
 			_ = d.listener.Close()
+		}
+		if d.httpIngress != nil {
+			result = errors.Join(result, d.httpIngress.Close())
 		}
 		if d.engine != nil {
 			result = errors.Join(result, d.engine.Close())

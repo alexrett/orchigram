@@ -1,0 +1,54 @@
+apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata:
+  name: daily-engineering-note
+  labels:
+    orchigram.dev/example: teams-tracer
+spec:
+  policies:
+    timeout: 10m
+    maxParallel: 1
+  nodes:
+    - id: compose
+      name: Compose daily note
+      uses: agent-command.run
+      timeout: 5m
+      retry:
+        limit: 1
+        backoff: 10s
+      with:
+        profile: daily-note-writer
+        prompt: >-
+          Write one concise plain-text engineering reminder for the team.
+          Return only the message, with no markdown wrapper.
+    - id: notify
+      name: Post Adaptive Card
+      uses: http.request
+      timeout: 30s
+      retry:
+        limit: 3
+        backoff: 5s
+      with:
+        urlSecret: webhook
+        secretRefs:
+          webhook: teams-webhook-url
+        method: POST
+        body:
+          type: message
+          attachments:
+            - contentType: application/vnd.microsoft.card.adaptive
+              contentUrl: null
+              content:
+                $schema: http://adaptivecards.io/schemas/adaptive-card.json
+                type: AdaptiveCard
+                version: "1.4"
+                body:
+                  - type: TextBlock
+                    text: pending
+                    wrap: true
+        mappings:
+          - from: nodes.compose.text
+            to: /body/attachments/0/content/body/0/text
+  edges:
+    - from: compose
+      to: notify

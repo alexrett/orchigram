@@ -1,0 +1,14 @@
+apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata:
+  name: weekday-daily-engineering-note
+  labels:
+    orchigram.dev/example: teams-tracer
+spec:
+  flow: daily-engineering-note
+  schedule:
+    cron: "0 9 * * 1-5"
+    timezone: Europe/Berlin
+    misfirePolicy: fireOnce
+    startingDeadline: 1h
+    concurrencyPolicy: forbid

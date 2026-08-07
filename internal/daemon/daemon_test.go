@@ -17,6 +17,8 @@ import (
 	"github.com/alexrett/orchigram/internal/pluginprotocol"
 	"github.com/alexrett/orchigram/internal/pluginruntime"
 	"github.com/alexrett/orchigram/internal/process"
+	"github.com/alexrett/orchigram/internal/resource"
+	"github.com/alexrett/orchigram/internal/store"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -166,6 +168,99 @@ spec:
 	waitForRunEvent(t, second, started.GetUid(), 0, "run.succeeded")
 }
 
+func TestNativeScheduleRestartCreatesExactlyOneRun(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "orchigram-schedule-restart-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	cfg := config.Development(filepath.Join(root, "state"))
+	now := time.Date(2026, 8, 8, 12, 0, 10, 0, time.UTC)
+
+	firstContext, cancelFirst := context.WithCancel(context.Background())
+	first, err := Open(firstContext, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyDaemonResource(t, first, `apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: scheduled-noop}
+spec:
+  nodes: [{id: execute, uses: core.noop}]
+`)
+	triggerDocument := applyDaemonResource(t, first, `apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata: {name: every-minute}
+spec:
+  flow: scheduled-noop
+  schedule: {cron: "* * * * *", timezone: UTC, startingDeadline: 1h, concurrencyPolicy: forbid}
+`)
+	if _, err := first.store.EnsureTriggerState(firstContext, triggerDocument.Metadata.UID, triggerDocument.Metadata.Generation, true, now.Add(-2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.triggers.ReconcileSchedules(firstContext, now); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a crash after receipt/outbox commit but before the cursor update
+	// became visible. The same occurrence must reconcile to the same receipt.
+	if err := first.store.AdvanceTriggerCursor(firstContext, triggerDocument.Metadata.UID, now.Add(-2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	cancelFirst()
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	secondContext, cancelSecond := context.WithCancel(context.Background())
+	second, err := Open(secondContext, cfg, nil)
+	if err != nil {
+		cancelSecond()
+		t.Fatal(err)
+	}
+	defer func() {
+		cancelSecond()
+		if closeErr := second.Close(); closeErr != nil {
+			t.Errorf("close second daemon: %v", closeErr)
+		}
+	}()
+	if err := second.triggers.ReconcileSchedules(secondContext, now); err != nil {
+		t.Fatal(err)
+	}
+	receipts, err := second.store.TriggerReceipts(secondContext, triggerDocument.Metadata.UID, 10)
+	if err != nil || len(receipts) != 1 {
+		t.Fatalf("receipts=%d err=%v", len(receipts), err)
+	}
+	second.orchestrator.Start(secondContext)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		run, runErr := second.store.GetRun(secondContext, receipts[0].RunUID)
+		if runErr == nil && run.Phase == "succeeded" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("scheduled run did not succeed: run=%+v err=%v", run, runErr)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	runs, err := second.store.ListRuns(secondContext, 10)
+	if err != nil || len(runs) != 1 || runs[0].UID != receipts[0].RunUID {
+		t.Fatalf("runs=%+v err=%v", runs, err)
+	}
+}
+
+func applyDaemonResource(t *testing.T, daemon *Daemon, source string) resource.Document {
+	t.Helper()
+	document, err := resource.DecodeStrict([]byte(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied, err := daemon.store.Apply(context.Background(), document, store.ApplyOptions{RequestID: "daemon-test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return applied
+}
+
 func TestShutdownIsBoundedWithActiveWatch(t *testing.T) {
 	t.Parallel()
 	root, err := os.MkdirTemp("/tmp", "orchigram-daemon-")
@@ -225,6 +320,28 @@ func TestPrepareSocketRefusesRegularFile(t *testing.T) {
 	data, err := os.ReadFile(path) //nolint:gosec // This test owns the temporary path.
 	if err != nil || string(data) != "do not replace" {
 		t.Fatalf("file changed: %q err=%v", data, err)
+	}
+}
+
+func TestDefaultConfigurationOpensNoNetworkListener(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "orchigram-no-network-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	cfg := config.Development(filepath.Join(root, "state"))
+	ctx, cancel := context.WithCancel(context.Background())
+	instance, err := Open(ctx, cfg, nil)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	if instance.httpIngress != nil {
+		t.Fatal("default configuration created an HTTP listener")
+	}
+	cancel()
+	if err := instance.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

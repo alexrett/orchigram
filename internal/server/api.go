@@ -19,6 +19,7 @@ import (
 	"github.com/alexrett/orchigram/internal/pluginmanager"
 	"github.com/alexrett/orchigram/internal/resource"
 	"github.com/alexrett/orchigram/internal/store"
+	triggercontroller "github.com/alexrett/orchigram/internal/trigger"
 	"github.com/alexrett/orchigram/internal/version"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -34,12 +35,13 @@ type API struct {
 	orchestrator *orchestrator.Orchestrator
 	engine       engine.DurableEngine
 	plugins      *pluginmanager.Manager
+	triggers     *triggercontroller.Controller
 	startedAt    time.Time
 }
 
 // NewAPI constructs the public service implementation.
-func NewAPI(state *store.Store, compiler *flow.Compiler, control *orchestrator.Orchestrator, durable engine.DurableEngine, plugins *pluginmanager.Manager) *API {
-	return &API{store: state, compiler: compiler, orchestrator: control, engine: durable, plugins: plugins, startedAt: time.Now()}
+func NewAPI(state *store.Store, compiler *flow.Compiler, control *orchestrator.Orchestrator, durable engine.DurableEngine, plugins *pluginmanager.Manager, triggers *triggercontroller.Controller) *API {
+	return &API{store: state, compiler: compiler, orchestrator: control, engine: durable, plugins: plugins, triggers: triggers, startedAt: time.Now()}
 }
 
 // Register binds every public service to one gRPC server.
@@ -421,6 +423,66 @@ func (a *API) DoctorPlugin(ctx context.Context, request *controlv1alpha1.PluginR
 	return &controlv1alpha1.DoctorResponse{}, nil
 }
 
+// NextTriggerOccurrences previews deterministic future schedule identities.
+func (a *API) NextTriggerOccurrences(ctx context.Context, request *controlv1alpha1.NextOccurrencesRequest) (*controlv1alpha1.NextOccurrencesResponse, error) {
+	document, err := a.store.ResourceByUID(ctx, "Trigger", request.GetUid())
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	trigger, err := resource.DecodeTrigger(document.JSON)
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	occurrences, err := a.triggers.NextOccurrences(trigger, time.Now(), int(request.GetCount()))
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	response := &controlv1alpha1.NextOccurrencesResponse{}
+	for _, occurrence := range occurrences {
+		response.Occurrences = append(response.Occurrences, &controlv1alpha1.Occurrence{Identity: triggercontroller.OccurrenceIdentity(trigger, occurrence), ScheduledAt: timestamppb.New(occurrence)})
+	}
+	return response, nil
+}
+
+// SetTriggerEnabled applies an operator enable or disable override.
+func (a *API) SetTriggerEnabled(ctx context.Context, request *controlv1alpha1.TriggerRequest, enabled bool) (*emptypb.Empty, error) {
+	document, err := a.store.ResourceByUID(ctx, "Trigger", request.GetUid())
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	trigger, err := resource.DecodeTrigger(document.JSON)
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	if _, err := a.store.EnsureTriggerState(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, trigger.Spec.Enabled == nil || *trigger.Spec.Enabled, time.Now()); err != nil {
+		return nil, rpcError(err)
+	}
+	if err := a.store.SetTriggerEnabled(ctx, trigger.Metadata.UID, enabled); err != nil {
+		return nil, rpcError(err)
+	}
+	return &emptypb.Empty{}, nil
+}
+
+// TriggerReceipts returns recent accepted external occurrences.
+func (a *API) TriggerReceipts(ctx context.Context, request *controlv1alpha1.ReceiptRequest) (*controlv1alpha1.ReceiptResponse, error) {
+	receipts, err := a.store.TriggerReceipts(ctx, request.GetTriggerUid(), int(request.GetLimit()))
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	response := &controlv1alpha1.ReceiptResponse{}
+	for _, receipt := range receipts {
+		response.Receipts = append(response.Receipts, &controlv1alpha1.TriggerReceipt{Uid: receipt.UID, TriggerUid: receipt.TriggerUID, OccurrenceId: receipt.OccurrenceID, RunUid: receipt.RunUID, Deduplicated: receipt.Deduplicated, AcceptedAt: timestamppb.New(receipt.AcceptedAt)})
+	}
+	skips, err := a.store.TriggerSkips(ctx, request.GetTriggerUid(), int(request.GetLimit()))
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	for _, skip := range skips {
+		response.Skips = append(response.Skips, &controlv1alpha1.TriggerSkip{OccurrenceId: skip.OccurrenceID, Reason: skip.Reason, ScheduledAt: timestamppb.New(skip.ScheduledAt)})
+	}
+	return response, nil
+}
+
 func resourcePB(doc resource.Document) *controlv1alpha1.ResourceDocument {
 	return &controlv1alpha1.ResourceDocument{Key: &controlv1alpha1.ResourceKey{Kind: doc.Kind, Namespace: doc.Metadata.Namespace, Name: doc.Metadata.Name, Uid: doc.Metadata.UID}, ResourceVersion: doc.Metadata.ResourceVersion, Generation: doc.Metadata.Generation, Json: doc.JSON}
 }
@@ -524,6 +586,19 @@ func (s *runService) Reconcile(ctx context.Context, request *controlv1alpha1.Rec
 type triggerService struct {
 	controlv1alpha1.UnimplementedTriggerServiceServer
 	api *API
+}
+
+func (s *triggerService) Next(ctx context.Context, request *controlv1alpha1.NextOccurrencesRequest) (*controlv1alpha1.NextOccurrencesResponse, error) {
+	return s.api.NextTriggerOccurrences(ctx, request)
+}
+func (s *triggerService) Enable(ctx context.Context, request *controlv1alpha1.TriggerRequest) (*emptypb.Empty, error) {
+	return s.api.SetTriggerEnabled(ctx, request, true)
+}
+func (s *triggerService) Disable(ctx context.Context, request *controlv1alpha1.TriggerRequest) (*emptypb.Empty, error) {
+	return s.api.SetTriggerEnabled(ctx, request, false)
+}
+func (s *triggerService) Receipts(ctx context.Context, request *controlv1alpha1.ReceiptRequest) (*controlv1alpha1.ReceiptResponse, error) {
+	return s.api.TriggerReceipts(ctx, request)
 }
 
 type pluginService struct {

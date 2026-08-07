@@ -255,9 +255,13 @@ func (a *Agent) Execute(request *pluginv1alpha1.AgentRequest, stream pluginv1alp
 		_ = writer.send("agent.failed", map[string]any{"exitCode": result.ExitCode, "outcome": result.Outcome}, nil)
 		return status.Errorf(codes.Internal, "%v (outcome=%s, exit=%d)", runErr, result.Outcome, result.ExitCode)
 	}
-	return writer.send("agent.completed", map[string]any{
+	completion := map[string]any{
 		"exitCode": result.ExitCode, "outcome": result.Outcome, "stdout": string(result.Stdout),
-	}, nil)
+	}
+	if text := finalAgentText(result.Stdout); text != "" {
+		completion["text"] = text
+	}
+	return writer.send("agent.completed", completion, nil)
 }
 
 // Input is reserved for interactive runtimes; v0.1 command profiles are non-interactive.
@@ -283,7 +287,8 @@ type HTTP struct {
 
 type httpConfig struct {
 	Method        string            `json:"method,omitempty"`
-	URL           string            `json:"url"`
+	URL           string            `json:"url,omitempty"`
+	URLSecret     string            `json:"urlSecret,omitempty"`
 	Headers       map[string]string `json:"headers,omitempty"`
 	SecretHeaders map[string]string `json:"secretHeaders,omitempty"`
 	Body          json.RawMessage   `json:"body,omitempty"`
@@ -299,8 +304,15 @@ func (h *HTTP) ValidateAction(_ context.Context, request *pluginv1alpha1.Validat
 	var config httpConfig
 	if err := decodeStrictJSON(request.GetConfigJson(), &config); err != nil {
 		issues = append(issues, issue("config", "invalid", err.Error()))
-	} else if !strings.HasPrefix(config.URL, "https://") && !strings.HasPrefix(config.URL, "http://") {
-		issues = append(issues, issue("config.url", "invalid", "URL must use http or https"))
+	} else {
+		switch {
+		case config.URL == "" && config.URLSecret == "":
+			issues = append(issues, issue("config.url", "required", "url or urlSecret is required"))
+		case config.URL != "" && config.URLSecret != "":
+			issues = append(issues, issue("config.urlSecret", "conflict", "url and urlSecret are mutually exclusive"))
+		case config.URL != "" && !strings.HasPrefix(config.URL, "https://") && !strings.HasPrefix(config.URL, "http://"):
+			issues = append(issues, issue("config.url", "invalid", "URL must use http or https"))
+		}
 	}
 	return &pluginv1alpha1.ValidateActionResponse{Issues: issues}, nil
 }
@@ -317,6 +329,17 @@ func (h *HTTP) Execute(request *pluginv1alpha1.ExecuteRequest, stream pluginv1al
 	if err := decodeStrictJSON(request.GetConfigJson(), &config); err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
+	requestURL := config.URL
+	if config.URLSecret != "" {
+		secret, exists := request.GetSecrets()[config.URLSecret]
+		if !exists {
+			return status.Errorf(codes.InvalidArgument, "URL secret %q is missing", config.URLSecret)
+		}
+		requestURL = string(secret)
+	}
+	if !strings.HasPrefix(requestURL, "https://") && !strings.HasPrefix(requestURL, "http://") {
+		return status.Error(codes.InvalidArgument, "resolved URL must use http or https")
+	}
 	method := strings.ToUpper(config.Method)
 	if method == "" {
 		method = http.MethodPost
@@ -325,7 +348,7 @@ func (h *HTTP) Execute(request *pluginv1alpha1.ExecuteRequest, stream pluginv1al
 	if len(body) == 0 {
 		body = request.GetInputJson()
 	}
-	httpRequest, err := http.NewRequestWithContext(stream.Context(), method, config.URL, strings.NewReader(string(body)))
+	httpRequest, err := http.NewRequestWithContext(stream.Context(), method, requestURL, strings.NewReader(string(body)))
 	if err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -524,6 +547,33 @@ func normalizeAgentLine(line []byte) (string, any) {
 	default:
 		return "agent.event", value
 	}
+}
+
+func finalAgentText(output []byte) string {
+	var result string
+	for _, line := range strings.Split(string(output), "\n") {
+		var event map[string]any
+		if json.Unmarshal([]byte(line), &event) != nil {
+			continue
+		}
+		if value, ok := event["result"].(string); ok && value != "" {
+			result = value
+		}
+		if value, ok := event["text"].(string); ok && value != "" {
+			result = value
+		}
+		if item, ok := event["item"].(map[string]any); ok {
+			if value, ok := item["text"].(string); ok && value != "" {
+				result = value
+			}
+		}
+		if message, ok := event["message"].(map[string]any); ok {
+			if value, ok := message["content"].(string); ok && value != "" {
+				result = value
+			}
+		}
+	}
+	return result
 }
 
 func readLimited(reader io.Reader, limit int64) ([]byte, error) {

@@ -45,7 +45,7 @@ type DurableEngine interface {
 
 // TaskExecutor invokes non-core actions at an at-least-once activity boundary.
 type TaskExecutor interface {
-	Execute(context.Context, string, flow.PlanNode, json.RawMessage, string) (json.RawMessage, error)
+	Execute(context.Context, string, flow.PlanNode, json.RawMessage, map[string]any, string) (json.RawMessage, error)
 }
 
 // ApprovalSignal is the framework-independent durable decision payload.
@@ -352,7 +352,7 @@ func (a *Activities) ExecuteNode(ctx context.Context, request NodeRequest) (Node
 			err = fmt.Errorf("no task executor for %q", request.Node.Uses)
 		} else {
 			key := fmt.Sprintf("run/%s/node/%s/iteration/0/operation/execute", request.RunUID, request.Node.ID)
-			output, err = a.executor.Execute(ctx, request.RunUID, request.Node, request.Input, key)
+			output, err = a.executor.Execute(ctx, request.RunUID, request.Node, request.Input, request.Nodes, key)
 		}
 	}
 	if err != nil {

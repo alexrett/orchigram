@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/robfig/cron/v3"
 	"gopkg.in/yaml.v3"
 )
 
@@ -320,6 +321,22 @@ func DecodeSecretRef(data []byte) (SecretRef, error) {
 	return secret, nil
 }
 
+// DecodeTrigger decodes and returns a concrete Trigger.
+func DecodeTrigger(data []byte) (Trigger, error) {
+	doc, err := DecodeStrict(data)
+	if err != nil {
+		return Trigger{}, err
+	}
+	if doc.Kind != "Trigger" {
+		return Trigger{}, fmt.Errorf("expected Trigger, got %s", doc.Kind)
+	}
+	var trigger Trigger
+	if err := json.Unmarshal(doc.JSON, &trigger); err != nil {
+		return Trigger{}, err
+	}
+	return trigger, nil
+}
+
 // ValidateMetadata enforces stable DNS-like resource keys.
 func ValidateMetadata(meta ObjectMeta) error {
 	if !dnsName.MatchString(meta.Name) || len(meta.Name) > 63 {
@@ -381,6 +398,36 @@ func validateKind(value any) error {
 		}
 		if strings.TrimSpace(v.Spec.Flow) == "" {
 			return errors.New("trigger spec flow is required")
+		}
+		if v.Spec.Schedule != nil {
+			if len(strings.Fields(v.Spec.Schedule.Cron)) != 5 {
+				return errors.New("trigger schedule cron must contain exactly five fields")
+			}
+			if _, err := cron.ParseStandard(v.Spec.Schedule.Cron); err != nil {
+				return fmt.Errorf("trigger schedule cron is invalid: %w", err)
+			}
+			timezone := v.Spec.Schedule.Timezone
+			if timezone == "" {
+				timezone = "UTC"
+			}
+			if _, err := time.LoadLocation(timezone); err != nil {
+				return fmt.Errorf("trigger schedule timezone %q is invalid", timezone)
+			}
+			if v.Spec.Schedule.MisfirePolicy != "" && v.Spec.Schedule.MisfirePolicy != "fireOnce" {
+				return fmt.Errorf("trigger schedule misfirePolicy %q is unsupported", v.Spec.Schedule.MisfirePolicy)
+			}
+			if v.Spec.Schedule.ConcurrencyPolicy != "" && v.Spec.Schedule.ConcurrencyPolicy != "forbid" {
+				return fmt.Errorf("trigger schedule concurrencyPolicy %q is unsupported", v.Spec.Schedule.ConcurrencyPolicy)
+			}
+			if _, err := ParseDuration(v.Spec.Schedule.StartingDeadline, time.Hour); err != nil {
+				return fmt.Errorf("trigger schedule startingDeadline: %w", err)
+			}
+		}
+		if v.Spec.Webhook != nil && strings.TrimSpace(v.Spec.Webhook.BearerSecretRef) == "" {
+			return errors.New("trigger webhook bearerSecretRef is required")
+		}
+		if v.Spec.Provider != nil && strings.TrimSpace(v.Spec.Provider.Plugin) == "" {
+			return errors.New("trigger provider plugin is required")
 		}
 	case *Repository:
 		if strings.TrimSpace(v.Spec.CloneURL) == "" {

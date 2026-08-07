@@ -83,7 +83,7 @@ spec:
 	runResult := make(chan error, 1)
 	go func() { runResult <- runWithApplication(tuiContext, client, application) }()
 	time.Sleep(100 * time.Millisecond)
-	for range 3 {
+	for range 4 {
 		postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyDown, 0, tcell.ModNone))
 	}
 	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))

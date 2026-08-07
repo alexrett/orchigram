@@ -1,0 +1,10 @@
+apiVersion: orchigram.dev/v1alpha1
+kind: AgentProfile
+metadata:
+  name: daily-note-writer
+  labels:
+    orchigram.dev/example: teams-tracer
+spec:
+  type: codex
+  effort: low
+  sandbox: read-only

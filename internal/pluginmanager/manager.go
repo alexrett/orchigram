@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -184,7 +185,7 @@ func (m *Manager) ValidateAction(action string, config map[string]any) []flow.Di
 	}
 	copyConfig := make(map[string]any, len(config))
 	for key, value := range config {
-		if key != "secretRefs" {
+		if key != "secretRefs" && key != "mappings" {
 			copyConfig[key] = value
 		}
 	}
@@ -206,6 +207,11 @@ func (m *Manager) ValidateAction(action string, config map[string]any) []flow.Di
 // Describe returns one installed or active version.
 func (m *Manager) Describe(ctx context.Context, name, version string) (store.PluginRecord, error) {
 	return m.store.Plugin(ctx, name, version)
+}
+
+// ResolveSecret resolves one operation-scoped SecretRef for daemon controllers.
+func (m *Manager) ResolveSecret(ctx context.Context, name string) ([]byte, error) {
+	return m.resolveSecret(ctx, name)
 }
 
 // Doctor launches the selected plugin and verifies negotiation plus health.
@@ -258,7 +264,7 @@ func (m *Manager) Doctor(ctx context.Context, name, version string) error {
 }
 
 // Execute implements engine.TaskExecutor for non-core Flow nodes.
-func (m *Manager) Execute(ctx context.Context, runUID string, node flow.PlanNode, input json.RawMessage, idempotencyKey string) (json.RawMessage, error) {
+func (m *Manager) Execute(ctx context.Context, runUID string, node flow.PlanNode, input json.RawMessage, nodes map[string]any, idempotencyKey string) (json.RawMessage, error) {
 	pluginName := strings.SplitN(node.Uses, ".", 2)[0]
 	process, record, err := m.activeProcess(ctx, pluginName)
 	if err != nil {
@@ -276,17 +282,60 @@ func (m *Manager) Execute(ctx context.Context, runUID string, node flow.PlanNode
 	callContext, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	if pluginName == "agent-command" {
-		output, executeErr := m.executeAgent(callContext, process, callMeta, node, input)
+		output, executeErr := m.executeAgent(callContext, process, callMeta, node, input, nodes)
 		if executeErr != nil && process.Exited() {
 			m.evict(installationKey(record.Name, record.Version))
 		}
 		return output, executeErr
 	}
-	output, executeErr := m.executeTask(callContext, process, callMeta, node, input)
+	output, executeErr := m.executeTask(callContext, process, callMeta, node, input, nodes)
 	if executeErr != nil && process.Exited() {
 		m.evict(installationKey(record.Name, record.Version))
 	}
 	return output, executeErr
+}
+
+// WatchTrigger runs one bidirectional provider stream and acknowledges an
+// event only after the controller callback has durably persisted it.
+func (m *Manager) WatchTrigger(ctx context.Context, pluginName, triggerUID string, config map[string]any, cursor string, accept func(*pluginv1alpha1.TriggerEvent) error) error {
+	process, record, err := m.activeProcess(ctx, pluginName)
+	if err != nil {
+		return err
+	}
+	configCopy := make(map[string]any, len(config))
+	for key, value := range config {
+		configCopy[key] = value
+	}
+	secrets, err := m.resolveNodeSecrets(ctx, configCopy)
+	if err != nil {
+		return err
+	}
+	configJSON, err := json.Marshal(configCopy)
+	if err != nil {
+		return err
+	}
+	stream, err := process.Clients().Trigger.Watch(ctx)
+	if err != nil {
+		return err
+	}
+	if err := stream.Send(&pluginv1alpha1.TriggerCommand{Value: &pluginv1alpha1.TriggerCommand_Start{Start: &pluginv1alpha1.WatchStart{InstallationUid: triggerUID, Cursor: cursor, ConfigJson: configJSON, Secrets: secrets}}}); err != nil {
+		return err
+	}
+	for {
+		event, receiveErr := stream.Recv()
+		if receiveErr != nil {
+			if process.Exited() {
+				m.evict(installationKey(record.Name, record.Version))
+			}
+			return receiveErr
+		}
+		if err := accept(event); err != nil {
+			return err
+		}
+		if err := stream.Send(&pluginv1alpha1.TriggerCommand{Value: &pluginv1alpha1.TriggerCommand_Ack{Ack: &pluginv1alpha1.TriggerAck{ProviderEventId: event.GetProviderEventId(), Cursor: event.GetCursor()}}}); err != nil {
+			return err
+		}
+	}
 }
 
 // Close stops every supervised plugin process.
@@ -303,10 +352,13 @@ func (m *Manager) Close() {
 	}
 }
 
-func (m *Manager) executeTask(ctx context.Context, process *pluginhost.Process, meta *pluginv1alpha1.CallMeta, node flow.PlanNode, input json.RawMessage) (json.RawMessage, error) {
+func (m *Manager) executeTask(ctx context.Context, process *pluginhost.Process, meta *pluginv1alpha1.CallMeta, node flow.PlanNode, input json.RawMessage, nodes map[string]any) (json.RawMessage, error) {
 	config := make(map[string]any, len(node.With))
 	for key, value := range node.With {
 		config[key] = value
+	}
+	if err := applyMappings(config, input, nodes); err != nil {
+		return nil, err
 	}
 	secrets, err := m.resolveNodeSecrets(ctx, config)
 	if err != nil {
@@ -325,7 +377,7 @@ func (m *Manager) executeTask(ctx context.Context, process *pluginhost.Process, 
 	return m.consume(ctx, runArtifact{runUID: meta.GetRunUid(), nodeID: meta.GetNodeId(), attempt: meta.GetAttempt(), redactions: secretValues(secrets)}, stream)
 }
 
-func (m *Manager) executeAgent(ctx context.Context, process *pluginhost.Process, meta *pluginv1alpha1.CallMeta, node flow.PlanNode, input json.RawMessage) (json.RawMessage, error) {
+func (m *Manager) executeAgent(ctx context.Context, process *pluginhost.Process, meta *pluginv1alpha1.CallMeta, node flow.PlanNode, input json.RawMessage, nodes map[string]any) (json.RawMessage, error) {
 	profileName, _ := node.With["profile"].(string)
 	if profileName == "" {
 		return nil, errors.New("agent-command node requires with.profile")
@@ -346,13 +398,49 @@ func (m *Manager) executeAgent(ctx context.Context, process *pluginhost.Process,
 	if err != nil {
 		return nil, err
 	}
-	stream, err := process.Clients().Agent.Execute(ctx, &pluginv1alpha1.AgentRequest{Meta: meta, ProfileType: profile.Spec.Type, ProfileJson: profileJSON, InputJson: input, Secrets: secrets})
+	config := make(map[string]any, len(node.With))
+	for key, value := range node.With {
+		if key != "profile" {
+			config[key] = value
+		}
+	}
+	if err := applyMappings(config, input, nodes); err != nil {
+		return nil, err
+	}
+	invocation := map[string]any{}
+	var decodedInput any
+	if len(input) > 0 && json.Unmarshal(input, &decodedInput) == nil {
+		invocation["input"] = decodedInput
+	}
+	for _, key := range []string{"prompt", "workspace"} {
+		if value, exists := config[key]; exists {
+			invocation[key] = value
+			delete(config, key)
+		}
+	}
+	if len(config) != 0 {
+		return nil, fmt.Errorf("unsupported agent-command configuration fields: %v", sortedMapKeys(config))
+	}
+	agentInput, err := json.Marshal(invocation)
+	if err != nil {
+		return nil, err
+	}
+	stream, err := process.Clients().Agent.Execute(ctx, &pluginv1alpha1.AgentRequest{Meta: meta, ProfileType: profile.Spec.Type, ProfileJson: profileJSON, InputJson: agentInput, Secrets: secrets})
 	if err != nil {
 		return nil, err
 	}
 	stopCancel := m.cancelAgentOnContext(ctx, process, meta)
 	defer stopCancel()
 	return m.consume(ctx, runArtifact{runUID: meta.GetRunUid(), nodeID: meta.GetNodeId(), attempt: meta.GetAttempt(), redactions: secretValues(secrets)}, stream)
+}
+
+func sortedMapKeys(values map[string]any) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 type eventReceiver interface {
@@ -480,6 +568,121 @@ func (m *Manager) resolveNodeSecrets(ctx context.Context, config map[string]any)
 		result[target] = secret
 	}
 	return result, nil
+}
+
+type valueMapping struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+func applyMappings(config map[string]any, input json.RawMessage, nodes map[string]any) error {
+	raw, exists := config["mappings"]
+	if !exists {
+		return nil
+	}
+	delete(config, "mappings")
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return fmt.Errorf("encode mappings: %w", err)
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(encoded)))
+	decoder.DisallowUnknownFields()
+	var mappings []valueMapping
+	if err := decoder.Decode(&mappings); err != nil {
+		return fmt.Errorf("decode mappings: %w", err)
+	}
+	var decodedInput any
+	if len(input) > 0 {
+		if err := json.Unmarshal(input, &decodedInput); err != nil {
+			return fmt.Errorf("decode mapping input: %w", err)
+		}
+	}
+	sources := map[string]any{"input": decodedInput, "nodes": nodes}
+	for index, mapping := range mappings {
+		value, err := lookupMappingValue(sources, mapping.From)
+		if err != nil {
+			return fmt.Errorf("mapping %d from %q: %w", index, mapping.From, err)
+		}
+		if err := setJSONPointer(config, mapping.To, value); err != nil {
+			return fmt.Errorf("mapping %d to %q: %w", index, mapping.To, err)
+		}
+	}
+	return nil
+}
+
+func lookupMappingValue(root any, path string) (any, error) {
+	if path == "" {
+		return nil, errors.New("source path is empty")
+	}
+	current := root
+	for _, segment := range strings.Split(path, ".") {
+		switch value := current.(type) {
+		case map[string]any:
+			var exists bool
+			current, exists = value[segment]
+			if !exists {
+				return nil, fmt.Errorf("field %q does not exist", segment)
+			}
+		case []any:
+			index, err := strconv.Atoi(segment)
+			if err != nil || index < 0 || index >= len(value) {
+				return nil, fmt.Errorf("array index %q is invalid", segment)
+			}
+			current = value[index]
+		default:
+			return nil, fmt.Errorf("cannot traverse %q", segment)
+		}
+	}
+	return current, nil
+}
+
+func setJSONPointer(root map[string]any, pointer string, value any) error {
+	if pointer == "" || !strings.HasPrefix(pointer, "/") {
+		return errors.New("target must be a non-empty JSON pointer")
+	}
+	tokens := strings.Split(strings.TrimPrefix(pointer, "/"), "/")
+	for index := range tokens {
+		tokens[index] = strings.ReplaceAll(strings.ReplaceAll(tokens[index], "~1", "/"), "~0", "~")
+	}
+	_, err := setPointerValue(root, tokens, value)
+	return err
+}
+
+func setPointerValue(current any, tokens []string, value any) (any, error) {
+	if len(tokens) == 0 {
+		return value, nil
+	}
+	token := tokens[0]
+	switch typed := current.(type) {
+	case map[string]any:
+		child, exists := typed[token]
+		if !exists {
+			if len(tokens) == 1 {
+				typed[token] = value
+				return typed, nil
+			}
+			child = map[string]any{}
+		}
+		updated, err := setPointerValue(child, tokens[1:], value)
+		if err != nil {
+			return nil, err
+		}
+		typed[token] = updated
+		return typed, nil
+	case []any:
+		index, err := strconv.Atoi(token)
+		if err != nil || index < 0 || index >= len(typed) {
+			return nil, fmt.Errorf("array index %q is invalid", token)
+		}
+		updated, err := setPointerValue(typed[index], tokens[1:], value)
+		if err != nil {
+			return nil, err
+		}
+		typed[index] = updated
+		return typed, nil
+	default:
+		return nil, fmt.Errorf("cannot traverse target segment %q", token)
+	}
 }
 
 func (m *Manager) resolveProfileSecrets(ctx context.Context, references []string) (map[string][]byte, error) {

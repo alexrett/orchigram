@@ -100,3 +100,23 @@ spec:
 		t.Fatalf("diagnostics: %+v", diagnostics)
 	}
 }
+
+func TestCompilerValidatesDeclarativeMappings(t *testing.T) {
+	t.Parallel()
+	_, diagnostics := compileYAML(t, `apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: mappings}
+spec:
+  nodes:
+    - {id: compose, uses: core.noop}
+    - id: notify
+      uses: core.noop
+      with:
+        mappings:
+          - {from: nodes.missing.text, to: body.text}
+  edges: [{from: compose, to: notify}]
+`)
+	if len(diagnostics) != 2 || diagnostics[0].Code != "unknown_node" || diagnostics[1].Code != "invalid_target" {
+		t.Fatalf("diagnostics: %+v", diagnostics)
+	}
+}

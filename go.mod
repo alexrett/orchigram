@@ -11,6 +11,7 @@ require (
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/go-plugin v1.8.0
 	github.com/rivo/tview v0.42.0
+	github.com/robfig/cron/v3 v3.0.1
 	github.com/spf13/cobra v1.10.2
 	google.golang.org/grpc v1.83.0
 	google.golang.org/protobuf v1.36.11

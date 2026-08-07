@@ -24,9 +24,8 @@ make check
 make cross-build
 ```
 
-See [Architecture](docs/architecture.md), [Durability](docs/durability.md), [Security](docs/security.md), and [Plugin authoring](docs/plugin-authoring.md).
+See [Architecture](docs/architecture.md), [Durability](docs/durability.md), [Triggers](docs/triggers.md), [Security](docs/security.md), and [Plugin authoring](docs/plugin-authoring.md).
 
 ## License
 
 Apache License 2.0.
-

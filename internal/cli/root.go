@@ -62,7 +62,7 @@ func NewRoot() *cobra.Command {
 		newDeleteCommand(opts),
 		newFlowCommand(opts),
 		newRunCommand(opts),
-		newTriggerCommand(),
+		newTriggerCommand(opts),
 		newPluginCommand(opts),
 		newContextCommand(opts),
 		newInstallCommand(),
@@ -299,8 +299,44 @@ func cancelCommand(opts *options) *cobra.Command {
 	return command
 }
 
-func newTriggerCommand() *cobra.Command {
-	return &cobra.Command{Use: "trigger", Short: "Inspect and control triggers", RunE: func(cmd *cobra.Command, _ []string) error { return cmd.Help() }}
+func newTriggerCommand(opts *options) *cobra.Command {
+	command := &cobra.Command{Use: "trigger", Short: "Inspect and control triggers", RunE: func(cmd *cobra.Command, _ []string) error { return cmd.Help() }}
+	var count uint32
+	next := &cobra.Command{Use: "next UID", Short: "Preview the next schedule occurrences", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error {
+			response, err := client.Triggers.Next(cmd.Context(), &controlv1alpha1.NextOccurrencesRequest{Uid: args[0], Count: count})
+			if err != nil {
+				return err
+			}
+			for _, occurrence := range response.GetOccurrences() {
+				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\n", occurrence.GetScheduledAt().AsTime().Format(time.RFC3339), occurrence.GetIdentity()); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}}
+	next.Flags().Uint32Var(&count, "count", 5, "number of occurrences to preview")
+	command.AddCommand(next, triggerMutationCommand(opts, true), triggerMutationCommand(opts, false))
+	return command
+}
+
+func triggerMutationCommand(opts *options, enabled bool) *cobra.Command {
+	operation := "disable"
+	if enabled {
+		operation = "enable"
+	}
+	return &cobra.Command{Use: operation + " UID", Short: strings.ToUpper(operation[:1]) + operation[1:] + " a trigger", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error {
+			request := &controlv1alpha1.TriggerRequest{Uid: args[0]}
+			if enabled {
+				_, err := client.Triggers.Enable(cmd.Context(), request)
+				return err
+			}
+			_, err := client.Triggers.Disable(cmd.Context(), request)
+			return err
+		})
+	}}
 }
 
 func newPluginCommand(opts *options) *cobra.Command {

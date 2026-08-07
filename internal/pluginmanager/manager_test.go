@@ -92,7 +92,7 @@ func TestFirstPartyPluginConformance(t *testing.T) {
 	output, err := manager.Execute(context.Background(), "run-env", flow.PlanNode{
 		ID: "environment", Uses: "exec.run", Timeout: "10s",
 		With: map[string]any{"argv": []string{"/usr/bin/env"}},
-	}, json.RawMessage(`{}`), "stable-env-key")
+	}, json.RawMessage(`{}`), nil, "stable-env-key")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ spec:
 `)
 		agentOutput, executeErr := manager.Execute(context.Background(), "run-agent-"+profileType, flow.PlanNode{
 			ID: "agent", Uses: "agent-command.run", Timeout: "10s", With: map[string]any{"profile": "fake-" + profileType},
-		}, json.RawMessage(`{"prompt":"conformance"}`), "stable-agent-"+profileType)
+		}, json.RawMessage(`{"prompt":"conformance"}`), nil, "stable-agent-"+profileType)
 		if executeErr != nil {
 			t.Fatalf("%s profile: %v", profileType, executeErr)
 		}
@@ -133,8 +133,11 @@ spec:
 	}
 
 	seenKeys := []string{}
+	seenBodies := []string{}
 	receiver := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		seenKeys = append(seenKeys, request.Header.Get("Idempotency-Key"))
+		body, _ := io.ReadAll(request.Body)
+		seenBodies = append(seenBodies, string(body))
 		writer.Header().Set("Content-Type", "application/json")
 		_, _ = writer.Write([]byte(`{"accepted":true}`))
 	}))
@@ -143,12 +146,31 @@ spec:
 		if _, err := manager.Execute(context.Background(), "run-http", flow.PlanNode{
 			ID: "notify", Uses: "http.request", Timeout: "10s",
 			With: map[string]any{"url": receiver.URL, "method": "POST", "body": map[string]any{"hello": "world"}},
-		}, json.RawMessage(`{}`), "stable-http-key"); err != nil {
+		}, json.RawMessage(`{}`), nil, "stable-http-key"); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if len(seenKeys) != 2 || seenKeys[0] != "stable-http-key" || seenKeys[1] != seenKeys[0] {
 		t.Fatalf("HTTP idempotency keys: %+v", seenKeys)
+	}
+	t.Setenv("ORCHIGRAM_TEST_WEBHOOK_URL", receiver.URL)
+	applyResource(t, state, `apiVersion: orchigram.dev/v1alpha1
+kind: SecretRef
+metadata: {name: webhook-url}
+spec: {backend: env, key: ORCHIGRAM_TEST_WEBHOOK_URL}
+`)
+	if _, err := manager.Execute(context.Background(), "run-mapping", flow.PlanNode{
+		ID: "notify", Uses: "http.request", Timeout: "10s",
+		With: map[string]any{
+			"urlSecret": "endpoint", "secretRefs": map[string]any{"endpoint": "webhook-url"},
+			"body":     map[string]any{"type": "message", "text": "placeholder"},
+			"mappings": []any{map[string]any{"from": "nodes.compose.text", "to": "/body/text"}},
+		},
+	}, json.RawMessage(`{}`), map[string]any{"compose": map[string]any{"text": "mapped message"}}, "stable-mapping-key"); err != nil {
+		t.Fatal(err)
+	}
+	if len(seenBodies) != 3 || !strings.Contains(seenBodies[2], `"text":"mapped message"`) {
+		t.Fatalf("mapped HTTP body: %+v", seenBodies)
 	}
 
 	cancelContext, cancel := context.WithCancel(context.Background())
@@ -157,7 +179,7 @@ spec:
 		_, executeErr := manager.Execute(cancelContext, "run-cancel", flow.PlanNode{
 			ID: "sleep", Uses: "exec.run", Timeout: "30s",
 			With: map[string]any{"argv": []string{"/bin/sh", "-c", "sleep 30 & wait"}},
-		}, json.RawMessage(`{}`), "stable-cancel-key")
+		}, json.RawMessage(`{}`), nil, "stable-cancel-key")
 		cancelled <- executeErr
 	}()
 	time.Sleep(150 * time.Millisecond)
@@ -175,7 +197,7 @@ spec:
 	startedTimeout := time.Now()
 	_, timeoutErr := manager.Execute(timeoutContext, "run-timeout", flow.PlanNode{
 		ID: "timeout", Uses: "exec.run", Timeout: "30s", With: map[string]any{"argv": []string{"/bin/sleep", "30"}},
-	}, json.RawMessage(`{}`), "stable-timeout-key")
+	}, json.RawMessage(`{}`), nil, "stable-timeout-key")
 	if !errors.Is(timeoutErr, context.DeadlineExceeded) || time.Since(startedTimeout) > 5*time.Second {
 		t.Fatalf("timeout outcome=%v elapsed=%s", timeoutErr, time.Since(startedTimeout))
 	}
@@ -183,14 +205,14 @@ spec:
 	_, crashErr := manager.Execute(context.Background(), "run-crash", flow.PlanNode{
 		ID: "crash", Uses: "exec.run", Timeout: "10s",
 		With: map[string]any{"argv": []string{"/bin/sh", "-c", "kill -KILL $PPID"}},
-	}, json.RawMessage(`{}`), "stable-crash-key")
+	}, json.RawMessage(`{}`), nil, "stable-crash-key")
 	if crashErr == nil {
 		t.Fatal("deliberate plugin crash was not observed")
 	}
 	time.Sleep(100 * time.Millisecond)
 	if _, err := manager.Execute(context.Background(), "run-recovered", flow.PlanNode{
 		ID: "recover", Uses: "exec.run", Timeout: "10s", With: map[string]any{"argv": []string{"/bin/echo", "recovered"}},
-	}, json.RawMessage(`{}`), "stable-recovery-key"); err != nil {
+	}, json.RawMessage(`{}`), nil, "stable-recovery-key"); err != nil {
 		t.Fatalf("daemon-side manager did not recover plugin: %v", err)
 	}
 }
