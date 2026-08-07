@@ -305,6 +305,22 @@ func DecodeAgentProfile(data []byte) (AgentProfile, error) {
 	return profile, nil
 }
 
+// DecodeRepository decodes and returns a concrete Repository projection.
+func DecodeRepository(data []byte) (Repository, error) {
+	doc, err := DecodeStrict(data)
+	if err != nil {
+		return Repository{}, err
+	}
+	if doc.Kind != "Repository" {
+		return Repository{}, fmt.Errorf("expected Repository, got %s", doc.Kind)
+	}
+	var repository Repository
+	if err := json.Unmarshal(doc.JSON, &repository); err != nil {
+		return Repository{}, err
+	}
+	return repository, nil
+}
+
 // DecodeSecretRef decodes and returns a concrete SecretRef projection.
 func DecodeSecretRef(data []byte) (SecretRef, error) {
 	doc, err := DecodeStrict(data)
@@ -432,6 +448,9 @@ func validateKind(value any) error {
 	case *Repository:
 		if strings.TrimSpace(v.Spec.CloneURL) == "" {
 			return errors.New("Repository.spec.cloneURL is required")
+		}
+		if v.Spec.WorkspacePolicy != "" && v.Spec.WorkspacePolicy != "isolated-run" {
+			return fmt.Errorf("Repository.spec.workspacePolicy %q is unsupported", v.Spec.WorkspacePolicy)
 		}
 	case *AgentProfile:
 		if v.Spec.Type != "codex" && v.Spec.Type != "claude" && v.Spec.Type != "command" {

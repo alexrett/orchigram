@@ -1,0 +1,145 @@
+apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata:
+  name: github-issue-to-pr
+  labels:
+    orchigram.dev/example: github-sdlc
+spec:
+  policies:
+    timeout: 2h
+    maxParallel: 1
+  nodes:
+    - id: fetch_issue
+      name: Fetch current issue
+      uses: github.issue.get
+      with:
+        owner: alexrett
+        repository: orchigram-e2e
+        tokenSecret: token
+        secretRefs: {token: github-e2e-token}
+        number: 1
+        mappings:
+          - {from: input.issue.number, to: /number}
+    - id: checkout
+      name: Create isolated issue branch
+      uses: github.workspace.checkout
+      timeout: 5m
+      with:
+        repositoryRef: orchigram-e2e
+        issueNumber: 1
+        mappings:
+          - {from: nodes.fetch_issue.issue.number, to: /issueNumber}
+    - id: plan
+      name: Plan read-only change
+      uses: agent-command.run
+      timeout: 20m
+      with:
+        profile: github-planner
+        workspace: .
+        prompt: |-
+          Inspect the repository and prepare a concrete implementation plan for
+          GitHub issue #${nodes.fetch_issue.issue.number}: ${nodes.fetch_issue.issue.title}
+
+          ${nodes.fetch_issue.issue.body}
+
+          Do not modify files. Return only the plan as Markdown.
+        mappings:
+          - {from: nodes.checkout.workspace, to: /workspace}
+    - id: publish_plan
+      name: Publish reconciled plan comment
+      uses: github.issue.comment
+      with:
+        owner: alexrett
+        repository: orchigram-e2e
+        tokenSecret: token
+        secretRefs: {token: github-e2e-token}
+        number: 1
+        body: |-
+          ## Orchigram implementation plan
+
+          ${nodes.plan.text}
+        mappings:
+          - {from: nodes.fetch_issue.issue.number, to: /number}
+    - id: approval
+      name: Approve implementation
+      uses: core.approval
+      timeout: 24h
+    - id: implement
+      name: Implement in workspace
+      uses: agent-command.run
+      timeout: 45m
+      with:
+        profile: github-implementer
+        workspace: .
+        prompt: |-
+          Implement GitHub issue #${nodes.fetch_issue.issue.number}: ${nodes.fetch_issue.issue.title}
+
+          Follow this approved plan:
+          ${nodes.plan.text}
+
+          Work only in the supplied repository workspace. Do not commit, push,
+          create a pull request, or modify credentials.
+        mappings:
+          - {from: nodes.checkout.workspace, to: /workspace}
+    - id: tests
+      name: Run configured test gate
+      uses: exec.run
+      timeout: 20m
+      with:
+        argv: [go, test, ./...]
+        directory: .
+        mappings:
+          - {from: nodes.checkout.workspace, to: /directory}
+    - id: push
+      name: Commit and push deterministic branch
+      uses: github.workspace.commit-push
+      timeout: 5m
+      with:
+        workspace: .
+        branch: orchigram/issue-1-placeholder
+        message: "Implement issue #${nodes.fetch_issue.issue.number}"
+        tokenSecret: token
+        secretRefs: {token: github-e2e-token}
+        mappings:
+          - {from: nodes.checkout.workspace, to: /workspace}
+          - {from: nodes.checkout.branch, to: /branch}
+    - id: create_pr
+      name: Create or reconcile pull request
+      uses: github.pr.ensure
+      with:
+        owner: alexrett
+        repository: orchigram-e2e
+        tokenSecret: token
+        secretRefs: {token: github-e2e-token}
+        head: orchigram/issue-1-placeholder
+        base: main
+        title: "Orchigram: ${nodes.fetch_issue.issue.title}"
+        body: |-
+          Implements #${nodes.fetch_issue.issue.number}.
+
+          Plan and execution are recorded by Orchigram. This pull request is
+          never merged automatically.
+        mappings:
+          - {from: nodes.checkout.branch, to: /head}
+    - id: final_status
+      name: Publish final issue status
+      uses: github.issue.comment
+      with:
+        owner: alexrett
+        repository: orchigram-e2e
+        tokenSecret: token
+        secretRefs: {token: github-e2e-token}
+        number: 1
+        body: "Orchigram completed the run and reconciled PR ${nodes.create_pr.url}."
+        mappings:
+          - {from: nodes.fetch_issue.issue.number, to: /number}
+  edges:
+    - {from: fetch_issue, to: checkout}
+    - {from: checkout, to: plan}
+    - {from: plan, to: publish_plan}
+    - {from: publish_plan, to: approval}
+    - {from: approval, to: implement, when: result.approved}
+    - {from: implement, to: tests}
+    - {from: tests, to: push}
+    - {from: push, to: create_pr}
+    - {from: create_pr, to: final_status}

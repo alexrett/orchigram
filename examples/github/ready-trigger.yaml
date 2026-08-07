@@ -1,0 +1,18 @@
+apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata:
+  name: orchigram-e2e-ready-issues
+  labels:
+    orchigram.dev/example: github-sdlc
+spec:
+  flow: github-issue-to-pr
+  provider:
+    plugin: github
+    config:
+      owner: alexrett
+      repository: orchigram-e2e
+      label: orchigram:ready
+      pollInterval: 30s
+      tokenSecret: token
+      secretRefs:
+        token: github-e2e-token

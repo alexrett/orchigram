@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,11 +14,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	pluginv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/plugin/v1alpha1"
 	"github.com/alexrett/orchigram/internal/flow"
+	"github.com/alexrett/orchigram/internal/githubplugin"
 	"github.com/alexrett/orchigram/internal/pluginbundle"
 	"github.com/alexrett/orchigram/internal/pluginprotocol"
 	"github.com/alexrett/orchigram/internal/pluginruntime"
@@ -46,8 +49,10 @@ func TestMain(m *testing.M) {
 			info.Capabilities = []string{"task.http.request"}
 			servers.Task = &pluginruntime.HTTP{}
 		case "github":
-			info.Capabilities = []string{"task.github.request"}
-			servers.Task = &pluginruntime.HTTP{Action: "github.request"}
+			info.Capabilities = githubplugin.Capabilities
+			githubRuntime := &githubplugin.Runtime{Runner: process.NewRunner()}
+			servers.Task = githubRuntime
+			servers.Trigger = githubRuntime
 		default:
 			os.Exit(2)
 		}
@@ -172,6 +177,90 @@ spec: {backend: env, key: ORCHIGRAM_TEST_WEBHOOK_URL}
 	if len(seenBodies) != 3 || !strings.Contains(seenBodies[2], `"text":"mapped message"`) {
 		t.Fatalf("mapped HTTP body: %+v", seenBodies)
 	}
+	t.Setenv("ORCHIGRAM_TEST_GITHUB_PROVIDER_TOKEN", "provider-token")
+	applyResource(t, state, `apiVersion: orchigram.dev/v1alpha1
+kind: SecretRef
+metadata: {name: github-provider-token}
+spec: {backend: env, key: ORCHIGRAM_TEST_GITHUB_PROVIDER_TOKEN}
+`)
+	var providerServer *httptest.Server
+	var providerMu sync.Mutex
+	providerComments := []map[string]any{}
+	providerServer = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer provider-token" {
+			writer.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/repos/acme/widget/issues/events":
+			_, _ = fmt.Fprintf(writer, `[{"id":77,"event":"labeled","issue_url":%q,"created_at":"2026-08-08T10:00:00Z","label":{"name":"orchigram:ready"}}]`, providerServer.URL+"/repos/acme/widget/issues/42")
+		case "/repos/acme/widget/issues/42":
+			_, _ = writer.Write([]byte(`{"number":42,"title":"provider issue","body":"fixture","html_url":"https://example.invalid/42","state":"open"}`))
+		case "/repos/acme/widget/issues/42/comments":
+			providerMu.Lock()
+			defer providerMu.Unlock()
+			if request.Method == http.MethodGet {
+				_ = json.NewEncoder(writer).Encode(providerComments)
+				return
+			}
+			var payload map[string]any
+			_ = json.NewDecoder(request.Body).Decode(&payload)
+			created := map[string]any{"id": 1, "html_url": "https://example.invalid/comment/1", "body": payload["body"]}
+			providerComments = append(providerComments, created)
+			writer.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(writer).Encode(created)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer providerServer.Close()
+	providerContext, stopProvider := context.WithCancel(context.Background())
+	providerAccepted := make(chan *pluginv1alpha1.TriggerEvent, 1)
+	providerDone := make(chan error, 1)
+	go func() {
+		providerDone <- manager.WatchTrigger(providerContext, "github", "trigger-fixture", map[string]any{
+			"owner": "acme", "repository": "widget", "apiBase": providerServer.URL, "label": "orchigram:ready", "pollInterval": "1h", "tokenSecret": "token",
+			"secretRefs": map[string]any{"token": "github-provider-token"},
+		}, "", func(event *pluginv1alpha1.TriggerEvent) error {
+			providerAccepted <- event
+			return nil
+		})
+	}()
+	select {
+	case event := <-providerAccepted:
+		if event.GetProviderEventId() != "github:acme/widget:issue-label-event:77" || event.GetCursor() != "77" || !strings.Contains(string(event.GetPayloadJson()), `"number":42`) {
+			t.Fatalf("provider event=%+v", event)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("GitHub provider did not emit fixture event")
+	}
+	time.Sleep(100 * time.Millisecond) // allow the post-callback acknowledgement to cross the stream
+	stopProvider()
+	select {
+	case <-providerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("GitHub provider stream did not stop")
+	}
+	githubCommentNode := flow.PlanNode{ID: "publish", Uses: "github.issue.comment", Timeout: "10s", With: map[string]any{
+		"owner": "acme", "repository": "widget", "apiBase": providerServer.URL, "tokenSecret": "token", "number": 42, "body": "Reconciled plan",
+		"secretRefs": map[string]any{"token": "github-provider-token"},
+	}}
+	firstGitHubOutput, err := manager.Execute(context.Background(), "run-github-reconcile", githubCommentNode, json.RawMessage(`{}`), nil, "github-comment-stable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.evict(installationKey("github", conformanceVersion))
+	secondGitHubOutput, err := manager.Execute(context.Background(), "run-github-reconcile", githubCommentNode, json.RawMessage(`{}`), nil, "github-comment-stable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	providerMu.Lock()
+	githubCommentCount := len(providerComments)
+	providerMu.Unlock()
+	if githubCommentCount != 1 || !strings.Contains(string(firstGitHubOutput), `"reconciled":false`) || !strings.Contains(string(secondGitHubOutput), `"reconciled":true`) {
+		t.Fatalf("GitHub restart reconciliation count=%d first=%s second=%s", githubCommentCount, firstGitHubOutput, secondGitHubOutput)
+	}
 
 	cancelContext, cancel := context.WithCancel(context.Background())
 	cancelled := make(chan error, 1)
@@ -268,7 +357,7 @@ func conformanceBundle(t *testing.T, name string, minimum, maximum uint32) []byt
 	digest := sha256.Sum256(binary)
 	capabilities := map[string][]string{
 		"exec": {"task.exec.run"}, "agent-command": {"agent.codex", "agent.claude", "agent.command"},
-		"http": {"task.http.request"}, "github": {"task.github.request"},
+		"http": {"task.http.request"}, "github": githubplugin.Capabilities,
 	}[name]
 	manifest := pluginbundle.Manifest{
 		APIVersion: pluginbundle.APIVersion, Name: name, Version: conformanceVersion,

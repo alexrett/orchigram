@@ -24,7 +24,7 @@ make check
 make cross-build
 ```
 
-See [Architecture](docs/architecture.md), [Durability](docs/durability.md), [Triggers](docs/triggers.md), [Security](docs/security.md), and [Plugin authoring](docs/plugin-authoring.md).
+See [Architecture](docs/architecture.md), [Durability](docs/durability.md), [Triggers](docs/triggers.md), [GitHub SDLC tracer](docs/github-sdlc.md), [Security](docs/security.md), and [Plugin authoring](docs/plugin-authoring.md).
 
 ## License
 

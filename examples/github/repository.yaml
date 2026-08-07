@@ -1,0 +1,11 @@
+apiVersion: orchigram.dev/v1alpha1
+kind: Repository
+metadata:
+  name: orchigram-e2e
+  labels:
+    orchigram.dev/example: github-sdlc
+spec:
+  cloneURL: https://github.com/alexrett/orchigram-e2e.git
+  defaultBranch: main
+  workspacePolicy: isolated-run
+  authSecretRef: github-e2e-token

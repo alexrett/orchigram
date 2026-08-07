@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,20 +32,23 @@ import (
 
 const maxSecretSize = 1 << 20
 
+var templateExpression = regexp.MustCompile(`\$\{([^{}]+)\}`)
+
 // Manager is both the plugin control plane and engine TaskExecutor.
 type Manager struct {
-	store     *store.Store
-	root      string
-	artifacts string
-	mu        sync.Mutex
-	processes map[string]*pluginhost.Process
+	store      *store.Store
+	root       string
+	artifacts  string
+	workspaces string
+	mu         sync.Mutex
+	processes  map[string]*pluginhost.Process
 }
 
 // New creates a manager rooted under the daemon's private state directory.
 func New(state *store.Store, stateRoot string) *Manager {
 	return &Manager{
 		store: state, root: filepath.Join(stateRoot, "plugins"),
-		artifacts: filepath.Join(stateRoot, "artifacts"), processes: map[string]*pluginhost.Process{},
+		artifacts: filepath.Join(stateRoot, "artifacts"), workspaces: filepath.Join(stateRoot, "workspaces"), processes: map[string]*pluginhost.Process{},
 	}
 }
 
@@ -189,6 +193,15 @@ func (m *Manager) ValidateAction(action string, config map[string]any) []flow.Di
 			copyConfig[key] = value
 		}
 	}
+	if action == "github.workspace.checkout" {
+		if err := m.expandRepositoryConfig(context.Background(), copyConfig); err != nil {
+			return []flow.Diagnostic{{Path: "config.repositoryRef", Code: "not_found", Message: err.Error()}}
+		}
+	}
+	if strings.HasPrefix(action, "github.workspace.") {
+		copyConfig["workspaceRoot"] = m.workspaces
+	}
+	delete(copyConfig, "secretRefs")
 	configJSON, err := json.Marshal(copyConfig)
 	if err != nil {
 		return []flow.Diagnostic{{Path: "config", Code: "invalid", Message: err.Error()}}
@@ -357,8 +370,19 @@ func (m *Manager) executeTask(ctx context.Context, process *pluginhost.Process, 
 	for key, value := range node.With {
 		config[key] = value
 	}
+	if err := renderConfigTemplates(config, input, nodes); err != nil {
+		return nil, err
+	}
 	if err := applyMappings(config, input, nodes); err != nil {
 		return nil, err
+	}
+	if node.Uses == "github.workspace.checkout" {
+		if err := m.expandRepositoryConfig(ctx, config); err != nil {
+			return nil, err
+		}
+	}
+	if strings.HasPrefix(node.Uses, "github.workspace.") {
+		config["workspaceRoot"] = m.workspaces
 	}
 	secrets, err := m.resolveNodeSecrets(ctx, config)
 	if err != nil {
@@ -375,6 +399,42 @@ func (m *Manager) executeTask(ctx context.Context, process *pluginhost.Process, 
 	stopCancel := m.cancelTaskOnContext(ctx, process, meta)
 	defer stopCancel()
 	return m.consume(ctx, runArtifact{runUID: meta.GetRunUid(), nodeID: meta.GetNodeId(), attempt: meta.GetAttempt(), redactions: secretValues(secrets)}, stream)
+}
+
+func (m *Manager) expandRepositoryConfig(ctx context.Context, config map[string]any) error {
+	name, _ := config["repositoryRef"].(string)
+	if name == "" {
+		return errors.New("repositoryRef is required")
+	}
+	document, err := m.store.Get(ctx, "Repository", resource.DefaultNamespace, name)
+	if err != nil {
+		return fmt.Errorf("resolve Repository %q: %w", name, err)
+	}
+	repository, err := resource.DecodeRepository(document.JSON)
+	if err != nil {
+		return err
+	}
+	delete(config, "repositoryRef")
+	config["cloneURL"] = repository.Spec.CloneURL
+	config["defaultBranch"] = repository.Spec.DefaultBranch
+	if repository.Spec.AuthSecretRef != "" {
+		bindings, exists := config["secretRefs"]
+		if !exists {
+			bindings = map[string]any{}
+			config["secretRefs"] = bindings
+		}
+		bindingMap, ok := bindings.(map[string]any)
+		if !ok {
+			return errors.New("with.secretRefs must be a string map")
+		}
+		if _, exists := bindingMap["token"]; !exists {
+			bindingMap["token"] = repository.Spec.AuthSecretRef
+		}
+		if _, exists := config["tokenSecret"]; !exists {
+			config["tokenSecret"] = "token"
+		}
+	}
+	return nil
 }
 
 func (m *Manager) executeAgent(ctx context.Context, process *pluginhost.Process, meta *pluginv1alpha1.CallMeta, node flow.PlanNode, input json.RawMessage, nodes map[string]any) (json.RawMessage, error) {
@@ -403,6 +463,9 @@ func (m *Manager) executeAgent(ctx context.Context, process *pluginhost.Process,
 		if key != "profile" {
 			config[key] = value
 		}
+	}
+	if err := renderConfigTemplates(config, input, nodes); err != nil {
+		return nil, err
 	}
 	if err := applyMappings(config, input, nodes); err != nil {
 		return nil, err
@@ -575,6 +638,66 @@ type valueMapping struct {
 	To   string `json:"to"`
 }
 
+func renderConfigTemplates(config map[string]any, input json.RawMessage, nodes map[string]any) error {
+	sources, err := mappingSources(input, nodes)
+	if err != nil {
+		return err
+	}
+	for key, value := range config {
+		rendered, renderErr := renderValue(value, sources)
+		if renderErr != nil {
+			return fmt.Errorf("render config %s: %w", key, renderErr)
+		}
+		config[key] = rendered
+	}
+	return nil
+}
+
+func renderValue(value any, sources map[string]any) (any, error) {
+	switch typed := value.(type) {
+	case string:
+		var renderErr error
+		rendered := templateExpression.ReplaceAllStringFunc(typed, func(match string) string {
+			path := templateExpression.FindStringSubmatch(match)[1]
+			resolved, err := lookupMappingValue(sources, path)
+			if err != nil {
+				renderErr = err
+				return match
+			}
+			if text, ok := resolved.(string); ok {
+				return text
+			}
+			encoded, err := json.Marshal(resolved)
+			if err != nil {
+				renderErr = err
+				return match
+			}
+			return string(encoded)
+		})
+		return rendered, renderErr
+	case map[string]any:
+		for key, child := range typed {
+			rendered, err := renderValue(child, sources)
+			if err != nil {
+				return nil, err
+			}
+			typed[key] = rendered
+		}
+		return typed, nil
+	case []any:
+		for index, child := range typed {
+			rendered, err := renderValue(child, sources)
+			if err != nil {
+				return nil, err
+			}
+			typed[index] = rendered
+		}
+		return typed, nil
+	default:
+		return value, nil
+	}
+}
+
 func applyMappings(config map[string]any, input json.RawMessage, nodes map[string]any) error {
 	raw, exists := config["mappings"]
 	if !exists {
@@ -591,13 +714,10 @@ func applyMappings(config map[string]any, input json.RawMessage, nodes map[strin
 	if err := decoder.Decode(&mappings); err != nil {
 		return fmt.Errorf("decode mappings: %w", err)
 	}
-	var decodedInput any
-	if len(input) > 0 {
-		if err := json.Unmarshal(input, &decodedInput); err != nil {
-			return fmt.Errorf("decode mapping input: %w", err)
-		}
+	sources, err := mappingSources(input, nodes)
+	if err != nil {
+		return err
 	}
-	sources := map[string]any{"input": decodedInput, "nodes": nodes}
 	for index, mapping := range mappings {
 		value, err := lookupMappingValue(sources, mapping.From)
 		if err != nil {
@@ -608,6 +728,16 @@ func applyMappings(config map[string]any, input json.RawMessage, nodes map[strin
 		}
 	}
 	return nil
+}
+
+func mappingSources(input json.RawMessage, nodes map[string]any) (map[string]any, error) {
+	var decodedInput any
+	if len(input) > 0 {
+		if err := json.Unmarshal(input, &decodedInput); err != nil {
+			return nil, fmt.Errorf("decode mapping input: %w", err)
+		}
+	}
+	return map[string]any{"input": decodedInput, "nodes": nodes}, nil
 }
 
 func lookupMappingValue(root any, path string) (any, error) {

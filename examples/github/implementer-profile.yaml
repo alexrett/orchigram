@@ -1,0 +1,10 @@
+apiVersion: orchigram.dev/v1alpha1
+kind: AgentProfile
+metadata:
+  name: github-implementer
+  labels:
+    orchigram.dev/example: github-sdlc
+spec:
+  type: codex
+  effort: high
+  sandbox: workspace-write
