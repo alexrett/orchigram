@@ -21,10 +21,10 @@
 
 ## Triggers
 
-- [ ] TRG-01: Five-field schedules with timezone, DST, misfire, concurrency, and deduplication.
-- [ ] TRG-02: Opt-in durable webhook ingress with bearer SecretRef and body limit.
-- [ ] TRG-03: Cursor-backed provider subscriptions and persisted acknowledgement.
-- [ ] TRG-04: Weekday Teams-compatible scheduled tracer.
+- [x] TRG-01: Five-field schedules with timezone, DST, misfire, concurrency, and deduplication.
+- [x] TRG-02: Opt-in durable webhook ingress with bearer SecretRef and body limit.
+- [x] TRG-03: Cursor-backed provider subscriptions and persisted acknowledgement.
+- [x] TRG-04: Weekday Teams-compatible scheduled tracer.
 
 ## GitHub tracer
 
