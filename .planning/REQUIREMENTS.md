@@ -15,9 +15,9 @@
 
 ## Plugins
 
-- [ ] PLG-01: Immutable bundle install, digest verification, protocol negotiation, activation, rollback.
-- [ ] PLG-02: Agent command, exec, HTTP, and GitHub plugin binaries.
-- [ ] PLG-03: Crash isolation, deadline/cancel propagation, process-tree cleanup, secret-minimized environments.
+- [x] PLG-01: Immutable bundle install, digest verification, protocol negotiation, activation, rollback.
+- [x] PLG-02: Agent command, exec, HTTP, and GitHub plugin binaries.
+- [x] PLG-03: Crash isolation, deadline/cancel propagation, process-tree cleanup, secret-minimized environments.
 
 ## Triggers
 
