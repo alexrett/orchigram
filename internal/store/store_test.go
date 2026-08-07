@@ -93,3 +93,31 @@ func TestTriggerReceiptAndOutboxAreDeduplicated(t *testing.T) {
 		t.Fatalf("second command: %v", err)
 	}
 }
+
+func TestPluginVersionsActivateAndRollbackWithoutOverwrite(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openTestStore(t)
+	for _, version := range []string{"0.1.0", "0.2.0"} {
+		if err := s.PutPlugin(ctx, PluginRecord{Name: "exec", Version: version, Digest: "digest-" + version, ManifestJSON: json.RawMessage(`{"name":"exec"}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.PutPlugin(ctx, PluginRecord{Name: "exec", Version: "0.1.0", Digest: "different", ManifestJSON: json.RawMessage(`{}`)}); err == nil {
+		t.Fatal("immutable plugin version was overwritten")
+	}
+	if err := s.ActivatePlugin(ctx, "exec", "0.2.0"); err != nil {
+		t.Fatal(err)
+	}
+	active, err := s.Plugin(ctx, "exec", "")
+	if err != nil || active.Version != "0.2.0" || !active.Active {
+		t.Fatalf("active=%+v err=%v", active, err)
+	}
+	if err := s.ActivatePlugin(ctx, "exec", "0.1.0"); err != nil {
+		t.Fatal(err)
+	}
+	rolledBack, err := s.Plugin(ctx, "exec", "")
+	if err != nil || rolledBack.Version != "0.1.0" {
+		t.Fatalf("rollback=%+v err=%v", rolledBack, err)
+	}
+}

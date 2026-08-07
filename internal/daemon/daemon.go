@@ -16,6 +16,7 @@ import (
 	"github.com/alexrett/orchigram/internal/engine"
 	"github.com/alexrett/orchigram/internal/flow"
 	"github.com/alexrett/orchigram/internal/orchestrator"
+	"github.com/alexrett/orchigram/internal/pluginmanager"
 	"github.com/alexrett/orchigram/internal/server"
 	"github.com/alexrett/orchigram/internal/store"
 	"google.golang.org/grpc"
@@ -27,6 +28,7 @@ type Daemon struct {
 	store        *store.Store
 	engine       *engine.Adapter
 	orchestrator *orchestrator.Orchestrator
+	plugins      *pluginmanager.Manager
 	grpc         *grpc.Server
 	listener     net.Listener
 	closeOnce    sync.Once
@@ -50,6 +52,10 @@ func Open(ctx context.Context, cfg config.Config, executor engine.TaskExecutor) 
 	if err != nil {
 		return nil, err
 	}
+	plugins := pluginmanager.New(state, cfg.StateDir)
+	if executor == nil {
+		executor = plugins
+	}
 	durable, err := engine.Open(ctx, filepath.Join(cfg.StateDir, "workflows.sqlite"), state, executor)
 	if err != nil {
 		_ = state.Close()
@@ -68,14 +74,14 @@ func Open(ctx context.Context, cfg config.Config, executor engine.TaskExecutor) 
 		_ = state.Close()
 		return nil, fmt.Errorf("set unix socket mode: %w", err)
 	}
-	compiler := flow.NewCompiler(nil)
+	compiler := flow.NewCompiler(plugins)
 	control := orchestrator.New(state, compiler, durable)
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(2<<20),
 		grpc.MaxSendMsgSize(8<<20),
 	)
-	server.NewAPI(state, compiler, control, durable).Register(grpcServer)
-	return &Daemon{config: cfg, store: state, engine: durable, orchestrator: control, grpc: grpcServer, listener: listener}, nil
+	server.NewAPI(state, compiler, control, durable, plugins).Register(grpcServer)
+	return &Daemon{config: cfg, store: state, engine: durable, orchestrator: control, plugins: plugins, grpc: grpcServer, listener: listener}, nil
 }
 
 // Serve starts reconciliation and serves until context cancellation or failure.
@@ -114,6 +120,9 @@ func (d *Daemon) Close() error {
 		}
 		if d.engine != nil {
 			result = errors.Join(result, d.engine.Close())
+		}
+		if d.plugins != nil {
+			d.plugins.Close()
 		}
 		if d.store != nil {
 			result = errors.Join(result, d.store.Close())

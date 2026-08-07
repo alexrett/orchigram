@@ -288,6 +288,38 @@ func DecodeFlow(data []byte) (Flow, error) {
 	return flow, nil
 }
 
+// DecodeAgentProfile decodes and returns a concrete AgentProfile.
+func DecodeAgentProfile(data []byte) (AgentProfile, error) {
+	doc, err := DecodeStrict(data)
+	if err != nil {
+		return AgentProfile{}, err
+	}
+	if doc.Kind != "AgentProfile" {
+		return AgentProfile{}, fmt.Errorf("expected AgentProfile, got %s", doc.Kind)
+	}
+	var profile AgentProfile
+	if err := json.Unmarshal(doc.JSON, &profile); err != nil {
+		return AgentProfile{}, err
+	}
+	return profile, nil
+}
+
+// DecodeSecretRef decodes and returns a concrete SecretRef projection.
+func DecodeSecretRef(data []byte) (SecretRef, error) {
+	doc, err := DecodeStrict(data)
+	if err != nil {
+		return SecretRef{}, err
+	}
+	if doc.Kind != "SecretRef" {
+		return SecretRef{}, fmt.Errorf("expected SecretRef, got %s", doc.Kind)
+	}
+	var secret SecretRef
+	if err := json.Unmarshal(doc.JSON, &secret); err != nil {
+		return SecretRef{}, err
+	}
+	return secret, nil
+}
+
 // ValidateMetadata enforces stable DNS-like resource keys.
 func ValidateMetadata(meta ObjectMeta) error {
 	if !dnsName.MatchString(meta.Name) || len(meta.Name) > 63 {
@@ -358,6 +390,9 @@ func validateKind(value any) error {
 		if v.Spec.Type != "codex" && v.Spec.Type != "claude" && v.Spec.Type != "command" {
 			return fmt.Errorf("AgentProfile.spec.type %q is unsupported", v.Spec.Type)
 		}
+		if v.Spec.Type == "command" && strings.TrimSpace(v.Spec.Executable) == "" {
+			return errors.New("AgentProfile command type requires an executable")
+		}
 	case *PluginInstallation:
 		if v.Spec.Plugin == "" || v.Spec.Version == "" || v.Spec.Digest == "" {
 			return errors.New("PluginInstallation plugin, version, and digest are required")
@@ -365,6 +400,9 @@ func validateKind(value any) error {
 	case *SecretRef:
 		if v.Spec.Backend == "" || v.Spec.Key == "" {
 			return errors.New("SecretRef backend and key are required")
+		}
+		if v.Spec.Backend != "env" && v.Spec.Backend != "environment" && v.Spec.Backend != "file" {
+			return fmt.Errorf("SecretRef backend %q is unsupported", v.Spec.Backend)
 		}
 	}
 	return nil

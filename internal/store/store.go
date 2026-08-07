@@ -717,6 +717,137 @@ func (s *Store) MarkApprovalSignaled(ctx context.Context, runUID, nodeID string)
 	return err
 }
 
+// PluginRecord is the authoritative immutable installation projection.
+type PluginRecord struct {
+	Name         string
+	Version      string
+	Digest       string
+	ManifestJSON json.RawMessage
+	State        string
+	InstalledAt  time.Time
+	Active       bool
+}
+
+// PutPlugin records one immutable plugin version idempotently.
+func (s *Store) PutPlugin(ctx context.Context, record PluginRecord) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var existingDigest string
+	err = tx.QueryRowContext(ctx, `SELECT digest FROM plugin_installations WHERE name=? AND version=?`, record.Name, record.Version).Scan(&existingDigest)
+	if err == nil {
+		if existingDigest != record.Digest {
+			return fmt.Errorf("plugin %s version %s already has digest %s", record.Name, record.Version, existingDigest)
+		}
+		return tx.Commit()
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	state := record.State
+	if state == "" {
+		state = "installed"
+	}
+	installedAt := record.InstalledAt
+	if installedAt.IsZero() {
+		installedAt = s.now().UTC()
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO plugin_installations(name,version,digest,manifest_json,state,installed_at) VALUES(?,?,?,?,?,?)`, record.Name, record.Version, record.Digest, []byte(record.ManifestJSON), state, installedAt.Format(time.RFC3339Nano)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ActivatePlugin atomically switches one plugin name to an installed version.
+func (s *Store) ActivatePlugin(ctx context.Context, name, version string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM plugin_installations WHERE name=? AND version=?`, name, version).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO plugin_activations(name,version,activated_at) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET version=excluded.version,activated_at=excluded.activated_at`, name, version, s.timestamp()); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE plugin_installations SET state=CASE WHEN name=? AND version=? THEN 'active' WHEN name=? AND state='active' THEN 'installed' ELSE state END`, name, version, name); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// DisablePlugin removes an activation without deleting immutable versions.
+func (s *Store) DisablePlugin(ctx context.Context, name string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.ExecContext(ctx, `DELETE FROM plugin_activations WHERE name=?`, name)
+	if err != nil {
+		return err
+	}
+	changed, _ := result.RowsAffected()
+	if changed == 0 {
+		return ErrNotFound
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE plugin_installations SET state='installed' WHERE name=? AND state='active'`, name); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// Plugin returns one installed version, or the active version when version is empty.
+func (s *Store) Plugin(ctx context.Context, name, version string) (PluginRecord, error) {
+	query := `SELECT p.name,p.version,p.digest,p.manifest_json,p.state,p.installed_at,CASE WHEN a.version=p.version THEN 1 ELSE 0 END FROM plugin_installations p LEFT JOIN plugin_activations a ON a.name=p.name WHERE p.name=? AND p.version=?`
+	arguments := []any{name, version}
+	if version == "" {
+		query = `SELECT p.name,p.version,p.digest,p.manifest_json,p.state,p.installed_at,1 FROM plugin_activations a JOIN plugin_installations p ON p.name=a.name AND p.version=a.version WHERE p.name=?`
+		arguments = []any{name}
+	}
+	var record PluginRecord
+	var installed string
+	var active int
+	if err := s.db.QueryRowContext(ctx, query, arguments...).Scan(&record.Name, &record.Version, &record.Digest, &record.ManifestJSON, &record.State, &installed, &active); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return PluginRecord{}, ErrNotFound
+		}
+		return PluginRecord{}, err
+	}
+	record.InstalledAt, _ = time.Parse(time.RFC3339Nano, installed)
+	record.Active = active == 1
+	return record, nil
+}
+
+// ListPlugins returns immutable versions in stable name/version order.
+func (s *Store) ListPlugins(ctx context.Context) ([]PluginRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT p.name,p.version,p.digest,p.manifest_json,p.state,p.installed_at,CASE WHEN a.version=p.version THEN 1 ELSE 0 END FROM plugin_installations p LEFT JOIN plugin_activations a ON a.name=p.name ORDER BY p.name,p.version`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	result := []PluginRecord{}
+	for rows.Next() {
+		var record PluginRecord
+		var installed string
+		var active int
+		if err := rows.Scan(&record.Name, &record.Version, &record.Digest, &record.ManifestJSON, &record.State, &installed, &active); err != nil {
+			return nil, err
+		}
+		record.InstalledAt, _ = time.Parse(time.RFC3339Nano, installed)
+		record.Active = active == 1
+		result = append(result, record)
+	}
+	return result, rows.Err()
+}
+
 // ApprovalState returns the persisted decision.
 func (s *Store) ApprovalState(ctx context.Context, runUID, nodeID string) (string, error) {
 	var state string

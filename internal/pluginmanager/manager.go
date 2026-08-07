@@ -1,0 +1,656 @@
+// Package pluginmanager installs, activates, supervises, and invokes plugins.
+package pluginmanager
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+	"unicode"
+
+	pluginv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/plugin/v1alpha1"
+	"github.com/alexrett/orchigram/internal/flow"
+	"github.com/alexrett/orchigram/internal/pluginbundle"
+	"github.com/alexrett/orchigram/internal/pluginhost"
+	"github.com/alexrett/orchigram/internal/resource"
+	"github.com/alexrett/orchigram/internal/store"
+	"github.com/google/uuid"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+const maxSecretSize = 1 << 20
+
+// Manager is both the plugin control plane and engine TaskExecutor.
+type Manager struct {
+	store     *store.Store
+	root      string
+	artifacts string
+	mu        sync.Mutex
+	processes map[string]*pluginhost.Process
+}
+
+// New creates a manager rooted under the daemon's private state directory.
+func New(state *store.Store, stateRoot string) *Manager {
+	return &Manager{
+		store: state, root: filepath.Join(stateRoot, "plugins"),
+		artifacts: filepath.Join(stateRoot, "artifacts"), processes: map[string]*pluginhost.Process{},
+	}
+}
+
+// Install validates an archive, executes protocol negotiation, then records it.
+func (m *Manager) Install(ctx context.Context, bundle []byte) (store.PluginRecord, error) {
+	manifest, _, _, err := pluginbundle.Parse(bundle)
+	if err != nil {
+		return store.PluginRecord{}, err
+	}
+	if manifest.Protocol.Minimum > 1 || manifest.Protocol.Maximum < 1 {
+		return store.PluginRecord{}, fmt.Errorf("plugin protocol range %d-%d is incompatible with host protocol 1", manifest.Protocol.Minimum, manifest.Protocol.Maximum)
+	}
+	installed, err := pluginbundle.Install(m.root, bundle)
+	if err != nil {
+		return store.PluginRecord{}, err
+	}
+	platform, err := installed.Manifest.CurrentPlatform()
+	if err != nil {
+		return store.PluginRecord{}, err
+	}
+	process, description, err := pluginhost.Launch(ctx, installed.Executable, platform.SHA256)
+	if err != nil {
+		return store.PluginRecord{}, err
+	}
+	process.Close()
+	if description.GetName() != installed.Manifest.Name || description.GetVersion() != installed.Manifest.Version {
+		return store.PluginRecord{}, fmt.Errorf("plugin identity %s@%s does not match manifest %s@%s", description.GetName(), description.GetVersion(), installed.Manifest.Name, installed.Manifest.Version)
+	}
+	if !sameCapabilities(description.GetCapabilities(), installed.Manifest.Capabilities) {
+		return store.PluginRecord{}, errors.New("plugin capabilities do not match manifest")
+	}
+	manifestJSON, err := json.Marshal(installed.Manifest)
+	if err != nil {
+		return store.PluginRecord{}, err
+	}
+	record := store.PluginRecord{Name: installed.Manifest.Name, Version: installed.Manifest.Version, Digest: installed.Digest, ManifestJSON: manifestJSON, State: "installed"}
+	if err := m.store.PutPlugin(ctx, record); err != nil {
+		return store.PluginRecord{}, err
+	}
+	return m.store.Plugin(ctx, record.Name, record.Version)
+}
+
+// Enable launches and health-checks a version before atomically activating it.
+func (m *Manager) Enable(ctx context.Context, name, version string) error {
+	record, err := m.store.Plugin(ctx, name, version)
+	if err != nil {
+		return err
+	}
+	process, err := m.launch(ctx, record)
+	if err != nil {
+		return err
+	}
+	healthContext, cancel := context.WithTimeout(ctx, 5*time.Second)
+	health, err := process.Clients().Control.Health(healthContext, &emptypb.Empty{})
+	cancel()
+	if err != nil || !health.GetReady() {
+		process.Close()
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("plugin %s@%s is not ready: %s", name, version, health.GetMessage())
+	}
+	if err := m.store.ActivatePlugin(ctx, name, version); err != nil {
+		process.Close()
+		return err
+	}
+	key := installationKey(name, version)
+	m.mu.Lock()
+	for candidate, running := range m.processes {
+		if strings.HasPrefix(candidate, name+"@") && candidate != key {
+			running.Close()
+			delete(m.processes, candidate)
+		}
+	}
+	m.processes[key] = process
+	m.mu.Unlock()
+	return nil
+}
+
+// Disable stops the active process and leaves immutable versions installed.
+func (m *Manager) Disable(ctx context.Context, name string) error {
+	record, err := m.store.Plugin(ctx, name, "")
+	if err != nil {
+		return err
+	}
+	if err := m.store.DisablePlugin(ctx, name); err != nil {
+		return err
+	}
+	m.evict(installationKey(name, record.Version))
+	return nil
+}
+
+// List returns every installed immutable version.
+func (m *Manager) List(ctx context.Context) ([]store.PluginRecord, error) {
+	return m.store.ListPlugins(ctx)
+}
+
+// HasAction implements flow.CapabilityResolver against active installations.
+func (m *Manager) HasAction(action string) bool {
+	name := strings.SplitN(action, ".", 2)[0]
+	record, err := m.store.Plugin(context.Background(), name, "")
+	if err != nil {
+		return false
+	}
+	var manifest pluginbundle.Manifest
+	if json.Unmarshal(record.ManifestJSON, &manifest) != nil {
+		return false
+	}
+	for _, capability := range manifest.Capabilities {
+		if capability == action || capability == "task."+action {
+			return true
+		}
+		if name == "agent-command" && action == "agent-command.run" && strings.HasPrefix(capability, "agent.") {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateAction asks the active provider to validate configuration at compile time.
+func (m *Manager) ValidateAction(action string, config map[string]any) []flow.Diagnostic {
+	name := strings.SplitN(action, ".", 2)[0]
+	if name == "agent-command" {
+		profile, _ := config["profile"].(string)
+		if profile == "" {
+			return []flow.Diagnostic{{Path: "config.profile", Code: "required", Message: "agent-command action requires a profile"}}
+		}
+		if _, err := m.store.Get(context.Background(), "AgentProfile", resource.DefaultNamespace, profile); err != nil {
+			return []flow.Diagnostic{{Path: "config.profile", Code: "not_found", Message: fmt.Sprintf("AgentProfile %q is not available", profile)}}
+		}
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	process, _, err := m.activeProcess(ctx, name)
+	if err != nil {
+		return []flow.Diagnostic{{Path: "config", Code: "plugin_unavailable", Message: err.Error()}}
+	}
+	copyConfig := make(map[string]any, len(config))
+	for key, value := range config {
+		if key != "secretRefs" {
+			copyConfig[key] = value
+		}
+	}
+	configJSON, err := json.Marshal(copyConfig)
+	if err != nil {
+		return []flow.Diagnostic{{Path: "config", Code: "invalid", Message: err.Error()}}
+	}
+	response, err := process.Clients().Task.ValidateAction(ctx, &pluginv1alpha1.ValidateActionRequest{Action: action, ConfigJson: configJSON})
+	if err != nil {
+		return []flow.Diagnostic{{Path: "config", Code: "validation_failed", Message: err.Error()}}
+	}
+	diagnostics := make([]flow.Diagnostic, 0, len(response.GetIssues()))
+	for _, issue := range response.GetIssues() {
+		diagnostics = append(diagnostics, flow.Diagnostic{Path: issue.GetPath(), Code: issue.GetCode(), Message: issue.GetMessage()})
+	}
+	return diagnostics
+}
+
+// Describe returns one installed or active version.
+func (m *Manager) Describe(ctx context.Context, name, version string) (store.PluginRecord, error) {
+	return m.store.Plugin(ctx, name, version)
+}
+
+// Doctor launches the selected plugin and verifies negotiation plus health.
+func (m *Manager) Doctor(ctx context.Context, name, version string) error {
+	record, err := m.store.Plugin(ctx, name, version)
+	if err != nil {
+		return err
+	}
+	process, err := m.launch(ctx, record)
+	if err != nil {
+		return err
+	}
+	defer process.Close()
+	health, err := process.Clients().Control.Health(ctx, &emptypb.Empty{})
+	if err != nil {
+		return err
+	}
+	if !health.GetReady() {
+		return fmt.Errorf("plugin is not ready: %s", health.GetMessage())
+	}
+	if name == "agent-command" {
+		profiles, _, err := m.store.List(ctx, "AgentProfile", resource.DefaultNamespace, 1000)
+		if err != nil {
+			return err
+		}
+		for _, document := range profiles {
+			profile, err := resource.DecodeAgentProfile(document.JSON)
+			if err != nil {
+				return err
+			}
+			secrets, err := m.resolveProfileSecrets(ctx, profile.Spec.SecretRefs)
+			if err != nil {
+				return fmt.Errorf("agent profile %s: %w", profile.Metadata.Name, err)
+			}
+			profileJSON, err := json.Marshal(profile.Spec)
+			if err != nil {
+				return err
+			}
+			meta := &pluginv1alpha1.CallMeta{RequestId: uuid.NewString(), RunUid: "doctor", NodeId: profile.Metadata.Name, Attempt: 1, IdempotencyKey: "doctor/" + profile.Metadata.UID, Deadline: timestamppb.New(time.Now().Add(30 * time.Second))}
+			stream, err := process.Clients().Agent.Execute(ctx, &pluginv1alpha1.AgentRequest{Meta: meta, ProfileType: profile.Spec.Type, ProfileJson: profileJSON, InputJson: []byte(`{"doctor":true}`), Secrets: secrets})
+			if err != nil {
+				return fmt.Errorf("agent profile %s authentication: %w", profile.Metadata.Name, err)
+			}
+			if err := drainDoctor(stream); err != nil {
+				return fmt.Errorf("agent profile %s authentication: %w", profile.Metadata.Name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// Execute implements engine.TaskExecutor for non-core Flow nodes.
+func (m *Manager) Execute(ctx context.Context, runUID string, node flow.PlanNode, input json.RawMessage, idempotencyKey string) (json.RawMessage, error) {
+	pluginName := strings.SplitN(node.Uses, ".", 2)[0]
+	process, record, err := m.activeProcess(ctx, pluginName)
+	if err != nil {
+		return nil, err
+	}
+	requestID := uuid.NewString()
+	deadline := time.Now().Add(30 * time.Minute)
+	if parsed, parseErr := time.ParseDuration(node.Timeout); parseErr == nil {
+		deadline = time.Now().Add(parsed)
+	}
+	callMeta := &pluginv1alpha1.CallMeta{
+		RequestId: requestID, RunUid: runUID, NodeId: node.ID, Attempt: 1,
+		IdempotencyKey: idempotencyKey, Deadline: timestamppb.New(deadline),
+	}
+	callContext, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	if pluginName == "agent-command" {
+		output, executeErr := m.executeAgent(callContext, process, callMeta, node, input)
+		if executeErr != nil && process.Exited() {
+			m.evict(installationKey(record.Name, record.Version))
+		}
+		return output, executeErr
+	}
+	output, executeErr := m.executeTask(callContext, process, callMeta, node, input)
+	if executeErr != nil && process.Exited() {
+		m.evict(installationKey(record.Name, record.Version))
+	}
+	return output, executeErr
+}
+
+// Close stops every supervised plugin process.
+func (m *Manager) Close() {
+	m.mu.Lock()
+	processes := make([]*pluginhost.Process, 0, len(m.processes))
+	for _, process := range m.processes {
+		processes = append(processes, process)
+	}
+	m.processes = map[string]*pluginhost.Process{}
+	m.mu.Unlock()
+	for _, process := range processes {
+		process.Close()
+	}
+}
+
+func (m *Manager) executeTask(ctx context.Context, process *pluginhost.Process, meta *pluginv1alpha1.CallMeta, node flow.PlanNode, input json.RawMessage) (json.RawMessage, error) {
+	config := make(map[string]any, len(node.With))
+	for key, value := range node.With {
+		config[key] = value
+	}
+	secrets, err := m.resolveNodeSecrets(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	configJSON, err := json.Marshal(config)
+	if err != nil {
+		return nil, err
+	}
+	stream, err := process.Clients().Task.Execute(ctx, &pluginv1alpha1.ExecuteRequest{Meta: meta, Action: node.Uses, InputJson: input, ConfigJson: configJSON, Secrets: secrets})
+	if err != nil {
+		return nil, err
+	}
+	stopCancel := m.cancelTaskOnContext(ctx, process, meta)
+	defer stopCancel()
+	return m.consume(ctx, runArtifact{runUID: meta.GetRunUid(), nodeID: meta.GetNodeId(), attempt: meta.GetAttempt(), redactions: secretValues(secrets)}, stream)
+}
+
+func (m *Manager) executeAgent(ctx context.Context, process *pluginhost.Process, meta *pluginv1alpha1.CallMeta, node flow.PlanNode, input json.RawMessage) (json.RawMessage, error) {
+	profileName, _ := node.With["profile"].(string)
+	if profileName == "" {
+		return nil, errors.New("agent-command node requires with.profile")
+	}
+	document, err := m.store.Get(ctx, "AgentProfile", resource.DefaultNamespace, profileName)
+	if err != nil {
+		return nil, err
+	}
+	profile, err := resource.DecodeAgentProfile(document.JSON)
+	if err != nil {
+		return nil, err
+	}
+	secrets, err := m.resolveProfileSecrets(ctx, profile.Spec.SecretRefs)
+	if err != nil {
+		return nil, err
+	}
+	profileJSON, err := json.Marshal(profile.Spec)
+	if err != nil {
+		return nil, err
+	}
+	stream, err := process.Clients().Agent.Execute(ctx, &pluginv1alpha1.AgentRequest{Meta: meta, ProfileType: profile.Spec.Type, ProfileJson: profileJSON, InputJson: input, Secrets: secrets})
+	if err != nil {
+		return nil, err
+	}
+	stopCancel := m.cancelAgentOnContext(ctx, process, meta)
+	defer stopCancel()
+	return m.consume(ctx, runArtifact{runUID: meta.GetRunUid(), nodeID: meta.GetNodeId(), attempt: meta.GetAttempt(), redactions: secretValues(secrets)}, stream)
+}
+
+type eventReceiver interface {
+	Recv() (*pluginv1alpha1.ExecuteEvent, error)
+}
+
+type runArtifact struct {
+	runUID     string
+	nodeID     string
+	attempt    uint32
+	redactions [][]byte
+}
+
+func (m *Manager) consume(ctx context.Context, artifact runArtifact, stream eventReceiver) (json.RawMessage, error) {
+	var expected uint64 = 1
+	var output json.RawMessage
+	completed := false
+	for {
+		event, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			if !completed {
+				return nil, errors.New("plugin stream ended without a completion event")
+			}
+			return output, nil
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, err
+		}
+		if event.GetSequence() != expected || event.GetType() == "" || event.GetOccurredAt() == nil || !event.GetOccurredAt().IsValid() {
+			return nil, fmt.Errorf("malformed plugin stream at sequence %d", expected)
+		}
+		expected++
+		if len(event.GetRawLog()) > 0 {
+			if err := m.appendArtifact(artifact, redact(event.GetRawLog(), artifact.redactions)); err != nil {
+				return nil, err
+			}
+		}
+		if len(event.GetPayloadJson()) > 0 {
+			payload := redact(event.GetPayloadJson(), artifact.redactions)
+			if !json.Valid(payload) {
+				return nil, fmt.Errorf("plugin event %d contains invalid JSON", event.GetSequence())
+			}
+			output = append(output[:0], payload...)
+		}
+		if strings.HasSuffix(event.GetType(), ".failed") {
+			return nil, fmt.Errorf("plugin reported %s", event.GetType())
+		}
+		if strings.HasSuffix(event.GetType(), ".completed") {
+			completed = true
+		}
+	}
+}
+
+func (m *Manager) activeProcess(ctx context.Context, name string) (*pluginhost.Process, store.PluginRecord, error) {
+	record, err := m.store.Plugin(ctx, name, "")
+	if err != nil {
+		return nil, store.PluginRecord{}, fmt.Errorf("active plugin %q: %w", name, err)
+	}
+	key := installationKey(name, record.Version)
+	m.mu.Lock()
+	if running := m.processes[key]; running != nil && !running.Exited() {
+		m.mu.Unlock()
+		return running, record, nil
+	}
+	m.mu.Unlock()
+	process, err := m.launch(ctx, record)
+	if err != nil {
+		return nil, store.PluginRecord{}, err
+	}
+	m.mu.Lock()
+	if existing := m.processes[key]; existing != nil && !existing.Exited() {
+		m.mu.Unlock()
+		process.Close()
+		return existing, record, nil
+	}
+	m.processes[key] = process
+	m.mu.Unlock()
+	return process, record, nil
+}
+
+func (m *Manager) launch(ctx context.Context, record store.PluginRecord) (*pluginhost.Process, error) {
+	var manifest pluginbundle.Manifest
+	if err := json.Unmarshal(record.ManifestJSON, &manifest); err != nil {
+		return nil, err
+	}
+	platform, err := manifest.CurrentPlatform()
+	if err != nil {
+		return nil, err
+	}
+	executable := filepath.Join(m.root, record.Name, record.Version, "plugin")
+	process, description, err := pluginhost.Launch(ctx, executable, platform.SHA256)
+	if err != nil {
+		return nil, err
+	}
+	if description.GetName() != record.Name || description.GetVersion() != record.Version {
+		process.Close()
+		return nil, errors.New("running plugin identity does not match installation")
+	}
+	return process, nil
+}
+
+func (m *Manager) resolveNodeSecrets(ctx context.Context, config map[string]any) (map[string][]byte, error) {
+	value, exists := config["secretRefs"]
+	if !exists {
+		return nil, nil
+	}
+	delete(config, "secretRefs")
+	references, ok := value.(map[string]any)
+	if !ok {
+		return nil, errors.New("with.secretRefs must be a string map")
+	}
+	result := make(map[string][]byte, len(references))
+	for target, untyped := range references {
+		name, ok := untyped.(string)
+		if !ok || name == "" {
+			return nil, fmt.Errorf("secret reference for %s must be a resource name", target)
+		}
+		secret, err := m.resolveSecret(ctx, name)
+		if err != nil {
+			return nil, err
+		}
+		result[target] = secret
+	}
+	return result, nil
+}
+
+func (m *Manager) resolveProfileSecrets(ctx context.Context, references []string) (map[string][]byte, error) {
+	result := make(map[string][]byte, len(references))
+	for _, binding := range references {
+		target, name := "", binding
+		if parts := strings.SplitN(binding, "=", 2); len(parts) == 2 {
+			target, name = parts[0], parts[1]
+		}
+		if target == "" {
+			target = secretEnvironmentName(name)
+		}
+		secret, err := m.resolveSecret(ctx, name)
+		if err != nil {
+			return nil, err
+		}
+		result[target] = secret
+	}
+	return result, nil
+}
+
+func (m *Manager) resolveSecret(ctx context.Context, name string) ([]byte, error) {
+	document, err := m.store.Get(ctx, "SecretRef", resource.DefaultNamespace, name)
+	if err != nil {
+		return nil, fmt.Errorf("resolve SecretRef %q: %w", name, err)
+	}
+	reference, err := resource.DecodeSecretRef(document.JSON)
+	if err != nil {
+		return nil, err
+	}
+	switch reference.Spec.Backend {
+	case "environment", "env":
+		value, exists := os.LookupEnv(reference.Spec.Key)
+		if !exists {
+			return nil, fmt.Errorf("SecretRef %q is not configured", name)
+		}
+		return []byte(value), nil
+	case "file":
+		file, err := os.Open(filepath.Clean(reference.Spec.Key)) //nolint:gosec // The operator explicitly configures this SecretRef path.
+		if err != nil {
+			return nil, fmt.Errorf("SecretRef %q is not configured", name)
+		}
+		defer func() { _ = file.Close() }()
+		data, err := io.ReadAll(io.LimitReader(file, maxSecretSize+1))
+		if err != nil || len(data) > maxSecretSize {
+			return nil, fmt.Errorf("SecretRef %q could not be read within the size limit", name)
+		}
+		return data, nil
+	default:
+		return nil, fmt.Errorf("SecretRef %q uses unsupported backend %q", name, reference.Spec.Backend)
+	}
+}
+
+func (m *Manager) appendArtifact(artifact runArtifact, data []byte) error {
+	directory := filepath.Join(m.artifacts, artifact.runUID, artifact.nodeID, fmt.Sprintf("attempt-%d", artifact.attempt))
+	if err := os.MkdirAll(directory, 0o750); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(filepath.Join(directory, "raw.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600) //nolint:gosec // Run and node identifiers are compiler-validated path components.
+	if err != nil {
+		return err
+	}
+	defer func() { _ = file.Close() }()
+	_, err = file.Write(data)
+	return err
+}
+
+func (m *Manager) cancelTaskOnContext(ctx context.Context, process *pluginhost.Process, meta *pluginv1alpha1.CallMeta) func() {
+	stopped := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			cancelContext, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_, _ = process.Clients().Task.Cancel(cancelContext, &pluginv1alpha1.CancelRequest{Meta: meta, Reason: ctx.Err().Error()})
+			cancel()
+		case <-stopped:
+		}
+	}()
+	return func() { close(stopped) }
+}
+
+func (m *Manager) cancelAgentOnContext(ctx context.Context, process *pluginhost.Process, meta *pluginv1alpha1.CallMeta) func() {
+	stopped := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			cancelContext, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_, _ = process.Clients().Agent.Cancel(cancelContext, &pluginv1alpha1.CancelRequest{Meta: meta, Reason: ctx.Err().Error()})
+			cancel()
+		case <-stopped:
+		}
+	}()
+	return func() { close(stopped) }
+}
+
+func (m *Manager) evict(key string) {
+	m.mu.Lock()
+	process := m.processes[key]
+	delete(m.processes, key)
+	m.mu.Unlock()
+	if process != nil {
+		process.Close()
+	}
+}
+
+func sameCapabilities(actual, expected []string) bool {
+	actual = append([]string(nil), actual...)
+	expected = append([]string(nil), expected...)
+	sort.Strings(actual)
+	sort.Strings(expected)
+	return strings.Join(actual, "\x00") == strings.Join(expected, "\x00")
+}
+
+func drainDoctor(stream eventReceiver) error {
+	var expected uint64 = 1
+	for {
+		event, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return errors.New("doctor stream ended without completion")
+		}
+		if err != nil {
+			return err
+		}
+		if event.GetSequence() != expected {
+			return errors.New("doctor stream sequence is malformed")
+		}
+		expected++
+		if strings.HasSuffix(event.GetType(), ".failed") {
+			return errors.New("doctor command failed")
+		}
+		if strings.HasSuffix(event.GetType(), ".completed") {
+			return nil
+		}
+	}
+}
+
+func secretValues(secrets map[string][]byte) [][]byte {
+	result := make([][]byte, 0, len(secrets))
+	for _, value := range secrets {
+		if len(value) > 0 {
+			result = append(result, append([]byte(nil), value...))
+		}
+	}
+	return result
+}
+
+func redact(data []byte, secrets [][]byte) []byte {
+	result := append([]byte(nil), data...)
+	for _, secret := range secrets {
+		encoded, _ := json.Marshal(string(secret))
+		if len(encoded) >= 2 {
+			result = []byte(strings.ReplaceAll(string(result), string(encoded[1:len(encoded)-1]), "[REDACTED]"))
+		}
+		result = []byte(strings.ReplaceAll(string(result), string(secret), "[REDACTED]"))
+	}
+	return result
+}
+
+func secretEnvironmentName(name string) string {
+	var builder strings.Builder
+	for _, character := range name {
+		if unicode.IsLetter(character) || unicode.IsDigit(character) {
+			builder.WriteRune(unicode.ToUpper(character))
+		} else {
+			builder.WriteByte('_')
+		}
+	}
+	return builder.String()
+}
+
+func installationKey(name, version string) string { return name + "@" + version }
+
+// StatusCode classifies plugin failures for control-plane diagnostics.
+func StatusCode(err error) codes.Code { return status.Code(err) }

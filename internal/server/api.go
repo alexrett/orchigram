@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"time"
@@ -14,6 +15,8 @@ import (
 	"github.com/alexrett/orchigram/internal/engine"
 	"github.com/alexrett/orchigram/internal/flow"
 	"github.com/alexrett/orchigram/internal/orchestrator"
+	"github.com/alexrett/orchigram/internal/pluginbundle"
+	"github.com/alexrett/orchigram/internal/pluginmanager"
 	"github.com/alexrett/orchigram/internal/resource"
 	"github.com/alexrett/orchigram/internal/store"
 	"github.com/alexrett/orchigram/internal/version"
@@ -30,12 +33,13 @@ type API struct {
 	compiler     *flow.Compiler
 	orchestrator *orchestrator.Orchestrator
 	engine       engine.DurableEngine
+	plugins      *pluginmanager.Manager
 	startedAt    time.Time
 }
 
 // NewAPI constructs the public service implementation.
-func NewAPI(state *store.Store, compiler *flow.Compiler, control *orchestrator.Orchestrator, durable engine.DurableEngine) *API {
-	return &API{store: state, compiler: compiler, orchestrator: control, engine: durable, startedAt: time.Now()}
+func NewAPI(state *store.Store, compiler *flow.Compiler, control *orchestrator.Orchestrator, durable engine.DurableEngine, plugins *pluginmanager.Manager) *API {
+	return &API{store: state, compiler: compiler, orchestrator: control, engine: durable, plugins: plugins, startedAt: time.Now()}
 }
 
 // Register binds every public service to one gRPC server.
@@ -326,12 +330,95 @@ func (a *API) Reconcile(ctx context.Context, request *controlv1alpha1.ReconcileR
 // Info reports protocol negotiation and process identity.
 func (a *API) Info(context.Context, *emptypb.Empty) (*controlv1alpha1.SystemInfo, error) {
 	hostname, _ := os.Hostname()
-	return &controlv1alpha1.SystemInfo{Version: version.Version, ProtocolVersion: "v1alpha1", Hostname: hostname, Os: runtime.GOOS, Architecture: runtime.GOARCH, ProcessId: int64(os.Getpid()), StartedAt: timestamppb.New(a.startedAt), Capabilities: []string{"resources.v1alpha1", "flows.compile", "runs.approval", "transport.uds"}}, nil
+	return &controlv1alpha1.SystemInfo{Version: version.Version, ProtocolVersion: "v1alpha1", Hostname: hostname, Os: runtime.GOOS, Architecture: runtime.GOARCH, ProcessId: int64(os.Getpid()), StartedAt: timestamppb.New(a.startedAt), Capabilities: []string{"resources.v1alpha1", "flows.compile", "runs.approval", "plugins.grpc.v1", "plugins.automtls", "transport.uds"}}, nil
 }
 
 // Health reports readiness without leaking configuration or secret material.
 func (a *API) Health(context.Context, *emptypb.Empty) (*controlv1alpha1.HealthResponse, error) {
 	return &controlv1alpha1.HealthResponse{Ready: true}, nil
+}
+
+// InstallPlugin receives one bounded bundle and closes with its verified identity.
+func (a *API) InstallPlugin(stream grpc.ClientStreamingServer[controlv1alpha1.PluginUploadRequest, controlv1alpha1.PluginInstallResponse]) error {
+	if a.plugins == nil {
+		return status.Error(codes.Unavailable, "plugin manager is unavailable")
+	}
+	bundle := make([]byte, 0)
+	final := false
+	for {
+		chunk, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if final {
+			return status.Error(codes.InvalidArgument, "bundle data followed final chunk")
+		}
+		if len(bundle)+len(chunk.GetBundleChunk()) > 128<<20 {
+			return status.Error(codes.ResourceExhausted, "plugin bundle exceeds 128 MiB")
+		}
+		bundle = append(bundle, chunk.GetBundleChunk()...)
+		final = chunk.GetFinal()
+		if final {
+			break
+		}
+	}
+	if !final {
+		return status.Error(codes.InvalidArgument, "plugin bundle is missing a final chunk")
+	}
+	record, err := a.plugins.Install(stream.Context(), bundle)
+	if err != nil {
+		return rpcError(err)
+	}
+	return stream.SendAndClose(&controlv1alpha1.PluginInstallResponse{Name: record.Name, Version: record.Version, Digest: record.Digest})
+}
+
+// EnablePlugin activates a verified immutable plugin version.
+func (a *API) EnablePlugin(ctx context.Context, request *controlv1alpha1.PluginRequest) (*emptypb.Empty, error) {
+	if err := a.plugins.Enable(ctx, request.GetName(), request.GetVersion()); err != nil {
+		return nil, rpcError(err)
+	}
+	return &emptypb.Empty{}, nil
+}
+
+// DisablePlugin removes the current activation without deleting a version.
+func (a *API) DisablePlugin(ctx context.Context, request *controlv1alpha1.PluginRequest) (*emptypb.Empty, error) {
+	if err := a.plugins.Disable(ctx, request.GetName()); err != nil {
+		return nil, rpcError(err)
+	}
+	return &emptypb.Empty{}, nil
+}
+
+// ListPlugins returns all immutable installed versions.
+func (a *API) ListPlugins(ctx context.Context, _ *emptypb.Empty) (*controlv1alpha1.ListPluginsResponse, error) {
+	records, err := a.plugins.List(ctx)
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	response := &controlv1alpha1.ListPluginsResponse{}
+	for _, record := range records {
+		response.Plugins = append(response.Plugins, pluginInfo(record))
+	}
+	return response, nil
+}
+
+// DescribePlugin returns one version or the active version when omitted.
+func (a *API) DescribePlugin(ctx context.Context, request *controlv1alpha1.PluginRequest) (*controlv1alpha1.PluginInfo, error) {
+	record, err := a.plugins.Describe(ctx, request.GetName(), request.GetVersion())
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	return pluginInfo(record), nil
+}
+
+// DoctorPlugin verifies executable integrity, protocol negotiation, and health.
+func (a *API) DoctorPlugin(ctx context.Context, request *controlv1alpha1.PluginRequest) (*controlv1alpha1.DoctorResponse, error) {
+	if err := a.plugins.Doctor(ctx, request.GetName(), request.GetVersion()); err != nil {
+		return &controlv1alpha1.DoctorResponse{Diagnostics: []*controlv1alpha1.Diagnostic{{Severity: controlv1alpha1.Diagnostic_SEVERITY_ERROR, Path: "plugin", Code: "doctor_failed", Message: err.Error()}}}, nil
+	}
+	return &controlv1alpha1.DoctorResponse{}, nil
 }
 
 func resourcePB(doc resource.Document) *controlv1alpha1.ResourceDocument {
@@ -344,6 +431,16 @@ func diagnosticPB(diagnostic flow.Diagnostic) *controlv1alpha1.Diagnostic {
 
 func runPB(run store.Run) *controlv1alpha1.RunSummary {
 	return &controlv1alpha1.RunSummary{Uid: run.UID, Flow: run.FlowUID, Phase: run.Phase, PlanHash: run.PlanHash, InterpreterVersion: run.InterpreterVersion, CreatedAt: timestamppb.New(run.CreatedAt), UpdatedAt: timestamppb.New(run.UpdatedAt)}
+}
+
+func pluginInfo(record store.PluginRecord) *controlv1alpha1.PluginInfo {
+	var manifest pluginbundle.Manifest
+	_ = json.Unmarshal(record.ManifestJSON, &manifest)
+	state := record.State
+	if record.Active {
+		state = "active"
+	}
+	return &controlv1alpha1.PluginInfo{Name: record.Name, Version: record.Version, Digest: record.Digest, State: state, Capabilities: manifest.Capabilities}
 }
 
 func rpcError(err error) error {
@@ -432,6 +529,25 @@ type triggerService struct {
 type pluginService struct {
 	controlv1alpha1.UnimplementedPluginServiceServer
 	api *API
+}
+
+func (s *pluginService) Install(stream grpc.ClientStreamingServer[controlv1alpha1.PluginUploadRequest, controlv1alpha1.PluginInstallResponse]) error {
+	return s.api.InstallPlugin(stream)
+}
+func (s *pluginService) Enable(ctx context.Context, request *controlv1alpha1.PluginRequest) (*emptypb.Empty, error) {
+	return s.api.EnablePlugin(ctx, request)
+}
+func (s *pluginService) Disable(ctx context.Context, request *controlv1alpha1.PluginRequest) (*emptypb.Empty, error) {
+	return s.api.DisablePlugin(ctx, request)
+}
+func (s *pluginService) List(ctx context.Context, request *emptypb.Empty) (*controlv1alpha1.ListPluginsResponse, error) {
+	return s.api.ListPlugins(ctx, request)
+}
+func (s *pluginService) Describe(ctx context.Context, request *controlv1alpha1.PluginRequest) (*controlv1alpha1.PluginInfo, error) {
+	return s.api.DescribePlugin(ctx, request)
+}
+func (s *pluginService) Doctor(ctx context.Context, request *controlv1alpha1.PluginRequest) (*controlv1alpha1.DoctorResponse, error) {
+	return s.api.DoctorPlugin(ctx, request)
 }
 
 type systemService struct {

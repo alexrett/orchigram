@@ -2,18 +2,99 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
 	controlv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/control/v1alpha1"
 	clientpkg "github.com/alexrett/orchigram/internal/client"
 	"github.com/alexrett/orchigram/internal/config"
+	"github.com/alexrett/orchigram/internal/pluginbundle"
+	"github.com/alexrett/orchigram/internal/pluginprotocol"
+	"github.com/alexrett/orchigram/internal/pluginruntime"
+	"github.com/alexrett/orchigram/internal/process"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
+
+func TestMain(m *testing.M) {
+	if os.Getenv(pluginprotocol.Handshake.MagicCookieKey) == pluginprotocol.Handshake.MagicCookieValue {
+		pluginprotocol.Serve(pluginprotocol.Servers{
+			Control: &pluginruntime.Control{Info: pluginruntime.Info{Name: "exec", Version: "0.1.0", Capabilities: []string{"task.exec.run"}}},
+			Task:    &pluginruntime.Exec{Runner: process.NewRunner()},
+		})
+		return
+	}
+	os.Exit(m.Run())
+}
+
+func TestInstalledPluginExecutesThroughDurableDaemon(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "orchigram-plugin-e2e-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	cfg := config.Development(filepath.Join(root, "state"))
+	stop := serveTestDaemon(t, cfg)
+	defer stop()
+	client := dialReadyClient(t, cfg.SocketPath)
+	defer func() { _ = client.Close() }()
+
+	bundle := daemonConformanceBundle(t)
+	stream, err := client.Plugins.Install(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const chunkSize = 1 << 20
+	for offset := 0; offset < len(bundle); offset += chunkSize {
+		end := min(offset+chunkSize, len(bundle))
+		if err := stream.Send(&controlv1alpha1.PluginUploadRequest{BundleChunk: bundle[offset:end], Final: end == len(bundle)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	installed, err := stream.CloseAndRecv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if installed.GetName() != "exec" || installed.GetVersion() != "0.1.0" {
+		t.Fatalf("installed plugin: %+v", installed)
+	}
+	if _, err := client.Plugins.Enable(context.Background(), &controlv1alpha1.PluginRequest{Name: "exec", Version: "0.1.0"}); err != nil {
+		t.Fatal(err)
+	}
+	flowDocument := []byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: plugin-execution}
+spec:
+  nodes:
+    - id: execute
+      uses: exec.run
+      timeout: 10s
+      with:
+        argv: [/bin/echo, durable-plugin-flow]
+`)
+	applied, err := client.Resources.Apply(context.Background(), &controlv1alpha1.ApplyRequest{Document: flowDocument})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(applied.GetDiagnostics()) != 0 {
+		t.Fatalf("apply diagnostics: %+v", applied.GetDiagnostics())
+	}
+	run, err := client.Runs.Start(context.Background(), &controlv1alpha1.StartRunRequest{Flow: "plugin-execution", InputJson: []byte(`{}`), IdempotencyKey: "plugin-e2e"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRunEvent(t, client, run.GetUid(), 0, "run.succeeded")
+	artifact, err := os.ReadFile(filepath.Join(cfg.StateDir, "artifacts", run.GetUid(), "execute", "attempt-1", "raw.log")) //nolint:gosec // Test-owned daemon state path.
+	if err != nil || string(artifact) != "durable-plugin-flow\n" {
+		t.Fatalf("artifact=%q err=%v", artifact, err)
+	}
+}
 
 func TestRunApprovalSurvivesDaemonRestart(t *testing.T) {
 	root, err := os.MkdirTemp("/tmp", "orchigram-restart-")
@@ -212,4 +293,27 @@ func waitForRunEvent(t *testing.T, client *clientpkg.Client, runUID string, afte
 			return
 		}
 	}
+}
+
+func daemonConformanceBundle(t *testing.T) []byte {
+	t.Helper()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary, err := os.ReadFile(executable) //nolint:gosec // The test intentionally bundles its own executable.
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(binary)
+	manifest := pluginbundle.Manifest{
+		APIVersion: pluginbundle.APIVersion, Name: "exec", Version: "0.1.0",
+		Protocol: pluginbundle.ProtocolRange{Minimum: 1, Maximum: 1}, Capabilities: []string{"task.exec.run"},
+		Platforms: []pluginbundle.Platform{{OS: runtime.GOOS, Arch: runtime.GOARCH, Path: "bin/plugin", SHA256: hex.EncodeToString(digest[:])}},
+	}
+	bundle, err := pluginbundle.Build(manifest, map[string][]byte{"bin/plugin": binary})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bundle
 }

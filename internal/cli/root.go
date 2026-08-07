@@ -25,6 +25,7 @@ import (
 	"github.com/alexrett/orchigram/internal/version"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
+	"google.golang.org/protobuf/types/known/emptypb"
 	"gopkg.in/yaml.v3"
 )
 
@@ -62,7 +63,7 @@ func NewRoot() *cobra.Command {
 		newFlowCommand(opts),
 		newRunCommand(opts),
 		newTriggerCommand(),
-		newPluginCommand(),
+		newPluginCommand(opts),
 		newContextCommand(opts),
 		newInstallCommand(),
 	)
@@ -302,8 +303,99 @@ func newTriggerCommand() *cobra.Command {
 	return &cobra.Command{Use: "trigger", Short: "Inspect and control triggers", RunE: func(cmd *cobra.Command, _ []string) error { return cmd.Help() }}
 }
 
-func newPluginCommand() *cobra.Command {
-	return &cobra.Command{Use: "plugin", Short: "Install and inspect plugins", RunE: func(cmd *cobra.Command, _ []string) error { return cmd.Help() }}
+func newPluginCommand(opts *options) *cobra.Command {
+	command := &cobra.Command{Use: "plugin", Short: "Install and inspect plugins", RunE: func(cmd *cobra.Command, _ []string) error { return cmd.Help() }}
+	install := &cobra.Command{Use: "install BUNDLE", Short: "Upload and verify an immutable plugin bundle", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		bundle, err := os.ReadFile(filepath.Clean(args[0])) //nolint:gosec // The operator explicitly supplies the bundle path.
+		if err != nil {
+			return err
+		}
+		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, contextName string) error {
+			stream, err := client.Plugins.Install(cmd.Context())
+			if err != nil {
+				return err
+			}
+			const chunkSize = 1 << 20
+			for offset := 0; offset < len(bundle); offset += chunkSize {
+				end := min(offset+chunkSize, len(bundle))
+				if err := stream.Send(&controlv1alpha1.PluginUploadRequest{Meta: requestMeta(contextName), BundleChunk: bundle[offset:end], Final: end == len(bundle)}); err != nil {
+					return err
+				}
+			}
+			response, err := stream.CloseAndRecv()
+			if err != nil {
+				return err
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\n", response.GetName(), response.GetVersion(), response.GetDigest())
+			return err
+		})
+	}}
+	list := &cobra.Command{Use: "list", Short: "List installed plugin versions", RunE: func(cmd *cobra.Command, _ []string) error {
+		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error {
+			response, err := client.Plugins.List(cmd.Context(), &emptypb.Empty{})
+			if err != nil {
+				return err
+			}
+			for _, item := range response.GetPlugins() {
+				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\t%s\n", item.GetName(), item.GetVersion(), item.GetState(), item.GetDigest()); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}}
+	command.AddCommand(install, list, pluginMutationCommand(opts, "enable"), pluginMutationCommand(opts, "disable"), pluginDoctorCommand(opts))
+	return command
+}
+
+func pluginMutationCommand(opts *options, operation string) *cobra.Command {
+	use := operation + " NAME"
+	if operation == "enable" {
+		use += " VERSION"
+	}
+	arguments := cobra.ExactArgs(1)
+	if operation == "enable" {
+		arguments = cobra.ExactArgs(2)
+	}
+	return &cobra.Command{Use: use, Short: strings.ToUpper(operation[:1]) + operation[1:] + " a plugin", Args: arguments, RunE: func(cmd *cobra.Command, args []string) error {
+		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error {
+			request := &controlv1alpha1.PluginRequest{Name: args[0]}
+			if len(args) == 2 {
+				request.Version = args[1]
+			}
+			if operation == "enable" {
+				_, err := client.Plugins.Enable(cmd.Context(), request)
+				return err
+			}
+			_, err := client.Plugins.Disable(cmd.Context(), request)
+			return err
+		})
+	}}
+}
+
+func pluginDoctorCommand(opts *options) *cobra.Command {
+	return &cobra.Command{Use: "doctor NAME [VERSION]", Short: "Verify plugin integrity, negotiation, and health", Args: cobra.RangeArgs(1, 2), RunE: func(cmd *cobra.Command, args []string) error {
+		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error {
+			request := &controlv1alpha1.PluginRequest{Name: args[0]}
+			if len(args) == 2 {
+				request.Version = args[1]
+			}
+			response, err := client.Plugins.Doctor(cmd.Context(), request)
+			if err != nil {
+				return err
+			}
+			for _, diagnostic := range response.GetDiagnostics() {
+				if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "%s: %s (%s)\n", diagnostic.GetPath(), diagnostic.GetMessage(), diagnostic.GetCode()); err != nil {
+					return err
+				}
+			}
+			if len(response.GetDiagnostics()) > 0 {
+				return errors.New("plugin doctor failed")
+			}
+			_, err = fmt.Fprintln(cmd.OutOrStdout(), "ok")
+			return err
+		})
+	}}
 }
 
 func newContextCommand(opts *options) *cobra.Command {

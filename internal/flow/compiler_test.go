@@ -75,3 +75,28 @@ spec:
 		t.Fatalf("diagnostics: %+v", diagnostics)
 	}
 }
+
+type testCapabilities struct{}
+
+func (testCapabilities) HasAction(action string) bool { return action == "exec.run" }
+func (testCapabilities) ValidateAction(_ string, _ map[string]any) []Diagnostic {
+	return []Diagnostic{{Path: "config.argv", Code: "required", Message: "argv is required"}}
+}
+
+func TestCompilerResolvesPluginCapabilityAndValidation(t *testing.T) {
+	t.Parallel()
+	flowResource, err := resource.DecodeFlow([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: plugin-validation}
+spec:
+  nodes:
+    - {id: execute, uses: exec.run}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, diagnostics := NewCompiler(testCapabilities{}).Compile(flowResource)
+	if len(diagnostics) != 1 || diagnostics[0].Path != "spec.nodes[0].with.argv" || diagnostics[0].Code != "required" {
+		t.Fatalf("diagnostics: %+v", diagnostics)
+	}
+}

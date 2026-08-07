@@ -28,6 +28,11 @@ type CapabilityResolver interface {
 	HasAction(action string) bool
 }
 
+// ActionValidator optionally performs plugin-owned configuration validation.
+type ActionValidator interface {
+	ValidateAction(action string, config map[string]any) []Diagnostic
+}
+
 // Diagnostic is a stable compiler diagnostic.
 type Diagnostic struct {
 	Path    string `json:"path"`
@@ -139,10 +144,17 @@ func (c *Compiler) Compile(input resource.Flow) (ExecutionPlan, []Diagnostic) {
 			continue
 		}
 		nodes[node.ID] = node
-		if !validAction(node.Uses) {
+		if !validAction(node.Uses) { //nolint:gocritic // Ordered diagnostics are clearer than a tagged switch here.
 			diagnostics = append(diagnostics, Diagnostic{Path: path + ".uses", Code: "invalid_action", Message: "action must be core.<name> or <plugin>.<action>"})
 		} else if !strings.HasPrefix(node.Uses, "core.") && c.capabilities != nil && !c.capabilities.HasAction(node.Uses) {
 			diagnostics = append(diagnostics, Diagnostic{Path: path + ".uses", Code: "unknown_action", Message: fmt.Sprintf("no enabled plugin provides %q", node.Uses)})
+		} else if !strings.HasPrefix(node.Uses, "core.") {
+			if validator, ok := c.capabilities.(ActionValidator); ok {
+				for _, diagnostic := range validator.ValidateAction(node.Uses, node.With) {
+					diagnostic.Path = path + ".with." + strings.TrimPrefix(diagnostic.Path, "config.")
+					diagnostics = append(diagnostics, diagnostic)
+				}
+			}
 		}
 		nodeTimeout, timeoutErr := resource.ParseDuration(node.Timeout, timeout)
 		if timeoutErr != nil {
