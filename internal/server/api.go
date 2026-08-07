@@ -1,0 +1,447 @@
+// Package server implements the public daemon gRPC control plane.
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"runtime"
+	"time"
+
+	controlv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/control/v1alpha1"
+	"github.com/alexrett/orchigram/internal/engine"
+	"github.com/alexrett/orchigram/internal/flow"
+	"github.com/alexrett/orchigram/internal/orchestrator"
+	"github.com/alexrett/orchigram/internal/resource"
+	"github.com/alexrett/orchigram/internal/store"
+	"github.com/alexrett/orchigram/internal/version"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+// API implements all public control-plane services over one authoritative state.
+type API struct {
+	store        *store.Store
+	compiler     *flow.Compiler
+	orchestrator *orchestrator.Orchestrator
+	engine       engine.DurableEngine
+	startedAt    time.Time
+}
+
+// NewAPI constructs the public service implementation.
+func NewAPI(state *store.Store, compiler *flow.Compiler, control *orchestrator.Orchestrator, durable engine.DurableEngine) *API {
+	return &API{store: state, compiler: compiler, orchestrator: control, engine: durable, startedAt: time.Now()}
+}
+
+// Register binds every public service to one gRPC server.
+func (a *API) Register(server *grpc.Server) {
+	controlv1alpha1.RegisterResourceServiceServer(server, &resourceService{api: a})
+	controlv1alpha1.RegisterFlowServiceServer(server, &flowService{api: a})
+	controlv1alpha1.RegisterRunServiceServer(server, &runService{api: a})
+	controlv1alpha1.RegisterTriggerServiceServer(server, &triggerService{api: a})
+	controlv1alpha1.RegisterPluginServiceServer(server, &pluginService{api: a})
+	controlv1alpha1.RegisterSystemServiceServer(server, &systemService{api: a})
+}
+
+// Apply validates and CAS-applies one strict resource.
+func (a *API) Apply(ctx context.Context, request *controlv1alpha1.ApplyRequest) (*controlv1alpha1.ApplyResponse, error) {
+	return a.apply(ctx, request, request.GetDryRun())
+}
+
+// Validate performs the exact apply validation path without persistence.
+func (a *API) Validate(ctx context.Context, request *controlv1alpha1.ApplyRequest) (*controlv1alpha1.ApplyResponse, error) {
+	return a.apply(ctx, request, true)
+}
+
+func (a *API) apply(ctx context.Context, request *controlv1alpha1.ApplyRequest, dryRun bool) (*controlv1alpha1.ApplyResponse, error) {
+	doc, err := resource.DecodeStrict(request.GetDocument())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	diagnostics := []*controlv1alpha1.Diagnostic{}
+	if doc.Kind == "Flow" {
+		flowResource, decodeErr := resource.DecodeFlow(doc.JSON)
+		if decodeErr != nil {
+			return nil, status.Error(codes.InvalidArgument, decodeErr.Error())
+		}
+		_, compilerDiagnostics := a.compiler.Compile(flowResource)
+		for _, diagnostic := range compilerDiagnostics {
+			diagnostics = append(diagnostics, diagnosticPB(diagnostic))
+		}
+		if len(diagnostics) > 0 {
+			return &controlv1alpha1.ApplyResponse{Resource: resourcePB(doc), Diagnostics: diagnostics}, nil
+		}
+	}
+	if dryRun {
+		return &controlv1alpha1.ApplyResponse{Resource: resourcePB(doc)}, nil
+	}
+	meta := request.GetMeta()
+	applied, err := a.store.Apply(ctx, doc, store.ApplyOptions{
+		ExpectedResourceVersion: request.GetExpectedResourceVersion(),
+		RequestID:               meta.GetRequestId(),
+		Actor:                   "unix-peer",
+		Context:                 meta.GetContext(),
+	})
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	return &controlv1alpha1.ApplyResponse{Resource: resourcePB(applied)}, nil
+}
+
+// Get returns one resource.
+func (a *API) Get(ctx context.Context, request *controlv1alpha1.GetRequest) (*controlv1alpha1.ResourceDocument, error) {
+	key := request.GetKey()
+	doc, err := a.store.Get(ctx, key.GetKind(), key.GetNamespace(), key.GetName())
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	return resourcePB(doc), nil
+}
+
+// List returns a stable resource page.
+func (a *API) List(ctx context.Context, request *controlv1alpha1.ListRequest) (*controlv1alpha1.ListResponse, error) {
+	docs, revision, err := a.store.List(ctx, request.GetKind(), request.GetNamespace(), int(request.GetLimit()))
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	result := &controlv1alpha1.ListResponse{Revision: revision, Resources: make([]*controlv1alpha1.ResourceDocument, 0, len(docs))}
+	for _, doc := range docs {
+		result.Resources = append(result.Resources, resourcePB(doc))
+	}
+	return result, nil
+}
+
+// Delete CAS-deletes a resource.
+func (a *API) Delete(ctx context.Context, request *controlv1alpha1.DeleteRequest) (*emptypb.Empty, error) {
+	key := request.GetKey()
+	if err := a.store.Delete(ctx, key.GetKind(), key.GetNamespace(), key.GetName(), request.GetExpectedResourceVersion(), request.GetMeta().GetRequestId()); err != nil {
+		return nil, rpcError(err)
+	}
+	return &emptypb.Empty{}, nil
+}
+
+// Watch streams resource events from a requested global revision.
+func (a *API) Watch(request *controlv1alpha1.WatchRequest, stream grpc.ServerStreamingServer[controlv1alpha1.ResourceEvent]) error {
+	revision := request.GetAfterRevision()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		events, err := a.store.EventsAfter(stream.Context(), request.GetKind(), request.GetNamespace(), revision, 100)
+		if err != nil {
+			return rpcError(err)
+		}
+		for _, event := range events {
+			var document *controlv1alpha1.ResourceDocument
+			if len(event.Document) > 0 {
+				doc, decodeErr := resource.DecodeStrict(event.Document)
+				if decodeErr != nil {
+					return status.Error(codes.Internal, "stored resource event is invalid")
+				}
+				document = resourcePB(doc)
+			}
+			if err := stream.Send(&controlv1alpha1.ResourceEvent{Revision: event.Revision, Type: event.Type, Resource: document, ObservedAt: timestamppb.New(event.ObservedAt)}); err != nil {
+				return err
+			}
+			revision = event.Revision
+		}
+		select {
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// Export returns canonical JSON in the YAML-compatible response envelope.
+func (a *API) Export(ctx context.Context, request *controlv1alpha1.ExportRequest) (*controlv1alpha1.ExportResponse, error) {
+	documents := make([]json.RawMessage, 0, len(request.GetKeys()))
+	for _, key := range request.GetKeys() {
+		doc, err := a.store.Get(ctx, key.GetKind(), key.GetNamespace(), key.GetName())
+		if err != nil {
+			return nil, rpcError(err)
+		}
+		documents = append(documents, doc.JSON)
+	}
+	data, err := json.MarshalIndent(documents, "", "  ")
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	return &controlv1alpha1.ExportResponse{Yaml: data}, nil
+}
+
+// Compile compiles a strict Flow without storing it.
+func (a *API) Compile(_ context.Context, request *controlv1alpha1.CompileRequest) (*controlv1alpha1.CompileResponse, error) {
+	flowResource, err := resource.DecodeFlow(request.GetFlow())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	plan, diagnostics := a.compiler.Compile(flowResource)
+	result := &controlv1alpha1.CompileResponse{PlanHash: plan.PlanHash}
+	for _, diagnostic := range diagnostics {
+		result.Diagnostics = append(result.Diagnostics, diagnosticPB(diagnostic))
+	}
+	if len(diagnostics) == 0 {
+		result.ExecutionPlanJson, err = json.Marshal(plan)
+		if err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+	}
+	return result, nil
+}
+
+// PreviewGraph returns the compiler's graph projection.
+func (a *API) PreviewGraph(ctx context.Context, request *controlv1alpha1.PreviewGraphRequest) (*controlv1alpha1.PreviewGraphResponse, error) {
+	compiled, err := a.Compile(ctx, &controlv1alpha1.CompileRequest{Flow: request.GetFlowOrPlan()})
+	if err != nil {
+		return nil, err
+	}
+	result := &controlv1alpha1.PreviewGraphResponse{Diagnostics: compiled.GetDiagnostics()}
+	if len(compiled.GetExecutionPlanJson()) == 0 {
+		return result, nil
+	}
+	var plan flow.ExecutionPlan
+	if err := json.Unmarshal(compiled.GetExecutionPlanJson(), &plan); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	for _, node := range plan.Nodes {
+		result.Nodes = append(result.Nodes, &controlv1alpha1.GraphNode{Id: node.ID, Label: node.Name, Action: node.Uses})
+	}
+	for _, edge := range plan.Edges {
+		result.Edges = append(result.Edges, &controlv1alpha1.GraphEdge{From: edge.From, To: edge.To, Condition: edge.Condition})
+	}
+	return result, nil
+}
+
+// Start durably accepts a manual start request.
+func (a *API) Start(ctx context.Context, request *controlv1alpha1.StartRunRequest) (*controlv1alpha1.RunRef, error) {
+	if request.GetFlow() == "" {
+		return nil, status.Error(codes.InvalidArgument, "flow is required")
+	}
+	input := request.GetInputJson()
+	if len(input) == 0 {
+		input = []byte(`{}`)
+	}
+	if !json.Valid(input) {
+		return nil, status.Error(codes.InvalidArgument, "input_json must be valid JSON")
+	}
+	receipt, err := a.orchestrator.StartManual(ctx, request.GetFlow(), resource.DefaultNamespace, input, request.GetIdempotencyKey())
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	return &controlv1alpha1.RunRef{Uid: receipt.RunUID}, nil
+}
+
+// ListRuns returns newest runs first.
+func (a *API) ListRuns(ctx context.Context, request *controlv1alpha1.ListRunsRequest) (*controlv1alpha1.ListRunsResponse, error) {
+	runs, err := a.store.ListRuns(ctx, int(request.GetLimit()))
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	result := &controlv1alpha1.ListRunsResponse{}
+	for _, run := range runs {
+		result.Runs = append(result.Runs, runPB(run))
+	}
+	return result, nil
+}
+
+// WatchEvents streams durable run events and supports replay from a sequence.
+func (a *API) WatchEvents(request *controlv1alpha1.WatchRunRequest, stream grpc.ServerStreamingServer[controlv1alpha1.RunEvent]) error {
+	sequence := request.GetAfterSequence()
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		events, err := a.store.RunEventsAfter(stream.Context(), request.GetUid(), sequence, 100)
+		if err != nil {
+			return rpcError(err)
+		}
+		for _, event := range events {
+			if err := stream.Send(&controlv1alpha1.RunEvent{Sequence: event.Sequence, RunUid: event.RunUID, NodeId: event.NodeID, Attempt: event.Attempt, Type: event.Type, PayloadJson: event.Payload, OccurredAt: timestamppb.New(event.OccurredAt)}); err != nil {
+				return err
+			}
+			sequence = event.Sequence
+		}
+		select {
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// Approve persists then delivers an approval signal.
+func (a *API) Approve(ctx context.Context, request *controlv1alpha1.ApprovalRequest) (*emptypb.Empty, error) {
+	return a.decide(ctx, request, "approved")
+}
+
+// Reject persists then delivers a rejection signal.
+func (a *API) Reject(ctx context.Context, request *controlv1alpha1.ApprovalRequest) (*emptypb.Empty, error) {
+	return a.decide(ctx, request, "rejected")
+}
+
+func (a *API) decide(ctx context.Context, request *controlv1alpha1.ApprovalRequest, decision string) (*emptypb.Empty, error) {
+	if request.GetRunUid() == "" || request.GetNodeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "run_uid and node_id are required")
+	}
+	if err := a.store.DecideApproval(ctx, request.GetRunUid(), request.GetNodeId(), decision, "unix-peer", request.GetReason()); err != nil {
+		return nil, rpcError(err)
+	}
+	if err := a.engine.Signal(ctx, request.GetRunUid(), request.GetNodeId(), engine.ApprovalSignal{State: decision, Reason: request.GetReason()}); err != nil {
+		// Decision remains durable and engine reconciliation redelivers it.
+		return &emptypb.Empty{}, nil
+	}
+	if err := a.store.MarkApprovalSignaled(ctx, request.GetRunUid(), request.GetNodeId()); err != nil {
+		return nil, rpcError(err)
+	}
+	return &emptypb.Empty{}, nil
+}
+
+// Cancel records cancellation before asking the framework to cancel.
+func (a *API) Cancel(ctx context.Context, request *controlv1alpha1.CancelRunRequest) (*emptypb.Empty, error) {
+	if err := a.store.AppendRunEvent(ctx, request.GetRunUid(), "", "run.cancelled", "cancelled", 0, []byte(fmt.Sprintf(`{"reason":%q}`, request.GetReason()))); err != nil {
+		return nil, rpcError(err)
+	}
+	if err := a.engine.Cancel(ctx, request.GetRunUid(), request.GetReason()); err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, rpcError(err)
+	}
+	return &emptypb.Empty{}, nil
+}
+
+// Reconcile returns the current run after running engine reconciliation.
+func (a *API) Reconcile(ctx context.Context, request *controlv1alpha1.ReconcileRequest) (*controlv1alpha1.RunSummary, error) {
+	if err := a.engine.Reconcile(ctx); err != nil {
+		return nil, rpcError(err)
+	}
+	run, err := a.store.GetRun(ctx, request.GetRunUid())
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	return runPB(run), nil
+}
+
+// Info reports protocol negotiation and process identity.
+func (a *API) Info(context.Context, *emptypb.Empty) (*controlv1alpha1.SystemInfo, error) {
+	hostname, _ := os.Hostname()
+	return &controlv1alpha1.SystemInfo{Version: version.Version, ProtocolVersion: "v1alpha1", Hostname: hostname, Os: runtime.GOOS, Architecture: runtime.GOARCH, ProcessId: int64(os.Getpid()), StartedAt: timestamppb.New(a.startedAt), Capabilities: []string{"resources.v1alpha1", "flows.compile", "runs.approval", "transport.uds"}}, nil
+}
+
+// Health reports readiness without leaking configuration or secret material.
+func (a *API) Health(context.Context, *emptypb.Empty) (*controlv1alpha1.HealthResponse, error) {
+	return &controlv1alpha1.HealthResponse{Ready: true}, nil
+}
+
+func resourcePB(doc resource.Document) *controlv1alpha1.ResourceDocument {
+	return &controlv1alpha1.ResourceDocument{Key: &controlv1alpha1.ResourceKey{Kind: doc.Kind, Namespace: doc.Metadata.Namespace, Name: doc.Metadata.Name, Uid: doc.Metadata.UID}, ResourceVersion: doc.Metadata.ResourceVersion, Generation: doc.Metadata.Generation, Json: doc.JSON}
+}
+
+func diagnosticPB(diagnostic flow.Diagnostic) *controlv1alpha1.Diagnostic {
+	return &controlv1alpha1.Diagnostic{Severity: controlv1alpha1.Diagnostic_SEVERITY_ERROR, Path: diagnostic.Path, Code: diagnostic.Code, Message: diagnostic.Message}
+}
+
+func runPB(run store.Run) *controlv1alpha1.RunSummary {
+	return &controlv1alpha1.RunSummary{Uid: run.UID, Flow: run.FlowUID, Phase: run.Phase, PlanHash: run.PlanHash, InterpreterVersion: run.InterpreterVersion, CreatedAt: timestamppb.New(run.CreatedAt), UpdatedAt: timestamppb.New(run.UpdatedAt)}
+}
+
+func rpcError(err error) error {
+	var conflict *store.ConflictError
+	switch {
+	case errors.As(err, &conflict):
+		return status.Error(codes.Aborted, conflict.Error())
+	case errors.Is(err, store.ErrNotFound):
+		return status.Error(codes.NotFound, err.Error())
+	default:
+		return status.Error(codes.Internal, err.Error())
+	}
+}
+
+type resourceService struct {
+	controlv1alpha1.UnimplementedResourceServiceServer
+	api *API
+}
+
+func (s *resourceService) Apply(ctx context.Context, request *controlv1alpha1.ApplyRequest) (*controlv1alpha1.ApplyResponse, error) {
+	return s.api.Apply(ctx, request)
+}
+func (s *resourceService) Validate(ctx context.Context, request *controlv1alpha1.ApplyRequest) (*controlv1alpha1.ApplyResponse, error) {
+	return s.api.Validate(ctx, request)
+}
+func (s *resourceService) Get(ctx context.Context, request *controlv1alpha1.GetRequest) (*controlv1alpha1.ResourceDocument, error) {
+	return s.api.Get(ctx, request)
+}
+func (s *resourceService) List(ctx context.Context, request *controlv1alpha1.ListRequest) (*controlv1alpha1.ListResponse, error) {
+	return s.api.List(ctx, request)
+}
+func (s *resourceService) Delete(ctx context.Context, request *controlv1alpha1.DeleteRequest) (*emptypb.Empty, error) {
+	return s.api.Delete(ctx, request)
+}
+func (s *resourceService) Watch(request *controlv1alpha1.WatchRequest, stream grpc.ServerStreamingServer[controlv1alpha1.ResourceEvent]) error {
+	return s.api.Watch(request, stream)
+}
+func (s *resourceService) Export(ctx context.Context, request *controlv1alpha1.ExportRequest) (*controlv1alpha1.ExportResponse, error) {
+	return s.api.Export(ctx, request)
+}
+
+type flowService struct {
+	controlv1alpha1.UnimplementedFlowServiceServer
+	api *API
+}
+
+func (s *flowService) Compile(ctx context.Context, request *controlv1alpha1.CompileRequest) (*controlv1alpha1.CompileResponse, error) {
+	return s.api.Compile(ctx, request)
+}
+func (s *flowService) PreviewGraph(ctx context.Context, request *controlv1alpha1.PreviewGraphRequest) (*controlv1alpha1.PreviewGraphResponse, error) {
+	return s.api.PreviewGraph(ctx, request)
+}
+
+type runService struct {
+	controlv1alpha1.UnimplementedRunServiceServer
+	api *API
+}
+
+func (s *runService) Start(ctx context.Context, request *controlv1alpha1.StartRunRequest) (*controlv1alpha1.RunRef, error) {
+	return s.api.Start(ctx, request)
+}
+func (s *runService) List(ctx context.Context, request *controlv1alpha1.ListRunsRequest) (*controlv1alpha1.ListRunsResponse, error) {
+	return s.api.ListRuns(ctx, request)
+}
+func (s *runService) WatchEvents(request *controlv1alpha1.WatchRunRequest, stream grpc.ServerStreamingServer[controlv1alpha1.RunEvent]) error {
+	return s.api.WatchEvents(request, stream)
+}
+func (s *runService) Approve(ctx context.Context, request *controlv1alpha1.ApprovalRequest) (*emptypb.Empty, error) {
+	return s.api.Approve(ctx, request)
+}
+func (s *runService) Reject(ctx context.Context, request *controlv1alpha1.ApprovalRequest) (*emptypb.Empty, error) {
+	return s.api.Reject(ctx, request)
+}
+func (s *runService) Cancel(ctx context.Context, request *controlv1alpha1.CancelRunRequest) (*emptypb.Empty, error) {
+	return s.api.Cancel(ctx, request)
+}
+func (s *runService) Reconcile(ctx context.Context, request *controlv1alpha1.ReconcileRequest) (*controlv1alpha1.RunSummary, error) {
+	return s.api.Reconcile(ctx, request)
+}
+
+type triggerService struct {
+	controlv1alpha1.UnimplementedTriggerServiceServer
+	api *API
+}
+
+type pluginService struct {
+	controlv1alpha1.UnimplementedPluginServiceServer
+	api *API
+}
+
+type systemService struct {
+	controlv1alpha1.UnimplementedSystemServiceServer
+	api *API
+}
+
+func (s *systemService) Info(ctx context.Context, request *emptypb.Empty) (*controlv1alpha1.SystemInfo, error) {
+	return s.api.Info(ctx, request)
+}
+func (s *systemService) Health(ctx context.Context, request *emptypb.Empty) (*controlv1alpha1.HealthResponse, error) {
+	return s.api.Health(ctx, request)
+}

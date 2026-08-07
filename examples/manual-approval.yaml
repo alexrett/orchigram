@@ -1,0 +1,31 @@
+apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata:
+  name: manual-approval
+  labels:
+    orchigram.dev/example: walking-skeleton
+spec:
+  policies:
+    timeout: 30m
+    maxParallel: 1
+  nodes:
+    - id: prepare
+      name: Prepare evidence
+      uses: core.noop
+      with:
+        result:
+          summary: Ready for operator review
+    - id: approval
+      name: Operator approval
+      uses: core.approval
+      timeout: 10m
+    - id: finish
+      name: Finish run
+      uses: core.noop
+  edges:
+    - from: prepare
+      to: approval
+    - from: approval
+      to: finish
+      when: result.approved
+
