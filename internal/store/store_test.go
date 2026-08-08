@@ -58,6 +58,134 @@ func TestTerminalRunTransitionsAreImmutable(t *testing.T) {
 	}
 }
 
+func TestNodeAttemptsPreservePhysicalRetriesAndEvidence(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openTestStore(t)
+	plan := flow.ExecutionPlan{FlowUID: "flow-attempts", FlowGeneration: 1, PlanHash: "plan-attempts", InterpreterVersion: flow.InterpreterVersion}
+	if _, err := s.EnsureRun(ctx, StartPayload{RunUID: "run-attempts", Input: json.RawMessage(`{"request":true}`)}, plan); err != nil {
+		t.Fatal(err)
+	}
+
+	const stableKey = "run/run-attempts/node/effect/iteration/0/operation/execute"
+	first, created, err := s.BeginNodeAttempt(ctx, "run-attempts", "effect", 0, 1, stableKey, json.RawMessage(`{"request":true}`))
+	if err != nil || !created || first.Attempt != 1 {
+		t.Fatalf("first attempt=%+v created=%v err=%v", first, created, err)
+	}
+	eventTime := time.Now()
+	if err := s.AppendPluginEvent(ctx, "run-attempts", "effect", 0, 1, 1, "log", json.RawMessage(`{"message":"first"}`), eventTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AppendPluginEvent(ctx, "run-attempts", "effect", 0, 1, 1, "log", json.RawMessage(`{"message":"first"}`), eventTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AppendPluginEvent(ctx, "run-attempts", "effect", 0, 1, 1, "log", json.RawMessage(`{"message":"conflict"}`), eventTime); err == nil {
+		t.Fatal("conflicting duplicate plugin event was accepted")
+	}
+	if _, err := s.CompleteNodeAttempt(ctx, "run-attempts", "effect", 0, 1, "failed", nil, "transient", "plugin-failed"); err != nil {
+		t.Fatal(err)
+	}
+	replayed, created, err := s.BeginNodeAttempt(ctx, "run-attempts", "effect", 0, 1, stableKey, json.RawMessage(`{"ignored":true}`))
+	if err != nil || created || string(replayed.Input) != `{"request":true}` || replayed.Phase != "failed" {
+		t.Fatalf("replayed attempt=%+v created=%v err=%v", replayed, created, err)
+	}
+	second, created, err := s.BeginNodeAttempt(ctx, "run-attempts", "effect", 0, 2, stableKey, json.RawMessage(`{"request":true}`))
+	if err != nil || !created || second.IdempotencyKey != stableKey {
+		t.Fatalf("second attempt=%+v created=%v err=%v", second, created, err)
+	}
+	if _, err := s.CompleteNodeAttempt(ctx, "run-attempts", "effect", 0, 2, "succeeded", json.RawMessage(`{"ok":true}`), "", "exited-0"); err != nil {
+		t.Fatal(err)
+	}
+
+	attempts, err := s.ListNodeAttempts(ctx, "run-attempts", "effect", 10)
+	if err != nil || len(attempts) != 2 {
+		t.Fatalf("attempts=%+v err=%v", attempts, err)
+	}
+	if attempts[0].FrameworkAttempt != 1 || attempts[0].Phase != "failed" || attempts[0].ExitOutcome != "plugin-failed" || attempts[1].FrameworkAttempt != 2 || attempts[1].Phase != "succeeded" || attempts[1].ExitOutcome != "exited-0" {
+		t.Fatalf("attempt outcomes=%+v", attempts)
+	}
+	if attempts[0].IdempotencyKey != attempts[1].IdempotencyKey {
+		t.Fatalf("external idempotency key changed across retries: %+v", attempts)
+	}
+
+	artifact, err := s.PutArtifact(ctx, ArtifactRecord{
+		RunUID: "run-attempts", NodeID: "effect", LogicalIteration: 0, Attempt: 2,
+		Name: "raw.log", MediaType: "text/plain", RelativePath: "artifacts/run-attempts/effect/iteration-0/attempt-2/raw.log",
+		SizeBytes: 7, SHA256: "0000000000000000000000000000000000000000000000000000000000000000",
+	})
+	if err != nil || artifact.UID == "" {
+		t.Fatalf("artifact=%+v err=%v", artifact, err)
+	}
+	if _, err := s.PutArtifact(ctx, ArtifactRecord{
+		RunUID: "run-attempts", NodeID: "effect", LogicalIteration: 0, Attempt: 2,
+		Name: "raw.log", MediaType: "text/plain", RelativePath: "artifacts/run-attempts/effect/iteration-0/attempt-2/raw.log",
+		SizeBytes: 8, SHA256: "1111111111111111111111111111111111111111111111111111111111111111",
+	}); err == nil {
+		t.Fatal("completed artifact metadata was overwritten")
+	}
+	artifacts, err := s.ListArtifacts(ctx, "run-attempts", 10)
+	if err != nil || len(artifacts) != 1 || artifacts[0].RelativePath == "" {
+		t.Fatalf("artifacts=%+v err=%v", artifacts, err)
+	}
+
+	events, err := s.RunEventsAfter(ctx, "run-attempts", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, pluginLogs := 0, 0
+	for _, event := range events {
+		switch event.Type {
+		case "node.started":
+			started++
+		case "plugin.log":
+			pluginLogs++
+		}
+	}
+	if started != 2 || pluginLogs != 1 {
+		t.Fatalf("event evidence started=%d plugin.log=%d events=%+v", started, pluginLogs, events)
+	}
+}
+
+func TestAmbiguousFrameworkRedeliveryAllocatesNewPhysicalAttempt(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openTestStore(t)
+	plan := flow.ExecutionPlan{FlowUID: "flow-redelivery", FlowGeneration: 1, PlanHash: "plan-redelivery", InterpreterVersion: flow.InterpreterVersion}
+	if _, err := s.EnsureRun(ctx, StartPayload{RunUID: "run-redelivery", Input: json.RawMessage(`{}`)}, plan); err != nil {
+		t.Fatal(err)
+	}
+	first, created, err := s.BeginNodeAttempt(ctx, "run-redelivery", "effect", 0, 1, "stable-key", json.RawMessage(`{}`))
+	if err != nil || !created || first.Attempt != 1 {
+		t.Fatalf("first=%+v created=%v err=%v", first, created, err)
+	}
+	second, created, err := s.BeginNodeAttempt(ctx, "run-redelivery", "effect", 0, 1, "stable-key", json.RawMessage(`{}`))
+	if err != nil || !created || second.Attempt != 2 || second.FrameworkAttempt != 1 {
+		t.Fatalf("redelivery=%+v created=%v err=%v", second, created, err)
+	}
+	lost, err := s.NodeAttempt(ctx, "run-redelivery", "effect", 0, 1)
+	if err != nil || lost.Phase != "failed" || lost.ExitOutcome != "delivery-lost" || lost.CompletedAt.IsZero() {
+		t.Fatalf("lost delivery=%+v err=%v", lost, err)
+	}
+	third, created, err := s.BeginNodeAttempt(ctx, "run-redelivery", "effect", 0, 1, "stable-key", json.RawMessage(`{}`))
+	if err != nil || !created || third.Attempt != 3 || third.FrameworkAttempt != 1 {
+		t.Fatalf("second redelivery=%+v created=%v err=%v", third, created, err)
+	}
+	secondLost, err := s.NodeAttempt(ctx, "run-redelivery", "effect", 0, 2)
+	if err != nil || secondLost.ExitOutcome != "delivery-lost" {
+		t.Fatalf("second lost delivery=%+v err=%v", secondLost, err)
+	}
+	if _, err := s.CompleteNodeAttempt(ctx, "run-redelivery", "effect", 0, 3, "succeeded", json.RawMessage(`{"ok":true}`), "", "exited"); err != nil {
+		t.Fatal(err)
+	}
+	replayed, created, err := s.BeginNodeAttempt(ctx, "run-redelivery", "effect", 0, 1, "stable-key", json.RawMessage(`{}`))
+	if err != nil || created || replayed.Attempt != 3 || replayed.Phase != "succeeded" {
+		t.Fatalf("completed redelivery replay=%+v created=%v err=%v", replayed, created, err)
+	}
+	if first.IdempotencyKey != second.IdempotencyKey || second.IdempotencyKey != third.IdempotencyKey {
+		t.Fatalf("redelivery idempotency changed: first=%+v second=%+v third=%+v", first, second, third)
+	}
+}
+
 func TestRunCancellationIntentAndDeliveryAreDurableAndIdempotent(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

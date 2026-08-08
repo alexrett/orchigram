@@ -57,6 +57,10 @@ func Open(ctx context.Context, cfg config.Config, executor engine.TaskExecutor) 
 		return nil, err
 	}
 	plugins := pluginmanager.New(state, cfg.StateDir)
+	if err := plugins.ReconcileArtifacts(ctx); err != nil {
+		_ = state.Close()
+		return nil, fmt.Errorf("reconcile plugin artifacts: %w", err)
+	}
 	if executor == nil {
 		executor = plugins
 	}

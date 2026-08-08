@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -11,6 +12,19 @@ import (
 	"github.com/alexrett/orchigram/internal/flow"
 	"github.com/alexrett/orchigram/internal/store"
 )
+
+func TestSecureArtifactPathRejectsEscapes(t *testing.T) {
+	t.Parallel()
+	inside, err := secureArtifactName("artifacts/run/node/raw.log")
+	if err != nil || inside != filepath.Join("artifacts", "run", "node", "raw.log") {
+		t.Fatalf("inside=%q err=%v", inside, err)
+	}
+	for _, candidate := range []string{"", "../outside", filepath.Join("artifacts", "..", "..", "outside"), filepath.Join(string(os.PathSeparator), "outside")} {
+		if path, err := secureArtifactName(candidate); err == nil {
+			t.Fatalf("escape %q resolved to %q", candidate, path)
+		}
+	}
+}
 
 type missingWorkflowEngine struct{}
 

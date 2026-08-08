@@ -131,7 +131,7 @@ spec:
 		if strings.Contains(string(agentOutput), token) || !strings.Contains(string(agentOutput), "[REDACTED]") {
 			t.Fatalf("%s profile output was not redacted: %s", profileType, agentOutput)
 		}
-		artifact, readErr := os.ReadFile(filepath.Join(stateRoot, "artifacts", "run-agent-"+profileType, "agent", "attempt-1", "raw.log")) //nolint:gosec // Test-owned artifact path.
+		artifact, readErr := os.ReadFile(filepath.Join(stateRoot, "artifacts", "run-agent-"+profileType, "agent", "iteration-0", "attempt-1", "raw.log")) //nolint:gosec // Test-owned artifact path.
 		if readErr != nil || strings.Contains(string(artifact), token) {
 			t.Fatalf("%s raw artifact leak: %q err=%v", profileType, artifact, readErr)
 		}
@@ -581,6 +581,114 @@ func TestMalformedStreamIsRejected(t *testing.T) {
 	}, [][]byte{secret})
 	if doctorErr == nil || status.Code(doctorErr) != codes.Internal || strings.Contains(doctorErr.Error(), string(secret)) || !strings.Contains(doctorErr.Error(), "[REDACTED]") {
 		t.Fatalf("redacted doctor diagnostic=%v", doctorErr)
+	}
+}
+
+func TestPluginEventOutcomePrefersStructuredProcessOutcome(t *testing.T) {
+	t.Parallel()
+	if got := pluginEventOutcome("task.process", json.RawMessage(`{"exitCode":17,"outcome":"exited"}`)); got != "exited" {
+		t.Fatalf("structured outcome=%q", got)
+	}
+	if got := pluginEventOutcome("task.failed", json.RawMessage(`{"error":"transport"}`)); got != "task.failed" {
+		t.Fatalf("terminal fallback=%q", got)
+	}
+	if got := pluginEventOutcome("task.progress", json.RawMessage(`{"percent":50}`)); got != "" {
+		t.Fatalf("nonterminal fallback=%q", got)
+	}
+}
+
+func TestConsumeRedactsEvidenceBeforeDurablePersistence(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	state, err := store.Open(filepath.Join(root, "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	plan := flow.ExecutionPlan{FlowUID: "flow-redaction", FlowGeneration: 1, PlanHash: "plan-redaction", InterpreterVersion: flow.InterpreterVersion}
+	if _, err := state.EnsureRun(ctx, store.StartPayload{RunUID: "run-redaction", Input: json.RawMessage(`{}`)}, plan); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := state.BeginNodeAttempt(ctx, "run-redaction", "effect", 0, 1, "stable-redaction-key", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	secret := []byte("durable-secret-sentinel")
+	manager := &Manager{store: state, artifacts: filepath.Join(root, "artifacts")}
+	events := []*pluginv1alpha1.ExecuteEvent{
+		{Sequence: 1, Type: "task.log.stdout", PayloadJson: []byte(`{"message":"durable-secret-sentinel"}`), RawLog: []byte("durable-secret-sentinel\n"), OccurredAt: timestamppb.Now()},
+		{Sequence: 2, Type: "task.completed", PayloadJson: []byte(`{"result":"durable-secret-sentinel","outcome":"exited"}`), OccurredAt: timestamppb.Now()},
+	}
+	output, err := manager.consume(ctx, runArtifact{runUID: "run-redaction", nodeID: "effect", attempt: 1, redactions: [][]byte{secret}, persist: true}, &fakeReceiver{events: events})
+	if err != nil || strings.Contains(string(output), string(secret)) || !strings.Contains(string(output), "[REDACTED]") {
+		t.Fatalf("output=%s err=%v", output, err)
+	}
+	runEvents, err := state.RunEventsAfter(ctx, "run-redaction", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range runEvents {
+		if strings.Contains(string(event.Payload), string(secret)) {
+			t.Fatalf("event leaked secret: %+v", event)
+		}
+	}
+	artifacts, err := state.ListArtifacts(ctx, "run-redaction", 10)
+	if err != nil || len(artifacts) != 1 {
+		t.Fatalf("artifacts=%+v err=%v", artifacts, err)
+	}
+	raw, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(artifacts[0].RelativePath))) //nolint:gosec // Test reads registered fixture metadata.
+	if err != nil || strings.Contains(string(raw), string(secret)) || !strings.Contains(string(raw), "[REDACTED]") {
+		t.Fatalf("raw artifact=%q err=%v", raw, err)
+	}
+	attempt, err := state.NodeAttempt(ctx, "run-redaction", "effect", 0, 1)
+	if err != nil || attempt.ExitOutcome != "exited" {
+		t.Fatalf("attempt=%+v err=%v", attempt, err)
+	}
+}
+
+func TestReconcileArtifactsRegistersCrashBoundaryFile(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	state, err := store.Open(filepath.Join(root, "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	plan := flow.ExecutionPlan{FlowUID: "flow-artifact-reconcile", FlowGeneration: 1, PlanHash: "plan-artifact-reconcile", InterpreterVersion: flow.InterpreterVersion}
+	if _, err := state.EnsureRun(ctx, store.StartPayload{RunUID: "run-artifact-reconcile", Input: json.RawMessage(`{}`)}, plan); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := state.BeginNodeAttempt(ctx, "run-artifact-reconcile", "effect", 2, 1, "stable-artifact-key", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	artifactPath := filepath.Join(root, "artifacts", "run-artifact-reconcile", "effect", "iteration-2", "attempt-1", "raw.log")
+	if err := os.MkdirAll(filepath.Dir(artifactPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(artifactPath, []byte("crash-boundary\n"), 0o600); err != nil { //nolint:gosec // Test-owned recovery fixture.
+		t.Fatal(err)
+	}
+	manager := New(state, root)
+	if err := manager.ReconcileArtifacts(ctx); err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := state.ListArtifacts(ctx, "run-artifact-reconcile", 10)
+	if err != nil || len(artifacts) != 1 || artifacts[0].LogicalIteration != 2 || artifacts[0].Attempt != 1 || artifacts[0].SizeBytes != int64(len("crash-boundary\n")) {
+		t.Fatalf("reconciled artifacts=%+v err=%v", artifacts, err)
+	}
+	digest := sha256.Sum256([]byte("crash-boundary\n"))
+	if artifacts[0].SHA256 != hex.EncodeToString(digest[:]) {
+		t.Fatalf("reconciled digest=%q", artifacts[0].SHA256)
+	}
+	if _, err := state.CompleteNodeAttempt(ctx, "run-artifact-reconcile", "effect", 2, 1, "succeeded", json.RawMessage(`{}`), "", "exited"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(artifactPath, []byte("tampered\n"), 0o600); err != nil { //nolint:gosec // Test deliberately mutates its fixture.
+		t.Fatal(err)
+	}
+	if err := manager.ReconcileArtifacts(ctx); err == nil || !strings.Contains(err.Error(), "differs from durable metadata") {
+		t.Fatalf("tampered completed artifact reconciliation error=%v", err)
 	}
 }
 

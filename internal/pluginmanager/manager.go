@@ -3,6 +3,8 @@ package pluginmanager
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +20,7 @@ import (
 	"unicode"
 
 	pluginv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/plugin/v1alpha1"
+	"github.com/alexrett/orchigram/internal/engine"
 	"github.com/alexrett/orchigram/internal/flow"
 	"github.com/alexrett/orchigram/internal/pluginbundle"
 	"github.com/alexrett/orchigram/internal/pluginhost"
@@ -62,6 +65,52 @@ func New(state *store.Store, stateRoot string) *Manager {
 		store: state, root: filepath.Join(stateRoot, "plugins"),
 		artifacts: filepath.Join(stateRoot, "artifacts"), workspaces: filepath.Join(stateRoot, "workspaces"), processes: map[string]*pluginhost.Process{}, active: map[string]*activeProviderCall{},
 	}
+}
+
+// ReconcileArtifacts registers attempt-local raw logs that reached durable
+// storage before a daemon crash but not the SQLite metadata transaction.
+func (m *Manager) ReconcileArtifacts(ctx context.Context) error {
+	if m.store == nil {
+		return errors.New("artifact reconciliation requires a state store")
+	}
+	if err := os.MkdirAll(m.artifacts, 0o750); err != nil {
+		return err
+	}
+	return filepath.WalkDir(m.artifacts, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() || entry.Name() != "raw.log" {
+			return nil
+		}
+		relative, err := filepath.Rel(m.artifacts, path)
+		if err != nil {
+			return err
+		}
+		parts := strings.Split(filepath.ToSlash(relative), "/")
+		if len(parts) != 5 || !strings.HasPrefix(parts[2], "iteration-") || !strings.HasPrefix(parts[3], "attempt-") {
+			return nil
+		}
+		logicalIteration, iterationErr := strconv.Atoi(strings.TrimPrefix(parts[2], "iteration-"))
+		physicalAttempt, attemptErr := strconv.ParseUint(strings.TrimPrefix(parts[3], "attempt-"), 10, 32)
+		if iterationErr != nil || logicalIteration < 0 || attemptErr != nil || physicalAttempt == 0 {
+			return nil
+		}
+		identity := runArtifact{runUID: parts[0], nodeID: parts[1], logicalIteration: logicalIteration, attempt: uint32(physicalAttempt), persist: true} //nolint:gosec // ParseUint is bounded to 32 bits.
+		if _, err := m.store.NodeAttempt(ctx, identity.runUID, identity.nodeID, identity.logicalIteration, identity.attempt); errors.Is(err, store.ErrNotFound) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		return m.registerArtifact(ctx, identity, path)
+	})
 }
 
 // Install validates an archive, executes protocol negotiation, then records it.
@@ -508,12 +557,13 @@ func (m *Manager) Execute(ctx context.Context, runUID string, node flow.PlanNode
 		return nil, err
 	}
 	requestID := uuid.NewString()
+	identity := engine.TaskIdentityFromContext(ctx)
 	deadline := time.Now().Add(30 * time.Minute)
 	if parsed, parseErr := time.ParseDuration(node.Timeout); parseErr == nil {
 		deadline = time.Now().Add(parsed)
 	}
 	callMeta := &pluginv1alpha1.CallMeta{
-		RequestId: requestID, RunUid: runUID, NodeId: node.ID, Attempt: 1,
+		RequestId: requestID, RunUid: runUID, NodeId: node.ID, Attempt: identity.Attempt,
 		IdempotencyKey: idempotencyKey, Deadline: timestamppb.New(deadline),
 	}
 	callContext, cancel := context.WithDeadline(ctx, deadline)
@@ -635,7 +685,7 @@ func (m *Manager) executeTask(ctx context.Context, process *pluginhost.Process, 
 	if err != nil {
 		return nil, err
 	}
-	return m.consume(ctx, runArtifact{runUID: meta.GetRunUid(), nodeID: meta.GetNodeId(), attempt: meta.GetAttempt(), redactions: secretValues(secrets)}, stream)
+	return m.consume(ctx, m.runArtifact(ctx, meta, secretValues(secrets)), stream)
 }
 
 func (m *Manager) expandRepositoryConfig(ctx context.Context, config map[string]any) error {
@@ -725,7 +775,7 @@ func (m *Manager) executeAgent(ctx context.Context, process *pluginhost.Process,
 	if err != nil {
 		return nil, err
 	}
-	return m.consume(ctx, runArtifact{runUID: meta.GetRunUid(), nodeID: meta.GetNodeId(), attempt: meta.GetAttempt(), redactions: secretValues(secrets)}, stream)
+	return m.consume(ctx, m.runArtifact(ctx, meta, secretValues(secrets)), stream)
 }
 
 func sortedMapKeys(values map[string]any) []string {
@@ -742,10 +792,22 @@ type eventReceiver interface {
 }
 
 type runArtifact struct {
-	runUID     string
-	nodeID     string
-	attempt    uint32
-	redactions [][]byte
+	runUID           string
+	nodeID           string
+	logicalIteration int
+	attempt          uint32
+	redactions       [][]byte
+	persist          bool
+}
+
+func (m *Manager) runArtifact(ctx context.Context, meta *pluginv1alpha1.CallMeta, redactions [][]byte) runArtifact {
+	identity := engine.TaskIdentityFromContext(ctx)
+	artifact := runArtifact{runUID: meta.GetRunUid(), nodeID: meta.GetNodeId(), logicalIteration: identity.LogicalIteration, attempt: identity.Attempt, redactions: redactions}
+	if m.store != nil {
+		_, err := m.store.NodeAttempt(ctx, artifact.runUID, artifact.nodeID, artifact.logicalIteration, artifact.attempt)
+		artifact.persist = err == nil
+	}
+	return artifact
 }
 
 func (m *Manager) consume(ctx context.Context, artifact runArtifact, stream eventReceiver) (json.RawMessage, error) {
@@ -793,20 +855,53 @@ func (m *Manager) consume(ctx context.Context, artifact runArtifact, stream even
 			return nil, fmt.Errorf("malformed plugin stream at sequence %d", expected)
 		}
 		expected++
-		if len(event.GetRawLog()) > 0 {
-			if err := m.appendArtifact(artifact, redact(event.GetRawLog(), artifact.redactions)); err != nil {
-				return nil, err
-			}
-		}
 		payload := redact(event.GetPayloadJson(), artifact.redactions)
 		if !json.Valid(payload) {
 			return nil, fmt.Errorf("plugin event %d contains invalid JSON", event.GetSequence())
+		}
+		if err := m.persistPluginEvidence(ctx, artifact, event, payload); err != nil {
+			return nil, err
 		}
 		if strings.HasSuffix(event.GetType(), ".failed") || strings.HasSuffix(event.GetType(), ".completed") {
 			terminal = event.GetType()
 			output = append(output[:0], payload...)
 		}
 	}
+}
+
+func (m *Manager) persistPluginEvidence(ctx context.Context, artifact runArtifact, event *pluginv1alpha1.ExecuteEvent, payload json.RawMessage) error {
+	persistContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if len(event.GetRawLog()) > 0 {
+		if err := m.appendArtifact(persistContext, artifact, redact(event.GetRawLog(), artifact.redactions)); err != nil {
+			return fmt.Errorf("persist plugin raw artifact: %w", err)
+		}
+	}
+	if !artifact.persist {
+		return nil
+	}
+	if err := m.store.AppendPluginEvent(persistContext, artifact.runUID, artifact.nodeID, artifact.logicalIteration, artifact.attempt, event.GetSequence(), event.GetType(), payload, event.GetOccurredAt().AsTime()); err != nil {
+		return fmt.Errorf("persist plugin event: %w", err)
+	}
+	if outcome := pluginEventOutcome(event.GetType(), payload); outcome != "" {
+		if err := m.store.SetNodeAttemptOutcome(persistContext, artifact.runUID, artifact.nodeID, artifact.logicalIteration, artifact.attempt, outcome); err != nil {
+			return fmt.Errorf("persist plugin outcome: %w", err)
+		}
+	}
+	return nil
+}
+
+func pluginEventOutcome(eventType string, payload json.RawMessage) string {
+	var terminal struct {
+		Outcome string `json:"outcome"`
+	}
+	if json.Unmarshal(payload, &terminal) == nil && terminal.Outcome != "" {
+		return terminal.Outcome
+	}
+	if !strings.HasSuffix(eventType, ".failed") && !strings.HasSuffix(eventType, ".completed") {
+		return ""
+	}
+	return eventType
 }
 
 func terminalFailureDiagnostic(payload json.RawMessage) string {
@@ -1185,17 +1280,54 @@ func resolveSecretSpec(name string, spec resource.SecretRefSpec) ([]byte, error)
 	}
 }
 
-func (m *Manager) appendArtifact(artifact runArtifact, data []byte) error {
-	directory := filepath.Join(m.artifacts, artifact.runUID, artifact.nodeID, fmt.Sprintf("attempt-%d", artifact.attempt))
+func (m *Manager) appendArtifact(ctx context.Context, artifact runArtifact, data []byte) error {
+	directory := filepath.Join(m.artifacts, artifact.runUID, artifact.nodeID, fmt.Sprintf("iteration-%d", artifact.logicalIteration), fmt.Sprintf("attempt-%d", artifact.attempt))
 	if err := os.MkdirAll(directory, 0o750); err != nil {
 		return err
 	}
-	file, err := os.OpenFile(filepath.Join(directory, "raw.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600) //nolint:gosec // Run and node identifiers are compiler-validated path components.
+	artifactPath := filepath.Join(directory, "raw.log")
+	file, err := os.OpenFile(artifactPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600) //nolint:gosec // Run and node identifiers are compiler-validated path components.
 	if err != nil {
 		return err
 	}
-	defer func() { _ = file.Close() }()
-	_, err = file.Write(data)
+	if _, err = file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if !artifact.persist {
+		return nil
+	}
+	return m.registerArtifact(ctx, artifact, artifactPath)
+}
+
+func (m *Manager) registerArtifact(ctx context.Context, identity runArtifact, artifactPath string) error {
+	file, err := os.Open(artifactPath) //nolint:gosec // Path is built below the manager-owned artifact root.
+	if err != nil {
+		return err
+	}
+	hasher := sha256.New()
+	size, copyErr := io.Copy(hasher, file)
+	closeErr := file.Close()
+	if copyErr != nil || closeErr != nil {
+		return errors.Join(copyErr, closeErr)
+	}
+	stateRoot := filepath.Dir(m.artifacts)
+	relativePath, err := filepath.Rel(stateRoot, artifactPath)
+	if err != nil || strings.HasPrefix(relativePath, "..") || filepath.IsAbs(relativePath) {
+		return errors.New("artifact path escaped state root")
+	}
+	_, err = m.store.PutArtifact(ctx, store.ArtifactRecord{
+		RunUID: identity.runUID, NodeID: identity.nodeID, LogicalIteration: identity.logicalIteration,
+		Attempt: identity.attempt, Name: "raw.log", MediaType: "text/plain; charset=utf-8",
+		RelativePath: filepath.ToSlash(relativePath), SizeBytes: size, SHA256: hex.EncodeToString(hasher.Sum(nil)),
+	})
 	return err
 }
 

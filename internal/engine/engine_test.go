@@ -108,6 +108,56 @@ func TestActivityHeartbeatsPreventConcurrentRedispatch(t *testing.T) {
 	}
 }
 
+func TestPhysicalRetriesAreDurableAndReuseExternalIdempotencyKey(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	state, err := store.Open(filepath.Join(root, "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	executor := &flakyAttemptExecutor{}
+	adapter, err := Open(ctx, filepath.Join(root, "workflows.sqlite"), state, executor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = adapter.Close() }()
+	plan := flow.ExecutionPlan{
+		FlowUID: "flow-retry-evidence", FlowGeneration: 1, InterpreterVersion: flow.InterpreterVersion, PlanHash: "retry-evidence-plan",
+		Nodes: []flow.PlanNode{{ID: "effect", Uses: "fixture.execute", Timeout: "5s", RetryLimit: 1, RetryBackoff: "10ms"}},
+	}
+	payload := store.StartPayload{RunUID: "run-retry-evidence", Input: json.RawMessage(`{"request":true}`)}
+	if _, err := state.EnsureRun(ctx, payload, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Start(ctx, payload.RunUID, plan, payload.Input); err != nil {
+		t.Fatal(err)
+	}
+	waitForPhase(ctx, t, state, payload.RunUID, "succeeded")
+
+	attempts, err := state.ListNodeAttempts(ctx, payload.RunUID, "effect", 10)
+	if err != nil || len(attempts) != 2 {
+		t.Fatalf("attempts=%+v err=%v", attempts, err)
+	}
+	if attempts[0].Attempt != 1 || attempts[0].Phase != "failed" || attempts[1].Attempt != 2 || attempts[1].Phase != "succeeded" {
+		t.Fatalf("attempt phases=%+v", attempts)
+	}
+	if attempts[0].IdempotencyKey != attempts[1].IdempotencyKey {
+		t.Fatalf("idempotency key changed across physical retries: %+v", attempts)
+	}
+	executor.mu.Lock()
+	identities, keys := append([]TaskIdentity(nil), executor.identities...), append([]string(nil), executor.keys...)
+	executor.mu.Unlock()
+	if len(identities) != 2 || identities[0].Attempt != 1 || identities[1].Attempt != 2 || identities[0].FrameworkAttempt != 1 || identities[1].FrameworkAttempt != 2 || identities[0].LogicalIteration != 0 || identities[1].LogicalIteration != 0 {
+		t.Fatalf("executor identities=%+v", identities)
+	}
+	if len(keys) != 2 || keys[0] != keys[1] || keys[0] == "" {
+		t.Fatalf("executor idempotency keys=%+v", keys)
+	}
+}
+
 func TestCancellationRemainsTerminalAfterLateActivityCompletion(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -267,6 +317,24 @@ type slowExecutor struct {
 	active, maximum int
 	calls           int
 	delay           time.Duration
+}
+
+type flakyAttemptExecutor struct {
+	mu         sync.Mutex
+	identities []TaskIdentity
+	keys       []string
+}
+
+func (e *flakyAttemptExecutor) Execute(ctx context.Context, _ string, _ flow.PlanNode, _ json.RawMessage, _ map[string]any, idempotencyKey string) (json.RawMessage, error) {
+	identity := TaskIdentityFromContext(ctx)
+	e.mu.Lock()
+	e.identities = append(e.identities, identity)
+	e.keys = append(e.keys, idempotencyKey)
+	e.mu.Unlock()
+	if identity.Attempt == 1 {
+		return nil, errors.New("transient fixture failure")
+	}
+	return json.RawMessage(`{"ok":true}`), nil
 }
 
 type blockingExecutor struct {
