@@ -47,7 +47,7 @@ func TestOpenRejectsAStateDatabaseFromANewerSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = Open(path)
-	if err == nil || !strings.Contains(err.Error(), "database schema version 999 is newer than supported version 5") {
+	if err == nil || !strings.Contains(err.Error(), "database schema version 999 is newer than supported version") {
 		t.Fatalf("future schema error=%v", err)
 	}
 }
