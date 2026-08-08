@@ -423,8 +423,34 @@ func TestInstalledPluginExecutesThroughDurableDaemon(t *testing.T) {
 	if installed.GetName() != "exec" || installed.GetVersion() != "0.1.0" {
 		t.Fatalf("installed plugin: %+v", installed)
 	}
+	installations, err := client.Resources.List(context.Background(), &controlv1alpha1.ListRequest{Kind: "PluginInstallation", Limit: 10})
+	if err != nil || len(installations.GetResources()) != 1 {
+		t.Fatalf("PluginInstallation list=%+v err=%v", installations, err)
+	}
+	installation := installations.GetResources()[0]
+	before := decodePluginInstallationProjection(t, installation.GetJson())
+	if before.Spec.Enabled == nil || *before.Spec.Enabled || before.Status.Phase != "Installed" || before.Status.ObservedGeneration != before.Metadata.Generation {
+		t.Fatalf("installed projection=%+v", before)
+	}
+	watchContext, cancelWatch := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelWatch()
+	watch, err := client.Resources.Watch(watchContext, &controlv1alpha1.WatchRequest{Kind: "PluginInstallation", AfterRevision: installations.GetRevision()})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := client.Plugins.Enable(context.Background(), &controlv1alpha1.PluginRequest{Name: "exec", Version: "0.1.0"}); err != nil {
 		t.Fatal(err)
+	}
+	var active pluginInstallationProjection
+	for active.Status.Phase != "Active" {
+		event, recvErr := watch.Recv()
+		if recvErr != nil {
+			t.Fatal(recvErr)
+		}
+		active = decodePluginInstallationProjection(t, event.GetResource().GetJson())
+	}
+	if active.Metadata.Generation != before.Metadata.Generation+1 || active.Metadata.ResourceVersion <= installation.GetResourceVersion() || active.Status.ObservedGeneration != active.Metadata.Generation {
+		t.Fatalf("active projection=%+v", active)
 	}
 	flowDocument := []byte(`apiVersion: orchigram.dev/v1alpha1
 kind: Flow
@@ -516,6 +542,66 @@ spec:
 			t.Fatalf("missing durable %s event; saw %+v", eventType, seenPluginEvents)
 		}
 	}
+}
+
+func TestMissingPluginInstallationIsPersistedWithControllerStatus(t *testing.T) {
+	t.Parallel()
+	root, err := os.MkdirTemp("/tmp", "orchigram-missing-plugin-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	cfg := config.Development(filepath.Join(root, "state"))
+	stop := serveTestDaemon(t, cfg)
+	defer stop()
+	client := dialReadyClient(t, cfg.SocketPath)
+	defer func() { _ = client.Close() }()
+	response, err := client.Resources.Apply(context.Background(), &controlv1alpha1.ApplyRequest{Document: []byte(`apiVersion: orchigram.dev/v1alpha1
+kind: PluginInstallation
+metadata: {name: missing-plugin}
+spec:
+  plugin: missing
+  version: 1.0.0
+  digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  enabled: false
+`)})
+	if err != nil || len(response.GetDiagnostics()) != 1 || response.GetDiagnostics()[0].GetCode() != "bundle_missing" || response.GetDiagnostics()[0].GetSeverity() != controlv1alpha1.Diagnostic_SEVERITY_WARNING {
+		t.Fatalf("apply response=%+v err=%v", response, err)
+	}
+	projection := decodePluginInstallationProjection(t, response.GetResource().GetJson())
+	if projection.Status.Phase != "Error" || projection.Status.ObservedGeneration != projection.Metadata.Generation {
+		t.Fatalf("projection=%+v", projection)
+	}
+	healthResponse, err := client.System.Health(context.Background(), &emptypb.Empty{})
+	if err != nil || healthResponse.GetReady() {
+		t.Fatalf("health=%+v err=%v", healthResponse, err)
+	}
+	if _, err := client.Resources.Delete(context.Background(), &controlv1alpha1.DeleteRequest{Key: response.GetResource().GetKey(), ExpectedResourceVersion: response.GetResource().GetResourceVersion()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Resources.Get(context.Background(), &controlv1alpha1.GetRequest{Key: response.GetResource().GetKey()}); status.Code(err) != codes.NotFound {
+		t.Fatalf("deleted missing PluginInstallation error=%v", err)
+	}
+}
+
+type pluginInstallationProjection struct {
+	APIVersion string                          `json:"apiVersion"`
+	Kind       string                          `json:"kind"`
+	Metadata   resource.ObjectMeta             `json:"metadata"`
+	Spec       resource.PluginInstallationSpec `json:"spec"`
+	Status     struct {
+		ObservedGeneration uint64 `json:"observedGeneration"`
+		Phase              string `json:"phase"`
+	} `json:"status"`
+}
+
+func decodePluginInstallationProjection(t *testing.T, data []byte) pluginInstallationProjection {
+	t.Helper()
+	var projection pluginInstallationProjection
+	if err := json.Unmarshal(data, &projection); err != nil {
+		t.Fatal(err)
+	}
+	return projection
 }
 
 func TestFlakyPluginRetriesKeepDistinctEvidenceAcrossRestart(t *testing.T) {

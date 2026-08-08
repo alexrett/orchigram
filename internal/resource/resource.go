@@ -173,7 +173,7 @@ type PluginInstallationSpec struct {
 	Enabled *bool  `json:"enabled,omitempty" yaml:"enabled,omitempty"`
 }
 
-// PluginInstallation projects daemon-owned plugin installation state.
+// PluginInstallation selects desired activation for one immutable bundle.
 type PluginInstallation struct {
 	TypeMeta `json:",inline" yaml:",inline"`
 	Metadata ObjectMeta             `json:"metadata" yaml:"metadata"`
@@ -320,6 +320,22 @@ func DecodeRepository(data []byte) (Repository, error) {
 		return Repository{}, err
 	}
 	return repository, nil
+}
+
+// DecodePluginInstallation decodes one declarative immutable plugin selection.
+func DecodePluginInstallation(data []byte) (PluginInstallation, error) {
+	doc, err := DecodeStrict(data)
+	if err != nil {
+		return PluginInstallation{}, err
+	}
+	if doc.Kind != "PluginInstallation" {
+		return PluginInstallation{}, fmt.Errorf("expected PluginInstallation, got %s", doc.Kind)
+	}
+	var installation PluginInstallation
+	if err := json.Unmarshal(doc.JSON, &installation); err != nil {
+		return PluginInstallation{}, err
+	}
+	return installation, nil
 }
 
 // DecodeSecretRef decodes and returns a concrete SecretRef projection.
