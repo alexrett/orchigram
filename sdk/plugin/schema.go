@@ -222,25 +222,40 @@ func declaresObject(document any) bool {
 }
 
 func rejectExternalReferences(value any) error {
-	switch typed := value.(type) {
-	case map[string]any:
-		for key, child := range typed {
-			if key == "$schema" {
-				if schema, ok := child.(string); !ok || schema != draft2020Schema {
-					return fmt.Errorf("$schema must be %q", draft2020Schema)
-				}
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	if child, exists := object["$schema"]; exists {
+		if schema, valid := child.(string); !valid || schema != draft2020Schema {
+			return fmt.Errorf("$schema must be %q", draft2020Schema)
+		}
+	}
+	for _, keyword := range []string{"$ref", "$dynamicRef"} {
+		if child, exists := object[keyword]; exists {
+			if reference, valid := child.(string); !valid || !strings.HasPrefix(reference, "#") {
+				return fmt.Errorf("external %s values are not allowed", keyword)
 			}
-			if key == "$ref" {
-				if reference, ok := child.(string); !ok || !strings.HasPrefix(reference, "#") {
-					return errors.New("external $ref values are not allowed")
-				}
-			}
+		}
+	}
+	for _, keyword := range []string{"additionalProperties", "unevaluatedProperties", "unevaluatedItems", "propertyNames", "contains", "items", "not", "if", "then", "else", "contentSchema"} {
+		if child, exists := object[keyword]; exists {
 			if err := rejectExternalReferences(child); err != nil {
 				return err
 			}
 		}
-	case []any:
-		for _, child := range typed {
+	}
+	for _, keyword := range []string{"allOf", "anyOf", "oneOf", "prefixItems"} {
+		children, _ := object[keyword].([]any)
+		for _, child := range children {
+			if err := rejectExternalReferences(child); err != nil {
+				return err
+			}
+		}
+	}
+	for _, keyword := range []string{"$defs", "properties", "patternProperties", "dependentSchemas"} {
+		children, _ := object[keyword].(map[string]any)
+		for _, child := range children {
 			if err := rejectExternalReferences(child); err != nil {
 				return err
 			}
@@ -290,10 +305,23 @@ func validateRaw(schema *jsonschema.Schema, raw json.RawMessage, root string) *p
 func schemaIssue(err error, root string) *pluginv1alpha1.ValidationIssue {
 	path := root
 	var validation *jsonschema.ValidationError
-	if errors.As(err, &validation) && len(validation.InstanceLocation) > 0 {
-		path += "." + strings.Join(validation.InstanceLocation, ".")
+	if errors.As(err, &validation) {
+		if location := deepestInstanceLocation(validation); len(location) > 0 {
+			path += "." + strings.Join(location, ".")
+		}
 	}
 	return &pluginv1alpha1.ValidationIssue{Path: path, Code: "schema_invalid", Message: root + " does not satisfy its declared action schema"}
+}
+
+func deepestInstanceLocation(validation *jsonschema.ValidationError) []string {
+	best := validation.InstanceLocation
+	for _, cause := range validation.Causes {
+		candidate := deepestInstanceLocation(cause)
+		if len(candidate) > len(best) || (len(candidate) == len(best) && strings.Join(candidate, ".") < strings.Join(best, ".")) {
+			best = candidate
+		}
+	}
+	return best
 }
 
 func actionDescriptorsPB(descriptors []ActionDescriptor) []*pluginv1alpha1.ActionDescriptor {

@@ -2,11 +2,13 @@
 package flow
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"sort"
 	"strconv"
@@ -183,10 +185,14 @@ func ValidateRunInput(plan ExecutionPlan, raw json.RawMessage) error {
 		raw = json.RawMessage(`{}`)
 	}
 	var value any
-	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	if err := decoder.Decode(&value); err != nil {
 		return errors.New("run input is not valid JSON")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return errors.New("run input must contain exactly one JSON value")
 	}
 	schema, err := actioncontract.Compile(plan.InputSchema)
 	if err != nil {

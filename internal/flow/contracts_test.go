@@ -148,6 +148,9 @@ func TestValidateRunInputUsesPinnedSchema(t *testing.T) {
 	if err := ValidateRunInput(plan, json.RawMessage(`{"issue":42}`)); err != nil {
 		t.Fatal(err)
 	}
+	if err := ValidateRunInput(plan, json.RawMessage(`{"issue":42}{}`)); err == nil {
+		t.Fatal("trailing JSON value was accepted")
+	}
 }
 
 func fixtureContract(config, output string) ActionContract {

@@ -301,10 +301,10 @@ func (r *Runtime) Execute(request *pluginv1alpha1.ExecuteRequest, stream pluginv
 	}
 	contract := r.contracts[request.GetAction()]
 	if issue := contract.validateConfig(config); issue != nil {
-		return status.Error(codes.InvalidArgument, issue.GetMessage())
+		return status.Error(codes.InvalidArgument, validationIssueMessage(issue))
 	}
 	if issue := contract.validateInput(input); issue != nil {
-		return status.Error(codes.InvalidArgument, issue.GetMessage())
+		return status.Error(codes.InvalidArgument, validationIssueMessage(issue))
 	}
 	ctx, cancel := context.WithDeadline(stream.Context(), request.GetMeta().GetDeadline().AsTime())
 	if err := r.register(meta, cancel); err != nil {
@@ -322,9 +322,13 @@ func (r *Runtime) Execute(request *pluginv1alpha1.ExecuteRequest, stream pluginv
 		return sink.finish("task.failed", map[string]any{"error": handlerErr.Error()})
 	}
 	if issue := contract.validateOutputValue(result); issue != nil {
-		return sink.finish("task.failed", map[string]any{"error": issue.GetMessage()})
+		return sink.finish("task.failed", map[string]any{"error": validationIssueMessage(issue)})
 	}
 	return sink.finish("task.completed", result)
+}
+
+func validationIssueMessage(issue *pluginv1alpha1.ValidationIssue) string {
+	return fmt.Sprintf("%s (%s): %s", issue.GetPath(), issue.GetCode(), issue.GetMessage())
 }
 
 // Cancel cancels the matching active handler context.

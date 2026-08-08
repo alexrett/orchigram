@@ -60,4 +60,18 @@ func TestCompileRejectsExternalReferencesWithoutNetworkAccess(t *testing.T) {
 	if _, err := Compile(json.RawMessage(`{"$ref":"https://example.invalid/schema"}`)); err == nil {
 		t.Fatal("external schema reference was accepted")
 	}
+	if _, err := Compile(json.RawMessage(`{"$dynamicRef":"https://example.invalid/schema"}`)); err == nil {
+		t.Fatal("external dynamic schema reference was accepted")
+	}
+}
+
+func TestCompileAllowsReferenceKeywordAsInstanceProperty(t *testing.T) {
+	t.Parallel()
+	if _, err := Compile(json.RawMessage(`{
+  "type":"object",
+  "properties":{"$ref":{"type":"string"},"payload":{"const":{"$ref":"instance value"}}},
+  "$defs":{"$schema":{"type":"string"}}
+}`)); err != nil {
+		t.Fatalf("instance property names were treated as schema keywords: %v", err)
+	}
 }

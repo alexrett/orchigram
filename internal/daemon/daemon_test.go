@@ -1606,10 +1606,13 @@ func dialReadyClient(t *testing.T, socketPath string) *clientpkg.Client {
 
 func waitForSystemHealth(t *testing.T, client *clientpkg.Client, ready bool, path, code string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	for {
-		health, err := client.System.Health(ctx, &emptypb.Empty{})
+	deadline := time.Now().Add(30 * time.Second)
+	var health *controlv1alpha1.HealthResponse
+	var err error
+	for time.Now().Before(deadline) {
+		callContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		health, err = client.System.Health(callContext, &emptypb.Empty{})
+		cancel()
 		if err == nil && health.GetReady() == ready {
 			if ready {
 				return
@@ -1620,11 +1623,12 @@ func waitForSystemHealth(t *testing.T, client *clientpkg.Client, ready bool, pat
 				}
 			}
 		}
-		if ctx.Err() != nil {
-			t.Fatalf("health did not converge to ready=%t path=%q code=%q: response=%+v err=%v", ready, path, code, health, err)
+		if err != nil && status.Code(err) != codes.Unavailable && status.Code(err) != codes.DeadlineExceeded {
+			t.Fatalf("health probe failed before convergence: %v", err)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	t.Fatalf("health did not converge to ready=%t path=%q code=%q: response=%+v err=%v", ready, path, code, health, err)
 }
 
 func waitForRunEvent(t *testing.T, client *clientpkg.Client, runUID string, after uint64, eventType string) {

@@ -87,25 +87,40 @@ func Compile(raw json.RawMessage) (*Schema, error) {
 }
 
 func rejectExternalReferences(value any) error {
-	switch typed := value.(type) {
-	case map[string]any:
-		for key, child := range typed {
-			if key == "$schema" {
-				if draft, ok := child.(string); !ok || draft != "https://json-schema.org/draft/2020-12/schema" {
-					return errors.New("$schema must select Draft 2020-12")
-				}
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	if child, exists := object["$schema"]; exists {
+		if draft, valid := child.(string); !valid || draft != "https://json-schema.org/draft/2020-12/schema" {
+			return errors.New("$schema must select Draft 2020-12")
+		}
+	}
+	for _, keyword := range []string{"$ref", "$dynamicRef"} {
+		if child, exists := object[keyword]; exists {
+			if reference, valid := child.(string); !valid || !strings.HasPrefix(reference, "#") {
+				return fmt.Errorf("external %s values are not allowed", keyword)
 			}
-			if key == "$ref" {
-				if reference, ok := child.(string); !ok || !strings.HasPrefix(reference, "#") {
-					return errors.New("external $ref values are not allowed")
-				}
-			}
+		}
+	}
+	for _, keyword := range []string{"additionalProperties", "unevaluatedProperties", "unevaluatedItems", "propertyNames", "contains", "items", "not", "if", "then", "else", "contentSchema"} {
+		if child, exists := object[keyword]; exists {
 			if err := rejectExternalReferences(child); err != nil {
 				return err
 			}
 		}
-	case []any:
-		for _, child := range typed {
+	}
+	for _, keyword := range []string{"allOf", "anyOf", "oneOf", "prefixItems"} {
+		children, _ := object[keyword].([]any)
+		for _, child := range children {
+			if err := rejectExternalReferences(child); err != nil {
+				return err
+			}
+		}
+	}
+	for _, keyword := range []string{"$defs", "properties", "patternProperties", "dependentSchemas"} {
+		children, _ := object[keyword].(map[string]any)
+		for _, child := range children {
 			if err := rejectExternalReferences(child); err != nil {
 				return err
 			}

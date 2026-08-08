@@ -96,8 +96,29 @@ func TestTaskRuntimeEnforcesDeclaredSchemas(t *testing.T) {
 		t.Fatal(err)
 	}
 	events := stream.snapshot()
-	if len(events) != 1 || events[0].GetType() != "task.failed" || strings.Contains(string(events[0].GetPayloadJson()), "42") {
+	if len(events) != 1 || events[0].GetType() != "task.failed" || strings.Contains(string(events[0].GetPayloadJson()), "42") ||
+		!strings.Contains(string(events[0].GetPayloadJson()), "output.message") || !strings.Contains(string(events[0].GetPayloadJson()), "schema_invalid") {
 		t.Fatalf("events=%+v", events)
+	}
+	request.InputJson = []byte(`{"message":42}`)
+	if err := runtime.Execute(request, &captureStream{ctx: context.Background()}); err == nil ||
+		!strings.Contains(err.Error(), "input.message") || !strings.Contains(err.Error(), "schema_invalid") || strings.Contains(err.Error(), "42") {
+		t.Fatalf("input schema error was not stable and secret-safe: %v", err)
+	}
+}
+
+func TestSchemaKeywordsMayBeInstancePropertyNames(t *testing.T) {
+	t.Parallel()
+	descriptor := testActionDescriptor()
+	descriptor.InputSchema = json.RawMessage(`{
+  "type":"object",
+  "properties":{"$ref":{"type":"string"},"payload":{"const":{"$schema":"instance value"}}},
+  "$defs":{"$ref":{"type":"string"}}
+}`)
+	if _, _, err := New(Config{Metadata: Metadata{
+		Name: "echo", Version: "0.1.0", Capabilities: []string{"task.echo.echo"}, Actions: []ActionDescriptor{descriptor},
+	}, Task: TaskHandlerFuncs{}}); err != nil {
+		t.Fatalf("instance property names were treated as schema keywords: %v", err)
 	}
 }
 
