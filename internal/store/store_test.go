@@ -52,6 +52,115 @@ func TestOpenRejectsAStateDatabaseFromANewerSchema(t *testing.T) {
 	}
 }
 
+func TestResourceStatusAdvancesWatchRevisionWithoutChangingGeneration(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openTestStore(t)
+	document, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: AgentProfile
+metadata: {name: worker}
+spec: {type: command, executable: fake-agent}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied, err := s.Apply(ctx, document, ApplyOptions{RequestID: "create-profile"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := map[string]any{"observedGeneration": float64(applied.Metadata.Generation), "phase": "Ready"}
+	projected, err := s.UpdateResourceStatus(ctx, "AgentProfile", applied.Metadata.Namespace, applied.Metadata.Name, applied.Metadata.Generation, status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projected.Metadata.Generation != applied.Metadata.Generation || projected.Metadata.ResourceVersion <= applied.Metadata.ResourceVersion {
+		t.Fatalf("applied=%+v projected=%+v", applied.Metadata, projected.Metadata)
+	}
+	var projection struct {
+		Status map[string]any `json:"status"`
+	}
+	if err := json.Unmarshal(projected.JSON, &projection); err != nil || projection.Status["phase"] != "Ready" {
+		t.Fatalf("status=%+v err=%v", projection.Status, err)
+	}
+	encodedStatus, err := json.Marshal(status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var statusRequestID string
+	if err := s.db.QueryRowContext(ctx, `SELECT request_id FROM audit_records WHERE operation='status' AND resource_uid=?`, applied.Metadata.UID).Scan(&statusRequestID); err != nil {
+		t.Fatal(err)
+	}
+	wantRequestID := "status:" + applied.Metadata.UID + ":1:" + digest(encodedStatus)
+	if statusRequestID != wantRequestID {
+		t.Fatalf("status request ID=%q want=%q", statusRequestID, wantRequestID)
+	}
+	same, err := s.UpdateResourceStatus(ctx, "AgentProfile", applied.Metadata.Namespace, applied.Metadata.Name, applied.Metadata.Generation, status)
+	if err != nil || same.Metadata.ResourceVersion != projected.Metadata.ResourceVersion {
+		t.Fatalf("idempotent status=%+v err=%v", same.Metadata, err)
+	}
+
+	updated, err := resource.DecodeStrict([]byte(fmt.Sprintf(`apiVersion: orchigram.dev/v1alpha1
+kind: AgentProfile
+metadata: {name: worker, resourceVersion: %d}
+spec: {type: command, executable: next-agent}
+`, projected.Metadata.ResourceVersion)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err = s.Apply(ctx, updated, ApplyOptions{RequestID: "update-profile"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Metadata.Generation != applied.Metadata.Generation+1 {
+		t.Fatalf("updated generation=%d", updated.Metadata.Generation)
+	}
+	if err := json.Unmarshal(updated.JSON, &projection); err != nil || projection.Status["phase"] != "Ready" {
+		t.Fatalf("preserved status=%+v err=%v", projection.Status, err)
+	}
+	if _, err := s.UpdateResourceStatus(ctx, "AgentProfile", updated.Metadata.Namespace, updated.Metadata.Name, applied.Metadata.Generation, map[string]any{"phase": "Stale"}); err == nil {
+		t.Fatal("stale observed generation status update succeeded")
+	} else {
+		var stale *StaleObservedGenerationError
+		if !errors.As(err, &stale) {
+			t.Fatalf("stale status error=%v", err)
+		}
+	}
+	events, err := s.EventsAfter(ctx, "AgentProfile", resource.DefaultNamespace, 0, 10)
+	if err != nil || len(events) != 3 || events[1].Type != "MODIFIED" {
+		t.Fatalf("events=%+v err=%v", events, err)
+	}
+}
+
+func TestResourceCreateCannotPersistClientOwnedStatus(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openTestStore(t)
+	document, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: AgentProfile
+metadata: {name: forged-status}
+spec: {type: command, executable: fake-agent}
+status: {observedGeneration: 999, phase: Active}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied, err := s.Apply(ctx, document, ApplyOptions{RequestID: "forged-status"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var projection map[string]any
+	if err := json.Unmarshal(applied.JSON, &projection); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := projection["status"]; exists || string(applied.Status) != `{}` {
+		t.Fatalf("client status persisted: %s", applied.JSON)
+	}
+	stored, err := s.Get(ctx, document.Kind, document.Metadata.Namespace, document.Metadata.Name)
+	if err != nil || strings.Contains(string(stored.JSON), `"phase":"Active"`) {
+		t.Fatalf("stored resource=%s err=%v", stored.JSON, err)
+	}
+}
+
 func TestTerminalRunTransitionsAreImmutable(t *testing.T) {
 	t.Parallel()
 	for _, terminal := range []string{"succeeded", "failed", "rejected", "cancelled"} {

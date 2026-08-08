@@ -31,6 +31,7 @@ import (
 	"github.com/alexrett/orchigram/internal/firstparty"
 	"github.com/alexrett/orchigram/internal/githubplugin"
 	"github.com/alexrett/orchigram/internal/pluginbundle"
+	"github.com/alexrett/orchigram/internal/pluginmanager"
 	"github.com/alexrett/orchigram/internal/pluginruntime"
 	"github.com/alexrett/orchigram/internal/process"
 	"github.com/alexrett/orchigram/internal/resource"
@@ -44,7 +45,15 @@ import (
 
 func TestMain(m *testing.M) {
 	if os.Getenv(pluginsdk.Handshake.MagicCookieKey) == pluginsdk.Handshake.MagicCookieValue {
-		executable, _ := os.Executable()
+		executable, err := os.Executable()
+		if err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, "resolve plugin test executable:", err)
+			os.Exit(3)
+		}
+		if err := os.WriteFile(filepath.Join(filepath.Dir(executable), "process.pid"), []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, "write plugin test pid marker:", err)
+			os.Exit(3)
+		}
 		name := filepath.Base(filepath.Dir(filepath.Dir(executable)))
 		catalogPlugin, _ := firstparty.Find(name)
 		config := pluginsdk.Config{Metadata: pluginsdk.Metadata{
@@ -69,6 +78,69 @@ func TestMain(m *testing.M) {
 		return
 	}
 	os.Exit(m.Run())
+}
+
+func TestOpenClosesActivatedPluginsWhenLateInitializationFails(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "orchigram-open-cleanup-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	cfg := config.Development(filepath.Join(root, "state"))
+	if err := os.MkdirAll(cfg.StateDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.Open(filepath.Join(cfg.StateDir, "orchigram.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := pluginmanager.New(state, cfg.StateDir)
+	record, err := manager.Install(context.Background(), daemonPluginBundle(t, "exec", []string{"task.exec.run"}))
+	if err != nil {
+		manager.Close()
+		_ = state.Close()
+		t.Fatal(err)
+	}
+	if err := state.ActivatePlugin(context.Background(), record.Name, record.Version); err != nil {
+		manager.Close()
+		_ = state.Close()
+		t.Fatal(err)
+	}
+	manager.Close()
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(cfg.StateDir, "workflows.sqlite"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	instance, err := Open(context.Background(), cfg, nil)
+	if err == nil {
+		_ = instance.Close()
+		t.Fatal("expected workflow database initialization to fail")
+	}
+	pidFile := filepath.Join(cfg.StateDir, "plugins", "exec", record.Version, "process.pid")
+	data, readErr := os.ReadFile(pidFile) //nolint:gosec // The test owns the temporary path.
+	if readErr != nil {
+		t.Fatalf("activated plugin did not report its pid: %v", readErr)
+	}
+	pid, parseErr := strconv.Atoi(string(data))
+	if parseErr != nil {
+		t.Fatalf("parse plugin pid %q: %v", data, parseErr)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		signalErr := syscall.Kill(pid, 0)
+		if errors.Is(signalErr, syscall.ESRCH) {
+			break
+		}
+		if signalErr != nil {
+			t.Fatalf("probe plugin process %d: %v", pid, signalErr)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("plugin process %d survived failed daemon initialization", pid)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func TestSlackWeekdayFlowAcceptance(t *testing.T) {
@@ -423,8 +495,34 @@ func TestInstalledPluginExecutesThroughDurableDaemon(t *testing.T) {
 	if installed.GetName() != "exec" || installed.GetVersion() != "0.1.0" {
 		t.Fatalf("installed plugin: %+v", installed)
 	}
+	installations, err := client.Resources.List(context.Background(), &controlv1alpha1.ListRequest{Kind: "PluginInstallation", Limit: 10})
+	if err != nil || len(installations.GetResources()) != 1 {
+		t.Fatalf("PluginInstallation list=%+v err=%v", installations, err)
+	}
+	installation := installations.GetResources()[0]
+	before := decodePluginInstallationProjection(t, installation.GetJson())
+	if before.Spec.Enabled == nil || *before.Spec.Enabled || before.Status.Phase != "Installed" || before.Status.ObservedGeneration != before.Metadata.Generation {
+		t.Fatalf("installed projection=%+v", before)
+	}
+	watchContext, cancelWatch := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelWatch()
+	watch, err := client.Resources.Watch(watchContext, &controlv1alpha1.WatchRequest{Kind: "PluginInstallation", AfterRevision: installations.GetRevision()})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := client.Plugins.Enable(context.Background(), &controlv1alpha1.PluginRequest{Name: "exec", Version: "0.1.0"}); err != nil {
 		t.Fatal(err)
+	}
+	var active pluginInstallationProjection
+	for active.Status.Phase != "Active" {
+		event, recvErr := watch.Recv()
+		if recvErr != nil {
+			t.Fatal(recvErr)
+		}
+		active = decodePluginInstallationProjection(t, event.GetResource().GetJson())
+	}
+	if active.Metadata.Generation != before.Metadata.Generation+1 || active.Metadata.ResourceVersion <= installation.GetResourceVersion() || active.Status.ObservedGeneration != active.Metadata.Generation {
+		t.Fatalf("active projection=%+v", active)
 	}
 	flowDocument := []byte(`apiVersion: orchigram.dev/v1alpha1
 kind: Flow
@@ -516,6 +614,78 @@ spec:
 			t.Fatalf("missing durable %s event; saw %+v", eventType, seenPluginEvents)
 		}
 	}
+}
+
+func TestMissingPluginInstallationIsPersistedWithControllerStatus(t *testing.T) {
+	t.Parallel()
+	root, err := os.MkdirTemp("/tmp", "orchigram-missing-plugin-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	cfg := config.Development(filepath.Join(root, "state"))
+	stop := serveTestDaemon(t, cfg)
+	defer stop()
+	client := dialReadyClient(t, cfg.SocketPath)
+	defer func() { _ = client.Close() }()
+	response, err := client.Resources.Apply(context.Background(), &controlv1alpha1.ApplyRequest{Document: []byte(`apiVersion: orchigram.dev/v1alpha1
+kind: PluginInstallation
+metadata: {name: missing-plugin}
+spec:
+  plugin: missing
+  version: 1.0.0
+  digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  enabled: false
+`)})
+	if err != nil || len(response.GetDiagnostics()) != 1 || response.GetDiagnostics()[0].GetCode() != "bundle_missing" || response.GetDiagnostics()[0].GetSeverity() != controlv1alpha1.Diagnostic_SEVERITY_WARNING {
+		t.Fatalf("apply response=%+v err=%v", response, err)
+	}
+	var current *controlv1alpha1.ResourceDocument
+	var projection pluginInstallationProjection
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		current, err = client.Resources.Get(context.Background(), &controlv1alpha1.GetRequest{Key: response.GetResource().GetKey()})
+		if err == nil {
+			projection = decodePluginInstallationProjection(t, current.GetJson())
+			if projection.Status.Phase == "Error" && projection.Status.ObservedGeneration == projection.Metadata.Generation {
+				break
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if projection.Status.Phase != "Error" || projection.Status.ObservedGeneration != projection.Metadata.Generation {
+		t.Fatalf("projection did not reconcile: %+v err=%v", projection, err)
+	}
+	healthResponse, err := client.System.Health(context.Background(), &emptypb.Empty{})
+	if err != nil || healthResponse.GetReady() {
+		t.Fatalf("health=%+v err=%v", healthResponse, err)
+	}
+	if _, err := client.Resources.Delete(context.Background(), &controlv1alpha1.DeleteRequest{Key: response.GetResource().GetKey(), ExpectedResourceVersion: current.GetResourceVersion()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Resources.Get(context.Background(), &controlv1alpha1.GetRequest{Key: response.GetResource().GetKey()}); status.Code(err) != codes.NotFound {
+		t.Fatalf("deleted missing PluginInstallation error=%v", err)
+	}
+}
+
+type pluginInstallationProjection struct {
+	APIVersion string                          `json:"apiVersion"`
+	Kind       string                          `json:"kind"`
+	Metadata   resource.ObjectMeta             `json:"metadata"`
+	Spec       resource.PluginInstallationSpec `json:"spec"`
+	Status     struct {
+		ObservedGeneration uint64 `json:"observedGeneration"`
+		Phase              string `json:"phase"`
+	} `json:"status"`
+}
+
+func decodePluginInstallationProjection(t *testing.T, data []byte) pluginInstallationProjection {
+	t.Helper()
+	var projection pluginInstallationProjection
+	if err := json.Unmarshal(data, &projection); err != nil {
+		t.Fatal(err)
+	}
+	return projection
 }
 
 func TestFlakyPluginRetriesKeepDistinctEvidenceAcrossRestart(t *testing.T) {
@@ -1545,6 +1715,9 @@ spec:
 	}
 	waitForSystemHealth(t, client, false, "controllers/schedules", "reconcile_failed")
 	if err := instance.store.AdvanceTriggerCursor(context.Background(), trigger.Metadata.UID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.triggers.ReconcileSchedulesNow(context.Background(), time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	waitForSystemHealth(t, client, true, "", "")

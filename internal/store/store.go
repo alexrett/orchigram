@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -69,6 +70,17 @@ type ConflictError struct {
 
 func (e *ConflictError) Error() string {
 	return fmt.Sprintf("resource version conflict: expected %d, current %d", e.Expected, e.Current)
+}
+
+// StaleObservedGenerationError prevents a controller status update computed
+// from an older desired resource generation from overwriting current status.
+type StaleObservedGenerationError struct {
+	Expected uint64
+	Current  uint64
+}
+
+func (e *StaleObservedGenerationError) Error() string {
+	return fmt.Sprintf("stale observed generation: expected %d, current %d", e.Expected, e.Current)
 }
 
 // Store is the authoritative SQLite state and event store.
@@ -198,16 +210,21 @@ type ApplyOptions struct {
 
 // Apply atomically stores a resource, event, and audit record.
 func (s *Store) Apply(ctx context.Context, doc resource.Document, options ApplyOptions) (resource.Document, error) {
+	var err error
+	doc, err = doc.WithServerStatus(nil)
+	if err != nil {
+		return resource.Document{}, fmt.Errorf("strip client-owned resource status: %w", err)
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return resource.Document{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var currentJSON []byte
+	var currentJSON, currentStatus []byte
 	var currentVersion, currentGeneration uint64
 	var currentUID string
-	err = tx.QueryRowContext(ctx, `SELECT spec_json, resource_version, generation, uid FROM resources WHERE kind=? AND namespace=? AND name=?`, doc.Kind, doc.Metadata.Namespace, doc.Metadata.Name).Scan(&currentJSON, &currentVersion, &currentGeneration, &currentUID)
+	err = tx.QueryRowContext(ctx, `SELECT spec_json,status_json,resource_version,generation,uid FROM resources WHERE kind=? AND namespace=? AND name=?`, doc.Kind, doc.Metadata.Namespace, doc.Metadata.Name).Scan(&currentJSON, &currentStatus, &currentVersion, &currentGeneration, &currentUID)
 	exists := err == nil
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return resource.Document{}, fmt.Errorf("read current resource: %w", err)
@@ -247,6 +264,18 @@ func (s *Store) Apply(ctx context.Context, doc resource.Document, options ApplyO
 	if err != nil {
 		return resource.Document{}, err
 	}
+	if exists {
+		var preservedStatus map[string]any
+		if len(currentStatus) > 0 && !bytes.Equal(currentStatus, []byte("{}")) {
+			if err := json.Unmarshal(currentStatus, &preservedStatus); err != nil {
+				return resource.Document{}, fmt.Errorf("decode stored resource status: %w", err)
+			}
+		}
+		doc, err = doc.WithServerStatus(preservedStatus)
+		if err != nil {
+			return resource.Document{}, err
+		}
+	}
 	labels, _ := json.Marshal(meta.Labels)
 	oldHash := digest(currentJSON)
 	newHash := digest(doc.JSON)
@@ -279,6 +308,80 @@ func (s *Store) Apply(ctx context.Context, doc resource.Document, options ApplyO
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO audit_records(revision,request_id,actor,context_name,operation,resource_uid,old_hash,new_hash,occurred_at) VALUES(?,?,?,?,?,?,?,?,?)`, revision, valueOr(options.RequestID, uuid.NewString()), valueOr(options.Actor, "unix-peer"), options.Context, strings.ToLower(eventType), meta.UID, oldHash, newHash, now); err != nil {
 		return resource.Document{}, fmt.Errorf("append audit record: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return resource.Document{}, err
+	}
+	return doc, nil
+}
+
+// UpdateResourceStatus atomically records one server-owned status projection.
+// It advances resourceVersion and the watch log without changing generation.
+// The expected generation closes the race between reconciliation and a newer
+// desired-state Apply.
+func (s *Store) UpdateResourceStatus(ctx context.Context, kind, namespace, name string, expectedGeneration uint64, status map[string]any) (resource.Document, error) {
+	if namespace == "" {
+		namespace = resource.DefaultNamespace
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return resource.Document{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var currentJSON, currentStatus []byte
+	var currentVersion, generation uint64
+	var uid string
+	if err := tx.QueryRowContext(ctx, `SELECT spec_json,status_json,resource_version,generation,uid FROM resources WHERE kind=? AND namespace=? AND name=?`, kind, namespace, name).Scan(&currentJSON, &currentStatus, &currentVersion, &generation, &uid); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return resource.Document{}, ErrNotFound
+		}
+		return resource.Document{}, err
+	}
+	if expectedGeneration != 0 && generation != expectedGeneration {
+		return resource.Document{}, &StaleObservedGenerationError{Expected: expectedGeneration, Current: generation}
+	}
+	encodedStatus, err := json.Marshal(status)
+	if err != nil {
+		return resource.Document{}, fmt.Errorf("encode resource status: %w", err)
+	}
+	if len(status) == 0 {
+		encodedStatus = []byte("{}")
+	}
+	if jsonEqual(currentStatus, encodedStatus) {
+		doc, decodeErr := resource.DecodeStrict(currentJSON)
+		if decodeErr != nil {
+			return resource.Document{}, fmt.Errorf("decode stored resource: %w", decodeErr)
+		}
+		return doc, nil
+	}
+	revision, err := nextRevision(ctx, tx)
+	if err != nil {
+		return resource.Document{}, err
+	}
+	doc, err := resource.DecodeStrict(currentJSON)
+	if err != nil {
+		return resource.Document{}, fmt.Errorf("decode stored resource: %w", err)
+	}
+	meta := doc.Metadata
+	meta.ResourceVersion = revision
+	doc, err = doc.WithServerMetadata(meta)
+	if err != nil {
+		return resource.Document{}, err
+	}
+	doc, err = doc.WithServerStatus(status)
+	if err != nil {
+		return resource.Document{}, err
+	}
+	now := s.timestamp()
+	if _, err := tx.ExecContext(ctx, `UPDATE resources SET resource_version=?,spec_json=?,status_json=?,updated_at=? WHERE kind=? AND namespace=? AND name=?`, revision, doc.JSON, encodedStatus, now, kind, namespace, name); err != nil {
+		return resource.Document{}, fmt.Errorf("write resource status: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO resource_events(revision,event_type,kind,namespace,name,uid,resource_json,observed_at) VALUES(?,?,?,?,?,?,?,?)`, revision, "MODIFIED", kind, namespace, name, uid, doc.JSON, now); err != nil {
+		return resource.Document{}, fmt.Errorf("append resource status event: %w", err)
+	}
+	requestID := "status:" + uid + ":" + strconv.FormatUint(generation, 10) + ":" + digest(encodedStatus)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO audit_records(revision,request_id,actor,context_name,operation,resource_uid,old_hash,new_hash,occurred_at) VALUES(?,?,?,?,?,?,?,?,?)`, revision, requestID, "controller", "", "status", uid, digest(currentJSON), digest(doc.JSON), now); err != nil {
+		return resource.Document{}, fmt.Errorf("append resource status audit record: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return resource.Document{}, err

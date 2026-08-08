@@ -84,9 +84,9 @@ spec:
 	runResult := make(chan error, 1)
 	go func() { runResult <- runWithApplication(tuiContext, client, application) }()
 	time.Sleep(100 * time.Millisecond)
-	// Contexts/current, Flows/flow, Triggers, Repositories,
-	// AgentProfiles, and the Runs heading precede the run item.
-	for range 8 {
+	// Contexts/current, Flows/flow, Triggers, Repositories, AgentProfiles,
+	// PluginInstallations, and the Runs heading precede the run item.
+	for range 9 {
 		postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyDown, 0, tcell.ModNone))
 	}
 	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))

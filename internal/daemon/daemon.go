@@ -17,6 +17,7 @@ import (
 	"github.com/alexrett/orchigram/internal/flow"
 	"github.com/alexrett/orchigram/internal/httpingress"
 	"github.com/alexrett/orchigram/internal/orchestrator"
+	"github.com/alexrett/orchigram/internal/plugincontroller"
 	"github.com/alexrett/orchigram/internal/pluginmanager"
 	"github.com/alexrett/orchigram/internal/server"
 	"github.com/alexrett/orchigram/internal/store"
@@ -31,6 +32,7 @@ type Daemon struct {
 	engine       *engine.Adapter
 	orchestrator *orchestrator.Orchestrator
 	plugins      *pluginmanager.Manager
+	pluginState  *plugincontroller.Controller
 	triggers     *triggercontroller.Controller
 	httpIngress  *httpingress.Server
 	grpc         *grpc.Server
@@ -57,12 +59,23 @@ func Open(ctx context.Context, cfg config.Config, executor engine.TaskExecutor) 
 		return nil, err
 	}
 	plugins := pluginmanager.New(state, cfg.StateDir)
+	pluginsOwnedByDaemon := false
+	defer func() {
+		if !pluginsOwnedByDaemon {
+			plugins.Close()
+		}
+	}()
 	if err := plugins.ReconcileArtifacts(ctx); err != nil {
 		_ = state.Close()
 		return nil, fmt.Errorf("reconcile plugin artifacts: %w", err)
 	}
 	if executor == nil {
 		executor = plugins
+	}
+	pluginState := plugincontroller.New(state, plugins)
+	if err := pluginState.Reconcile(ctx); err != nil {
+		_ = state.Close()
+		return nil, fmt.Errorf("reconcile plugin installations: %w", err)
 	}
 	durable, err := engine.Open(ctx, filepath.Join(cfg.StateDir, "workflows.sqlite"), state, executor)
 	if err != nil {
@@ -89,21 +102,22 @@ func Open(ctx context.Context, cfg config.Config, executor engine.TaskExecutor) 
 		grpc.MaxRecvMsgSize(2<<20),
 		grpc.MaxSendMsgSize(8<<20),
 	)
-	server.NewAPI(state, compiler, control, durable, plugins, triggers, cfg.StateDir).Register(grpcServer)
+	server.NewAPI(state, compiler, control, durable, plugins, triggers, cfg.StateDir, pluginState).Register(grpcServer)
 	ingress, err := httpingress.Listen(ctx, cfg.HTTP.Listen, state, plugins, control)
 	if err != nil {
 		_ = listener.Close()
 		_ = durable.Close()
-		plugins.Close()
 		_ = state.Close()
 		return nil, err
 	}
-	return &Daemon{config: cfg, store: state, engine: durable, orchestrator: control, plugins: plugins, triggers: triggers, httpIngress: ingress, grpc: grpcServer, listener: listener}, nil
+	pluginsOwnedByDaemon = true
+	return &Daemon{config: cfg, store: state, engine: durable, orchestrator: control, plugins: plugins, pluginState: pluginState, triggers: triggers, httpIngress: ingress, grpc: grpcServer, listener: listener}, nil
 }
 
 // Serve starts reconciliation and serves until context cancellation or failure.
 func (d *Daemon) Serve(ctx context.Context) error {
 	d.orchestrator.Start(ctx)
+	d.pluginState.Start(ctx)
 	d.triggers.Start(ctx)
 	serveError := make(chan error, 1)
 	go func() { serveError <- d.grpc.Serve(d.listener) }()

@@ -22,6 +22,7 @@ import (
 	"github.com/alexrett/orchigram/internal/health"
 	"github.com/alexrett/orchigram/internal/orchestrator"
 	"github.com/alexrett/orchigram/internal/pluginbundle"
+	"github.com/alexrett/orchigram/internal/plugincontroller"
 	"github.com/alexrett/orchigram/internal/pluginmanager"
 	"github.com/alexrett/orchigram/internal/references"
 	"github.com/alexrett/orchigram/internal/resource"
@@ -44,6 +45,7 @@ type API struct {
 	orchestrator *orchestrator.Orchestrator
 	engine       engine.DurableEngine
 	plugins      *pluginmanager.Manager
+	pluginState  *plugincontroller.Controller
 	references   *references.Resolver
 	triggers     *triggercontroller.Controller
 	stateDir     string
@@ -51,8 +53,12 @@ type API struct {
 }
 
 // NewAPI constructs the public service implementation.
-func NewAPI(state *store.Store, compiler *flow.Compiler, control *orchestrator.Orchestrator, durable engine.DurableEngine, plugins *pluginmanager.Manager, triggers *triggercontroller.Controller, stateDir string) *API {
-	return &API{store: state, compiler: compiler, orchestrator: control, engine: durable, plugins: plugins, references: references.New(state, plugins), triggers: triggers, stateDir: stateDir, startedAt: time.Now()}
+func NewAPI(state *store.Store, compiler *flow.Compiler, control *orchestrator.Orchestrator, durable engine.DurableEngine, plugins *pluginmanager.Manager, triggers *triggercontroller.Controller, stateDir string, pluginControllers ...*plugincontroller.Controller) *API {
+	var pluginState *plugincontroller.Controller
+	if len(pluginControllers) > 0 {
+		pluginState = pluginControllers[0]
+	}
+	return &API{store: state, compiler: compiler, orchestrator: control, engine: durable, plugins: plugins, pluginState: pluginState, references: references.New(state, plugins), triggers: triggers, stateDir: stateDir, startedAt: time.Now()}
 }
 
 // Register binds every public service to one gRPC server.
@@ -111,7 +117,7 @@ func (a *API) apply(ctx context.Context, request *controlv1alpha1.ApplyRequest, 
 	if err != nil {
 		return nil, rpcError(err)
 	}
-	return &controlv1alpha1.ApplyResponse{Resource: resourcePB(applied), Diagnostics: diagnostics}, nil
+	return &controlv1alpha1.ApplyResponse{Resource: a.projectResource(ctx, applied), Diagnostics: diagnostics}, nil
 }
 
 // Get returns one resource.
@@ -172,12 +178,28 @@ func (a *API) resourceDiagnostics(ctx context.Context, document resource.Documen
 	if references.Supports(document.Kind) {
 		diagnostics = append(diagnostics, a.references.Diagnostics(ctx, document)...)
 	}
+	if document.Kind == "PluginInstallation" && a.pluginState != nil {
+		diagnostics = append(diagnostics, a.pluginState.Diagnostics(ctx, document)...)
+	}
 	return diagnostics, nil
 }
 
 // Delete CAS-deletes a resource.
 func (a *API) Delete(ctx context.Context, request *controlv1alpha1.DeleteRequest) (*emptypb.Empty, error) {
 	key := request.GetKey()
+	if key.GetKind() == "PluginInstallation" {
+		document, err := a.store.Get(ctx, key.GetKind(), key.GetNamespace(), key.GetName())
+		if err != nil {
+			return nil, rpcError(err)
+		}
+		installation, err := resource.DecodePluginInstallation(document.JSON)
+		if err != nil {
+			return nil, rpcError(err)
+		}
+		if installation.Spec.Enabled != nil && *installation.Spec.Enabled {
+			return nil, status.Error(codes.FailedPrecondition, "an enabled PluginInstallation must be disabled before deletion")
+		}
+	}
 	if err := a.store.Delete(ctx, key.GetKind(), key.GetNamespace(), key.GetName(), request.GetExpectedResourceVersion(), request.GetMeta().GetRequestId()); err != nil {
 		return nil, rpcError(err)
 	}
@@ -515,7 +537,12 @@ func (a *API) Reconcile(ctx context.Context, request *controlv1alpha1.ReconcileR
 // Info reports protocol negotiation and process identity.
 func (a *API) Info(context.Context, *emptypb.Empty) (*controlv1alpha1.SystemInfo, error) {
 	hostname, _ := os.Hostname()
-	return &controlv1alpha1.SystemInfo{Version: version.Version, ProtocolVersion: "v1alpha1", Hostname: hostname, Os: runtime.GOOS, Architecture: runtime.GOARCH, ProcessId: int64(os.Getpid()), StartedAt: timestamppb.New(a.startedAt), Capabilities: []string{"resources.v1alpha1", "flows.compile", "runs.approval", "plugins.grpc.v1", "plugins.automtls", "transport.uds"}}, nil
+	capabilities := []string{"resources.v1alpha1", "flows.compile", "runs.approval", "plugins.grpc.v1", "plugins.automtls", "transport.uds"}
+	if a.pluginState != nil {
+		capabilities = append(capabilities, "plugins.declarative.v1")
+	}
+	sort.Strings(capabilities)
+	return &controlv1alpha1.SystemInfo{Version: version.Version, ProtocolVersion: "v1alpha1", Hostname: hostname, Os: runtime.GOOS, Architecture: runtime.GOARCH, ProcessId: int64(os.Getpid()), StartedAt: timestamppb.New(a.startedAt), Capabilities: capabilities}, nil
 }
 
 // Health aggregates required control-plane components without leaking
@@ -530,6 +557,9 @@ func (a *API) Health(ctx context.Context, _ *emptypb.Empty) (*controlv1alpha1.He
 	}
 	if a.plugins != nil {
 		diagnostics = append(diagnostics, a.plugins.HealthDiagnostics(ctx)...)
+	}
+	if a.pluginState != nil {
+		diagnostics = append(diagnostics, a.pluginState.HealthDiagnostics()...)
 	}
 	sort.Slice(diagnostics, func(i, j int) bool {
 		if diagnostics[i].Path != diagnostics[j].Path {
@@ -587,12 +617,23 @@ func (a *API) InstallPlugin(stream grpc.ClientStreamingServer[controlv1alpha1.Pl
 	if err != nil {
 		return rpcError(err)
 	}
+	if a.pluginState != nil {
+		if _, err := a.pluginState.EnsureProjection(stream.Context(), record); err != nil {
+			return rpcError(err)
+		}
+		if err := a.pluginState.Reconcile(stream.Context()); err != nil {
+			return rpcError(err)
+		}
+	}
 	return stream.SendAndClose(&controlv1alpha1.PluginInstallResponse{Name: record.Name, Version: record.Version, Digest: record.Digest})
 }
 
 // EnablePlugin activates a verified immutable plugin version.
 func (a *API) EnablePlugin(ctx context.Context, request *controlv1alpha1.PluginRequest) (*emptypb.Empty, error) {
-	if err := a.plugins.Enable(ctx, request.GetName(), request.GetVersion()); err != nil {
+	if a.pluginState == nil {
+		return nil, status.Error(codes.Unavailable, "plugin installation controller is unavailable")
+	}
+	if err := a.pluginState.SetEnabled(ctx, request.GetName(), request.GetVersion(), true); err != nil {
 		return nil, rpcError(err)
 	}
 	return &emptypb.Empty{}, nil
@@ -600,7 +641,10 @@ func (a *API) EnablePlugin(ctx context.Context, request *controlv1alpha1.PluginR
 
 // DisablePlugin removes the current activation without deleting a version.
 func (a *API) DisablePlugin(ctx context.Context, request *controlv1alpha1.PluginRequest) (*emptypb.Empty, error) {
-	if err := a.plugins.Disable(ctx, request.GetName()); err != nil {
+	if a.pluginState == nil {
+		return nil, status.Error(codes.Unavailable, "plugin installation controller is unavailable")
+	}
+	if err := a.pluginState.SetEnabled(ctx, request.GetName(), "", false); err != nil {
 		return nil, rpcError(err)
 	}
 	return &emptypb.Empty{}, nil
@@ -736,10 +780,11 @@ func rpcError(err error) error {
 	var staleFlow *store.StaleFlowPlanError
 	var staleTrigger *store.StaleTriggerGenerationError
 	var changedReference *store.TriggerReferenceChangedError
+	var staleObserved *store.StaleObservedGenerationError
 	switch {
 	case errors.As(err, &conflict):
 		return status.Error(codes.Aborted, conflict.Error())
-	case errors.As(err, &staleFlow), errors.As(err, &staleTrigger), errors.As(err, &changedReference):
+	case errors.As(err, &staleFlow), errors.As(err, &staleTrigger), errors.As(err, &changedReference), errors.As(err, &staleObserved):
 		return status.Error(codes.Aborted, err.Error())
 	case errors.Is(err, store.ErrTriggerDisabled):
 		return status.Error(codes.FailedPrecondition, err.Error())

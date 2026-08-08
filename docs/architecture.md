@@ -24,6 +24,14 @@ uses `RunService`: event replay includes validated plugin stream events,
 `ListAttempts` exposes retry identity and outcome, while `ListArtifacts` and
 bounded `GetArtifact` expose registered evidence without leaking daemon paths.
 
+Plugin bundles and activation deliberately have separate roles. The immutable
+bundle store proves which executable and contract were verified;
+`PluginInstallation` is the only desired activation state. A controller adopts
+legacy records, serializes activation/rollback, preserves the current version
+during an enabled-version conflict, and emits durable status-only resource
+revisions. CLI plugin mutations call that controller instead of bypassing it.
+See [Declarative plugin installations](plugin-installations.md).
+
 `sdk/plugin` is the public author boundary. It owns the shared go-plugin
 handshake, protocol-v1 negotiation, task adapters, cancellation registry,
 health/draining state, sequence/timestamp assignment, and exactly-one-terminal

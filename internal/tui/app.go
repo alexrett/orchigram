@@ -161,12 +161,12 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 			openTriggerDetail(ctx, application, pages, client, item, inspector, events, navigation)
 		})
 	}
-	for _, kind := range []string{"Repository", "AgentProfile"} {
+	for _, kind := range []string{"Repository", "AgentProfile", "PluginInstallation"} {
 		response, listErr := client.Resources.List(ctx, &controlv1alpha1.ListRequest{Kind: kind, Namespace: "default", Limit: 200})
 		if listErr != nil {
 			return listErr
 		}
-		heading := map[string]string{"Repository": "Repositories", "AgentProfile": "AgentProfiles"}[kind]
+		heading := map[string]string{"Repository": "Repositories", "AgentProfile": "AgentProfiles", "PluginInstallation": "PluginInstallations"}[kind]
 		add(heading, nil)
 		for _, item := range response.GetResources() {
 			item := item

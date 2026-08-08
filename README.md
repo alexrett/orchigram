@@ -29,7 +29,7 @@ make check
 make cross-build
 ```
 
-See [Operator guide](docs/operator-guide.md), [Architecture](docs/architecture.md), [Durability](docs/durability.md), [Flow data contracts](docs/flow-contracts.md), [Resource references](docs/resource-references.md), [Triggers](docs/triggers.md), [Slack tracer](examples/slack/README.md), [GitHub SDLC tracer](docs/github-sdlc.md), [self-SDLC example](examples/self-sdlc/README.md), [echo plugin](examples/plugins/echo/main.go), [Security](docs/security.md), [Plugin authoring](docs/plugin-authoring.md), and [Release process](docs/release.md).
+See [Operator guide](docs/operator-guide.md), [Architecture](docs/architecture.md), [Durability](docs/durability.md), [Flow data contracts](docs/flow-contracts.md), [Resource references](docs/resource-references.md), [Plugin installations](docs/plugin-installations.md), [Triggers](docs/triggers.md), [Slack tracer](examples/slack/README.md), [GitHub SDLC tracer](docs/github-sdlc.md), [self-SDLC example](examples/self-sdlc/README.md), [echo plugin](examples/plugins/echo/main.go), [Security](docs/security.md), [Plugin authoring](docs/plugin-authoring.md), and [Release process](docs/release.md).
 
 ## License
 
