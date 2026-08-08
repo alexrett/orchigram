@@ -2,10 +2,12 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,6 +23,33 @@ func openTestStore(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	return s
+}
+
+func TestOpenRejectsAStateDatabaseFromANewerSchema(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "future.sqlite")
+	state, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(context.Background(), `INSERT INTO schema_migrations(version,applied_at) VALUES(999,'2030-01-01T00:00:00Z')`); err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, err = Open(path)
+	if err == nil || !strings.Contains(err.Error(), "database schema version 999 is newer than supported version 5") {
+		t.Fatalf("future schema error=%v", err)
+	}
 }
 
 func TestTerminalRunTransitionsAreImmutable(t *testing.T) {

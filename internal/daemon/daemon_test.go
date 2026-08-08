@@ -1487,6 +1487,46 @@ func TestDefaultConfigurationOpensNoNetworkListener(t *testing.T) {
 	}
 }
 
+func TestPublicHealthReflectsControllerFailureAndRecovery(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "orchigram-health-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	cfg := config.Development(filepath.Join(root, "state"))
+	instance, stop := serveTestDaemonInstance(t, cfg)
+	defer stop()
+	client := dialReadyClient(t, cfg.SocketPath)
+	defer func() { _ = client.Close() }()
+	document, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata: {name: health-overflow}
+spec:
+  flow: unused
+  schedule: {cron: "* * * * *", timezone: UTC, startingDeadline: 1h}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied, err := instance.store.Apply(context.Background(), document, store.ApplyOptions{RequestID: "health-overflow"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	trigger, err := resource.DecodeTrigger(applied.JSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := instance.store.AdvanceTriggerCursor(context.Background(), trigger.Metadata.UID, now.Add(-20*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	waitForSystemHealth(t, client, false, "controllers/schedules", "reconcile_failed")
+	if err := instance.store.AdvanceTriggerCursor(context.Background(), trigger.Metadata.UID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	waitForSystemHealth(t, client, true, "", "")
+}
+
 func serveTestDaemon(t *testing.T, cfg config.Config) func() {
 	t.Helper()
 	_, stop := serveTestDaemonInstance(t, cfg)
@@ -1525,17 +1565,40 @@ func dialReadyClient(t *testing.T, socketPath string) *clientpkg.Client {
 		t.Fatal(err)
 	}
 	for {
-		_, healthErr := client.System.Health(ctx, &emptypb.Empty{})
-		if healthErr == nil {
+		health, healthErr := client.System.Health(ctx, &emptypb.Empty{})
+		if healthErr == nil && health.GetReady() {
 			return client
 		}
 		if ctx.Err() != nil {
 			_ = client.Close()
 			t.Fatalf("daemon was not ready: %v", healthErr)
 		}
-		if status.Code(healthErr) != codes.Unavailable {
+		if healthErr != nil && status.Code(healthErr) != codes.Unavailable {
 			_ = client.Close()
 			t.Fatal(healthErr)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func waitForSystemHealth(t *testing.T, client *clientpkg.Client, ready bool, path, code string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for {
+		health, err := client.System.Health(ctx, &emptypb.Empty{})
+		if err == nil && health.GetReady() == ready {
+			if ready {
+				return
+			}
+			for _, diagnostic := range health.GetDiagnostics() {
+				if diagnostic.GetPath() == path && diagnostic.GetCode() == code {
+					return
+				}
+			}
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("health did not converge to ready=%t path=%q code=%q: response=%+v err=%v", ready, path, code, health, err)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

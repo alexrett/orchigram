@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/alexrett/orchigram/internal/backup"
 	"github.com/alexrett/orchigram/internal/engine"
 	"github.com/alexrett/orchigram/internal/flow"
+	"github.com/alexrett/orchigram/internal/health"
 	"github.com/alexrett/orchigram/internal/orchestrator"
 	"github.com/alexrett/orchigram/internal/pluginbundle"
 	"github.com/alexrett/orchigram/internal/pluginmanager"
@@ -494,9 +496,30 @@ func (a *API) Info(context.Context, *emptypb.Empty) (*controlv1alpha1.SystemInfo
 	return &controlv1alpha1.SystemInfo{Version: version.Version, ProtocolVersion: "v1alpha1", Hostname: hostname, Os: runtime.GOOS, Architecture: runtime.GOARCH, ProcessId: int64(os.Getpid()), StartedAt: timestamppb.New(a.startedAt), Capabilities: []string{"resources.v1alpha1", "flows.compile", "runs.approval", "plugins.grpc.v1", "plugins.automtls", "transport.uds"}}, nil
 }
 
-// Health reports readiness without leaking configuration or secret material.
-func (a *API) Health(context.Context, *emptypb.Empty) (*controlv1alpha1.HealthResponse, error) {
-	return &controlv1alpha1.HealthResponse{Ready: true}, nil
+// Health aggregates required control-plane components without leaking
+// dependency errors, configuration, secret material, or daemon paths.
+func (a *API) Health(ctx context.Context, _ *emptypb.Empty) (*controlv1alpha1.HealthResponse, error) {
+	diagnostics := make([]health.Diagnostic, 0)
+	if a.orchestrator != nil {
+		diagnostics = append(diagnostics, a.orchestrator.HealthDiagnostics()...)
+	}
+	if a.triggers != nil {
+		diagnostics = append(diagnostics, a.triggers.HealthDiagnostics()...)
+	}
+	if a.plugins != nil {
+		diagnostics = append(diagnostics, a.plugins.HealthDiagnostics(ctx)...)
+	}
+	sort.Slice(diagnostics, func(i, j int) bool {
+		if diagnostics[i].Path != diagnostics[j].Path {
+			return diagnostics[i].Path < diagnostics[j].Path
+		}
+		return diagnostics[i].Code < diagnostics[j].Code
+	})
+	response := &controlv1alpha1.HealthResponse{Ready: len(diagnostics) == 0, Diagnostics: make([]*controlv1alpha1.Diagnostic, 0, len(diagnostics))}
+	for _, diagnostic := range diagnostics {
+		response.Diagnostics = append(response.Diagnostics, &controlv1alpha1.Diagnostic{Severity: controlv1alpha1.Diagnostic_SEVERITY_ERROR, Path: diagnostic.Path, Code: diagnostic.Code, Message: diagnostic.Message})
+	}
+	return response, nil
 }
 
 // Backup creates an online state snapshot under the daemon state directory.

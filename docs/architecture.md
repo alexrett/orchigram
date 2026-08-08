@@ -34,6 +34,15 @@ components, including skipped branches. On the first failed component, the
 scheduler stops admission and propagates a durable run-scoped cancellation to
 active plugin or agent calls before committing the final Run failure.
 
+`SystemService.Health` is an aggregate control-plane projection rather than a
+socket liveness check. Runtime reconciliation owners retain secret-safe failure
+state until they observe recovery, while every active plugin receives a bounded
+health RPC. The first probe after process loss reports the exited immutable
+version; a later successful restart and health pass clears it. Configuration,
+schema migration, artifact reconciliation, and listener failures remain
+fail-closed startup errors because no authoritative daemon can safely serve
+without them.
+
 ## Repository layout
 
 - `api/`: versioned protobuf sources.

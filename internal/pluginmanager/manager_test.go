@@ -321,6 +321,41 @@ spec: {backend: env, key: ORCHIGRAM_TEST_GITHUB_PROVIDER_TOKEN}
 	}
 }
 
+func TestActivePluginHealthReportsProcessLossThenRestarts(t *testing.T) {
+	state, err := store.Open(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	manager := New(state, t.TempDir())
+	defer manager.Close()
+	record, err := manager.Install(context.Background(), conformanceBundle(t, "exec", 1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Enable(context.Background(), record.Name, record.Version); err != nil {
+		t.Fatal(err)
+	}
+	if diagnostics := manager.HealthDiagnostics(context.Background()); len(diagnostics) != 0 {
+		t.Fatalf("healthy plugin diagnostics=%+v", diagnostics)
+	}
+	key := installationKey(record.Name, record.Version)
+	manager.mu.Lock()
+	process := manager.processes[key]
+	manager.mu.Unlock()
+	if process == nil {
+		t.Fatal("enabled plugin process is missing")
+	}
+	process.Close()
+	diagnostics := manager.HealthDiagnostics(context.Background())
+	if len(diagnostics) != 1 || diagnostics[0].Path != "plugins/exec@"+record.Version || diagnostics[0].Code != "process_exited" {
+		t.Fatalf("process-loss diagnostics=%+v", diagnostics)
+	}
+	if diagnostics := manager.HealthDiagnostics(context.Background()); len(diagnostics) != 0 {
+		t.Fatalf("plugin health did not recover after restart: %+v", diagnostics)
+	}
+}
+
 func TestCompiledNodePinsInactivePluginAndDeletedResourceProjections(t *testing.T) {
 	ctx := context.Background()
 	stateRoot := t.TempDir()

@@ -2,7 +2,10 @@ package trigger
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -116,10 +119,97 @@ spec:
 	}
 }
 
+func TestControllerHealthReportsAndRecoversScheduleFailure(t *testing.T) {
+	t.Parallel()
+	state := openTriggerStore(t)
+	trigger := applyTrigger(t, state, `apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata: {name: catchup-overflow}
+spec:
+  flow: target
+  schedule: {cron: "* * * * *", timezone: UTC, startingDeadline: 1h}
+`)
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	if err := state.AdvanceTriggerCursor(context.Background(), trigger.Metadata.UID, now.Add(-20*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	controller := NewController(state, nil)
+	controller.observeSchedule(controller.ReconcileSchedules(context.Background(), now))
+	if code := controllerDiagnosticCode(controller, "controllers/schedules"); code != "reconcile_failed" {
+		t.Fatalf("schedule diagnostic=%q diagnostics=%+v", code, controller.HealthDiagnostics())
+	}
+	if err := state.AdvanceTriggerCursor(context.Background(), trigger.Metadata.UID, now); err != nil {
+		t.Fatal(err)
+	}
+	controller.observeSchedule(controller.ReconcileSchedules(context.Background(), now))
+	if code := controllerDiagnosticCode(controller, "controllers/schedules"); code != "" {
+		t.Fatalf("schedule health did not recover: %+v", controller.HealthDiagnostics())
+	}
+}
+
 type fakeProvider struct {
 	accepted  chan string
 	activated chan time.Time
 	cancel    context.CancelFunc
+}
+
+type recoveringProvider struct {
+	mu         sync.Mutex
+	calls      int
+	secondCall chan struct{}
+}
+
+func (p *recoveringProvider) WatchTrigger(ctx context.Context, _, _ string, _ map[string]any, _ string, _ time.Time, _ func(*pluginv1alpha1.TriggerEvent) error) error {
+	p.mu.Lock()
+	p.calls++
+	call := p.calls
+	p.mu.Unlock()
+	if call == 1 {
+		return errors.New("provider-credential-must-not-escape")
+	}
+	if call == 2 {
+		close(p.secondCall)
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestProviderHealthReportsFailureWithoutLeakingAndRecoversOnReconnect(t *testing.T) {
+	t.Parallel()
+	state := openTriggerStore(t)
+	trigger := applyTrigger(t, state, `apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata: {name: recovering-provider}
+spec:
+  flow: target
+  provider: {plugin: fake, config: {repository: example}}
+`)
+	provider := &recoveringProvider{secondCall: make(chan struct{})}
+	controller := NewController(state, provider)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go controller.watchProvider(ctx, trigger)
+	providerPath := "controllers/providers/" + trigger.Metadata.UID
+	deadline := time.Now().Add(3 * time.Second)
+	for controllerDiagnosticCode(controller, providerPath) != "watch_failed" {
+		if time.Now().After(deadline) {
+			t.Fatalf("provider failure was not reported: %+v", controller.HealthDiagnostics())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for _, diagnostic := range controller.HealthDiagnostics() {
+		if strings.Contains(diagnostic.Message, "provider-credential-must-not-escape") {
+			t.Fatalf("provider health leaked dependency error: %+v", diagnostic)
+		}
+	}
+	select {
+	case <-provider.secondCall:
+	case <-time.After(3 * time.Second):
+		t.Fatal("provider subscription did not retry")
+	}
+	if code := controllerDiagnosticCode(controller, providerPath); code != "" {
+		t.Fatalf("provider health did not recover on reconnect: %+v", controller.HealthDiagnostics())
+	}
 }
 
 func (f *fakeProvider) WatchTrigger(ctx context.Context, _, _ string, _ map[string]any, cursor string, activatedAt time.Time, accept func(*pluginv1alpha1.TriggerEvent) error) error {
@@ -207,4 +297,13 @@ func applyTrigger(t *testing.T, state *store.Store, yaml string) resource.Trigge
 		t.Fatal(err)
 	}
 	return trigger
+}
+
+func controllerDiagnosticCode(controller *Controller, path string) string {
+	for _, diagnostic := range controller.HealthDiagnostics() {
+		if diagnostic.Path == path {
+			return diagnostic.Code
+		}
+	}
+	return ""
 }

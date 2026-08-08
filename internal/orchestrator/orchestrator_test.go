@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -39,6 +40,91 @@ func (f *fakeEngine) Cancel(context.Context, string, string) error              
 func (f *fakeEngine) Reconcile(context.Context) error                                     { return nil }
 func (f *fakeEngine) Describe(context.Context, string) (store.Run, error)                 { return store.Run{}, nil }
 func (f *fakeEngine) Close() error                                                        { return nil }
+
+type healthEngine struct {
+	*fakeEngine
+	healthMu     sync.Mutex
+	reconcileErr error
+}
+
+func (e *healthEngine) Reconcile(context.Context) error {
+	e.healthMu.Lock()
+	defer e.healthMu.Unlock()
+	return e.reconcileErr
+}
+
+func (e *healthEngine) setReconcileError(err error) {
+	e.healthMu.Lock()
+	e.reconcileErr = err
+	e.healthMu.Unlock()
+}
+
+func TestRuntimeHealthRetainsFailuresUntilSuccessfulRecovery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	state, err := store.Open(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	applyFlow(ctx, t, state, `
+    - {id: effect, uses: core.noop}
+`, "", 0)
+	durable := &healthEngine{fakeEngine: &fakeEngine{}}
+	control := New(state, flow.NewCompiler(nil), durable)
+	control.claimStaleAfter = 10 * time.Millisecond
+	control.Start(ctx)
+	waitForHealthDiagnostics(t, control, func(codes map[string]string) bool { return len(codes) == 0 })
+
+	durable.setReconcileError(errors.New("credential-like-value-must-not-escape"))
+	waitForHealthDiagnostics(t, control, func(codes map[string]string) bool { return codes["engine"] == "reconcile_failed" })
+	assertHealthDoesNotContain(t, control, "credential-like-value-must-not-escape")
+	durable.setReconcileError(nil)
+	waitForHealthDiagnostics(t, control, func(codes map[string]string) bool { return codes["engine"] == "" })
+
+	var failOnce sync.Once
+	control.SetFaultHook(func(boundary Boundary) error {
+		var result error
+		if boundary == BoundaryAfterRun {
+			failOnce.Do(func() { result = errors.New("private-outbox-payload-must-not-escape") })
+		}
+		return result
+	})
+	if _, err := control.StartManual(ctx, "demo", "default", json.RawMessage(`{}`), "health-recovery"); err != nil {
+		t.Fatal(err)
+	}
+	waitForHealthDiagnostics(t, control, func(codes map[string]string) bool { return codes["outbox"] == "reconcile_failed" })
+	assertHealthDoesNotContain(t, control, "private-outbox-payload-must-not-escape")
+	control.SetFaultHook(nil)
+	waitForHealthDiagnostics(t, control, func(codes map[string]string) bool { return codes["outbox"] == "" })
+}
+
+func waitForHealthDiagnostics(t *testing.T, control *Orchestrator, predicate func(map[string]string) bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		codes := map[string]string{}
+		for _, diagnostic := range control.HealthDiagnostics() {
+			codes[diagnostic.Path] = diagnostic.Code
+		}
+		if predicate(codes) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("health diagnostics did not converge: %+v", control.HealthDiagnostics())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func assertHealthDoesNotContain(t *testing.T, control *Orchestrator, forbidden string) {
+	t.Helper()
+	for _, diagnostic := range control.HealthDiagnostics() {
+		if strings.Contains(diagnostic.Path+diagnostic.Code+diagnostic.Message, forbidden) {
+			t.Fatalf("health diagnostic leaked dependency text: %+v", diagnostic)
+		}
+	}
+}
 
 func TestCrashBoundariesRecoverOnePinnedRun(t *testing.T) {
 	t.Parallel()
