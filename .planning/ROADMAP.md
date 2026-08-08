@@ -5,8 +5,8 @@ Phases 1–7 are retained as the prototype baseline. The release milestone conti
 | Phase | Goal | Requirements | Status |
 |---|---|---|---|
 | 1–7 | Prototype protocol, plugins, triggers, GitHub tracer, TUI, install, and release-building primitives | Historical baseline | Audited; not release proof |
-| 8 | Make accepted work reproducible, durable, and observable | DUR-01..09 | In progress |
-| 9 | Make schemas, APIs, CLI, and TUI deliver the declared operator contract | CTL-01..04, CLI-01, TUI-01..04 | Pending |
+| 8 | Make accepted work reproducible, durable, and observable | DUR-01..09 | Complete |
+| 9 | Make schemas, APIs, CLI, and TUI deliver the declared operator contract | CTL-01..04, CLI-01, TUI-01..04 | In progress |
 | 10 | Close the public GitHub review and rework loop | GHR-01..06 | Pending |
 | 11 | Bound and recover single-node production operation | OPR-01..06 | Pending |
 | 12 | Prove both tracers and publish verifiable artifacts | REL-01..05 | Pending |

@@ -4,15 +4,15 @@ The existing code is a prototype baseline. A checked requirement below means its
 
 ## Phase 8 — Reproducible durable execution
 
-- [ ] DUR-01: Every manual, schedule, webhook, and provider event is compiled before acknowledgement, and its receipt, immutable execution plan, and outbox command are committed atomically.
-- [ ] DUR-02: A run pins plugin name/version/digest/protocol plus the UID, generation, and resource version of each AgentProfile, Repository, and SecretRef metadata projection it uses; secret values remain runtime-only.
-- [ ] DUR-03: Editing or deleting a Flow or referenced resource after trigger acceptance cannot change or strand the accepted run.
-- [ ] DUR-04: Node attempts have durable monotonically increasing identities across retries and restarts; each attempt owns separate events, logs, artifacts, and exit outcome.
-- [ ] DUR-05: Structured plugin stream events are validated, persisted, watchable, and retained alongside downloadable raw artifacts.
-- [ ] DUR-06: `maxParallel` provides real bounded deterministic execution, including joins, cancellation, retry, and crash recovery, rather than a schema-only promise.
-- [ ] DUR-07: Every external activity receives a stable idempotency key derived from run, node, and logical attempt and reuses it after ambiguous completion.
-- [ ] DUR-08: Health and diagnostics report outbox backlog, controller failures, plugin availability, migration state, and degraded readiness instead of returning an unconditional ready state.
-- [ ] DUR-09: Crash-boundary tests cover acceptance, dispatch, activity side effects, completion recording, approval, retry timers, and concurrent nodes without duplicating the local Run UID.
+- [x] DUR-01: Every manual, schedule, webhook, and provider event is compiled before acknowledgement, and its receipt, immutable execution plan, and outbox command are committed atomically.
+- [x] DUR-02: A run pins plugin name/version/digest/protocol plus the UID, generation, and resource version of each AgentProfile, Repository, and SecretRef metadata projection it uses; secret values remain runtime-only.
+- [x] DUR-03: Editing or deleting a Flow or referenced resource after trigger acceptance cannot change or strand the accepted run.
+- [x] DUR-04: Node attempts have durable monotonically increasing identities across retries and restarts; each attempt owns separate events, logs, artifacts, and exit outcome.
+- [x] DUR-05: Structured plugin stream events are validated, persisted, watchable, and retained alongside downloadable raw artifacts.
+- [x] DUR-06: `maxParallel` provides real bounded deterministic execution, including joins, cancellation, retry, and crash recovery, rather than a schema-only promise.
+- [x] DUR-07: Every external activity receives a stable idempotency key derived from run, node, and logical attempt and reuses it after ambiguous completion.
+- [x] DUR-08: Health and diagnostics report outbox backlog, controller failures, plugin availability, migration state, and degraded readiness instead of returning an unconditional ready state.
+- [x] DUR-09: Crash-boundary tests cover acceptance, dispatch, activity side effects, completion recording, approval, retry timers, and concurrent nodes without duplicating the local Run UID.
 
 ## Phase 9 — Declarative control plane and operator surface
 

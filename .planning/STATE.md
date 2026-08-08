@@ -2,10 +2,10 @@
 
 Status: active recovery milestone
 Current milestone: v0.1.0 First Real Release
-Current phase: 8 of 12
-Progress: 0/5 release phases
+Current phase: 9 of 12
+Progress: 1/5 release phases
 Last activity: 2026-08-08
-Current focus: immutable accepted plans and pinned execution dependencies
+Current focus: typed declarative contracts and the complete live operator surface
 
 ## Reality check
 
@@ -25,9 +25,19 @@ Current focus: immutable accepted plans and pinned execution dependencies
 - Implement real bounded parallelism because `maxParallel` is already part of the public Flow contract.
 - Never auto-merge in v0.1.0.
 
+## Completed phase evidence
+
+Phase 8 passed acceptance mutation and dependency-switch recovery, physical
+attempt/event/artifact evidence, deterministic bounded fork/join with hard-crash
+resume, and secret-safe degraded health with recovery. The implementation was
+delivered through public issues and independently reviewed pull requests.
+
 ## Active phase gate
 
-Phase 8 is complete only when acceptance mutation tests, dependency switch tests, per-attempt observability, truthful degraded health, deterministic fork/join execution, and crash-boundary recovery all pass.
+Phase 9 is complete only when typed plugin schemas and references fail before
+storage, the declared API/CLI contracts are executable, and a keyboard-only
+operator can edit and run the same interactive graph projection while watches,
+reconnect, attempt evidence, and artifacts remain live.
 
 ## Blockers
 
