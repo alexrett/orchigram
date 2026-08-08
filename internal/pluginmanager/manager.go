@@ -1073,8 +1073,11 @@ func drainDoctor(stream eventReceiver, redactions [][]byte) error {
 
 func validateProviderBootstrap(record store.PluginRecord, cursor string, activatedAt time.Time, config map[string]any) error {
 	replayExisting, _ := config["replayExisting"].(bool)
-	if cursor != "" || activatedAt.IsZero() || replayExisting {
+	if cursor != "" || replayExisting {
 		return nil
+	}
+	if activatedAt.IsZero() {
+		return errors.New("provider bootstrap activation time is required for an empty cursor unless replayExisting is true")
 	}
 	var manifest pluginbundle.Manifest
 	if err := json.Unmarshal(record.ManifestJSON, &manifest); err != nil {

@@ -232,11 +232,12 @@ spec: {backend: env, key: ORCHIGRAM_TEST_GITHUB_PROVIDER_TOKEN}
 	providerContext, stopProvider := context.WithCancel(context.Background())
 	providerAccepted := make(chan *pluginv1alpha1.TriggerEvent, 1)
 	providerDone := make(chan error, 1)
+	providerActivation := time.Date(2026, 8, 8, 10, 0, 30, 0, time.UTC)
 	go func() {
 		providerDone <- manager.WatchTrigger(providerContext, "github", "trigger-fixture", map[string]any{
 			"owner": "acme", "repository": "widget", "apiBase": providerServer.URL, "label": "orchigram:ready", "pollInterval": "1h", "tokenSecret": "token",
 			"secretRefs": map[string]any{"token": "github-provider-token"},
-		}, "", time.Time{}, func(event *pluginv1alpha1.TriggerEvent) error {
+		}, "", providerActivation, func(event *pluginv1alpha1.TriggerEvent) error {
 			providerAccepted <- event
 			return nil
 		})
@@ -505,6 +506,9 @@ func TestProviderBootstrapRequiresActivationFenceCapability(t *testing.T) {
 	t.Parallel()
 	activation := time.Date(2026, 8, 8, 10, 0, 0, 0, time.UTC)
 	oldRecord := store.PluginRecord{Name: "github", ManifestJSON: json.RawMessage(`{"capabilities":["trigger.github.issues"]}`)}
+	if err := validateProviderBootstrap(oldRecord, "", time.Time{}, map[string]any{}); err == nil || !strings.Contains(err.Error(), "activation time is required") {
+		t.Fatalf("missing activation fence error=%v", err)
+	}
 	if err := validateProviderBootstrap(oldRecord, "", activation, map[string]any{}); err == nil || !strings.Contains(err.Error(), pluginsdk.ActivationFenceCapability) {
 		t.Fatalf("old provider bootstrap error=%v", err)
 	}
@@ -513,6 +517,9 @@ func TestProviderBootstrapRequiresActivationFenceCapability(t *testing.T) {
 	}
 	if err := validateProviderBootstrap(oldRecord, "", activation, map[string]any{"replayExisting": true}); err != nil {
 		t.Fatalf("explicit replay should allow an old provider: %v", err)
+	}
+	if err := validateProviderBootstrap(oldRecord, "", time.Time{}, map[string]any{"replayExisting": true}); err != nil {
+		t.Fatalf("explicit replay should allow a missing activation time: %v", err)
 	}
 	newRecord := store.PluginRecord{Name: "github", ManifestJSON: json.RawMessage(`{"capabilities":["trigger.github.issues","trigger.bootstrap.activation-fence"]}`)}
 	if err := validateProviderBootstrap(newRecord, "", activation, map[string]any{}); err != nil {

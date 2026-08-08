@@ -221,15 +221,9 @@ func (r *Runtime) Watch(stream pluginv1alpha1.TriggerProvider_WatchServer) error
 	if err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
-	activatedAt := time.Time{}
-	if start.GetActivatedAt() != nil {
-		if !start.GetActivatedAt().IsValid() {
-			return status.Error(codes.InvalidArgument, "activated_at must be a valid timestamp")
-		}
-		activatedAt = start.GetActivatedAt().AsTime()
-	}
-	if config.ReplayExisting || cursor > 0 {
-		activatedAt = time.Time{}
+	activatedAt, err := providerActivation(start, config.ReplayExisting, cursor)
+	if err != nil {
+		return err
 	}
 	for {
 		events, listErr := r.listReadyEvents(stream.Context(), config, token, cursor, activatedAt)
@@ -264,6 +258,20 @@ func (r *Runtime) Watch(stream pluginv1alpha1.TriggerProvider_WatchServer) error
 		case <-timer.C:
 		}
 	}
+}
+
+func providerActivation(start *pluginv1alpha1.WatchStart, replayExisting bool, cursor int64) (time.Time, error) {
+	activatedAt := start.GetActivatedAt()
+	if activatedAt != nil && !activatedAt.IsValid() {
+		return time.Time{}, status.Error(codes.InvalidArgument, "activated_at must be a valid timestamp")
+	}
+	if replayExisting || cursor > 0 {
+		return time.Time{}, nil
+	}
+	if activatedAt == nil {
+		return time.Time{}, status.Error(codes.FailedPrecondition, "activated_at is required for an empty-cursor non-replay subscription")
+	}
+	return activatedAt.AsTime(), nil
 }
 
 type readyEvent struct {

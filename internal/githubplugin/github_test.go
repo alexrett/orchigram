@@ -12,7 +12,11 @@ import (
 	"testing"
 	"time"
 
+	pluginv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/plugin/v1alpha1"
 	pluginsdk "github.com/alexrett/orchigram/sdk/plugin"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func TestIssueEventWithoutEmbeddedIssueOrURLIsRejected(t *testing.T) {
@@ -134,6 +138,32 @@ func TestInitialSubscriptionUsesBoundedOverlapForSecondPrecisionAndClockSkew(t *
 	}
 	if len(events) != 2 || events[0].ID != 202 || events[1].ID != 203 {
 		t.Fatalf("overlap events=%+v", events)
+	}
+}
+
+func TestProviderActivationFailsClosedForOlderHost(t *testing.T) {
+	t.Parallel()
+	if _, err := providerActivation(&pluginv1alpha1.WatchStart{}, false, 0); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("missing activation error=%v", err)
+	}
+	activation := time.Date(2026, 8, 8, 10, 30, 0, 0, time.UTC)
+	actual, err := providerActivation(&pluginv1alpha1.WatchStart{ActivatedAt: timestamppb.New(activation)}, false, 0)
+	if err != nil || !actual.Equal(activation) {
+		t.Fatalf("activation=%s err=%v", actual, err)
+	}
+	for name, test := range map[string]struct {
+		replay bool
+		cursor int64
+	}{
+		"explicit replay": {replay: true},
+		"durable cursor":  {cursor: 77},
+	} {
+		t.Run(name, func(t *testing.T) {
+			actual, err := providerActivation(&pluginv1alpha1.WatchStart{}, test.replay, test.cursor)
+			if err != nil || !actual.IsZero() {
+				t.Fatalf("activation=%s err=%v", actual, err)
+			}
+		})
 	}
 }
 

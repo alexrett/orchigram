@@ -26,6 +26,9 @@ import (
 // ErrNotFound is returned when an authoritative object does not exist.
 var ErrNotFound = errors.New("not found")
 
+// ErrTriggerDisabled rejects an occurrence after an operator has disabled its Trigger.
+var ErrTriggerDisabled = errors.New("trigger is disabled")
+
 // StaleTriggerGenerationError rejects events emitted by a superseded provider watch.
 type StaleTriggerGenerationError struct {
 	Expected uint64
@@ -315,6 +318,14 @@ func (s *Store) Delete(ctx context.Context, kind, namespace, name string, expect
 	if _, err := tx.ExecContext(ctx, `DELETE FROM resources WHERE kind=? AND namespace=? AND name=?`, kind, namespace, name); err != nil {
 		return err
 	}
+	if kind == "Trigger" {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM provider_cursors WHERE trigger_uid=?`, uid); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM trigger_states WHERE trigger_uid=?`, uid); err != nil {
+			return err
+		}
+	}
 	now := s.timestamp()
 	if _, err := tx.ExecContext(ctx, `INSERT INTO resource_events(revision,event_type,kind,namespace,name,uid,resource_json,observed_at) VALUES(?,?,?,?,?,?,NULL,?)`, revision, "DELETED", kind, namespace, name, uid, now); err != nil {
 		return err
@@ -461,15 +472,24 @@ func (s *Store) acceptTrigger(ctx context.Context, triggerUID string, triggerGen
 	}
 	defer func() { _ = tx.Rollback() }()
 	if providerCursor != "" {
-		var currentGeneration uint64
-		if err := tx.QueryRowContext(ctx, `SELECT generation FROM trigger_states WHERE trigger_uid=?`, triggerUID).Scan(&currentGeneration); err != nil {
+		var resourceGeneration, stateGeneration uint64
+		var enabled int
+		if err := tx.QueryRowContext(ctx, `SELECT resources.generation,trigger_states.generation,trigger_states.enabled
+			FROM resources JOIN trigger_states ON trigger_states.trigger_uid=resources.uid
+			WHERE resources.kind='Trigger' AND resources.uid=?`, triggerUID).Scan(&resourceGeneration, &stateGeneration, &enabled); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return Receipt{}, ErrNotFound
 			}
 			return Receipt{}, err
 		}
-		if currentGeneration != triggerGeneration {
-			return Receipt{}, &StaleTriggerGenerationError{Expected: triggerGeneration, Current: currentGeneration}
+		if resourceGeneration != triggerGeneration {
+			return Receipt{}, &StaleTriggerGenerationError{Expected: triggerGeneration, Current: resourceGeneration}
+		}
+		if stateGeneration != triggerGeneration {
+			return Receipt{}, &StaleTriggerGenerationError{Expected: triggerGeneration, Current: stateGeneration}
+		}
+		if enabled == 0 {
+			return Receipt{}, ErrTriggerDisabled
 		}
 	}
 	existing, err := receiptByOccurrence(ctx, tx, triggerUID, occurrenceID)

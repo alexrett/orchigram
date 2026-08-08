@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -252,6 +253,73 @@ spec:
 	if err != nil || cursor != "20" || eventID != "event-20" {
 		t.Fatalf("no-op apply reset provider cursor=%q event=%q err=%v", cursor, eventID, err)
 	}
+}
+
+func TestProviderAcceptanceRequiresExistingEnabledTrigger(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openTestStore(t)
+	trigger := applyStoreTrigger(t, s, "provider-acceptance")
+	if _, err := s.AcceptProviderTrigger(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, "event-1", "target", "default", json.RawMessage(`{"issue":1}`), "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTriggerEnabled(ctx, trigger.Metadata.UID, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptProviderTrigger(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, "event-2", "target", "default", json.RawMessage(`{"issue":2}`), "2"); !errors.Is(err, ErrTriggerDisabled) {
+		t.Fatalf("disabled Trigger acceptance error=%v", err)
+	}
+	if _, err := s.AcceptProviderTrigger(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, "event-1", "target", "default", json.RawMessage(`{"issue":1}`), "2"); !errors.Is(err, ErrTriggerDisabled) {
+		t.Fatalf("disabled Trigger duplicate error=%v", err)
+	}
+	cursor, eventID, err := s.ProviderCursor(ctx, trigger.Metadata.UID)
+	if err != nil || cursor != "1" || eventID != "event-1" {
+		t.Fatalf("disabled Trigger advanced cursor=%q event=%q err=%v", cursor, eventID, err)
+	}
+	receipts, err := s.TriggerReceipts(ctx, trigger.Metadata.UID, 10)
+	if err != nil || len(receipts) != 1 || receipts[0].OccurrenceID != "event-1" {
+		t.Fatalf("disabled Trigger persisted receipts=%+v err=%v", receipts, err)
+	}
+
+	deleted := applyStoreTrigger(t, s, "provider-deletion")
+	if _, err := s.AcceptProviderTrigger(ctx, deleted.Metadata.UID, deleted.Metadata.Generation, "event-before-delete", "target", "default", json.RawMessage(`{"issue":3}`), "3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Delete(ctx, "Trigger", deleted.Metadata.Namespace, deleted.Metadata.Name, deleted.Metadata.ResourceVersion, "delete-trigger"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptProviderTrigger(ctx, deleted.Metadata.UID, deleted.Metadata.Generation, "event-after-delete", "target", "default", json.RawMessage(`{"issue":4}`), "4"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted Trigger acceptance error=%v", err)
+	}
+	if _, err := s.TriggerState(ctx, deleted.Metadata.UID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted Trigger retained state: %v", err)
+	}
+	if cursor, eventID, err := s.ProviderCursor(ctx, deleted.Metadata.UID); err != nil || cursor != "" || eventID != "" {
+		t.Fatalf("deleted Trigger retained provider cursor=%q event=%q err=%v", cursor, eventID, err)
+	}
+	receipts, err = s.TriggerReceipts(ctx, deleted.Metadata.UID, 10)
+	if err != nil || len(receipts) != 1 || receipts[0].OccurrenceID != "event-before-delete" {
+		t.Fatalf("deleted Trigger persisted receipts=%+v err=%v", receipts, err)
+	}
+}
+
+func applyStoreTrigger(t *testing.T, s *Store, name string) resource.Document {
+	t.Helper()
+	document, err := resource.DecodeStrict([]byte(fmt.Sprintf(`apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata: {name: %s}
+spec:
+  flow: target
+  provider: {plugin: github, config: {repository: fixture}}
+`, name)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied, err := s.Apply(context.Background(), document, ApplyOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return applied
 }
 
 func TestPluginVersionsActivateAndRollbackWithoutOverwrite(t *testing.T) {
