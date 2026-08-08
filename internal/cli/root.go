@@ -732,7 +732,16 @@ func newPluginCommand(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			encoded, err := json.Marshal(map[string]any{"name": plugin.GetName(), "version": plugin.GetVersion(), "digest": plugin.GetDigest(), "state": plugin.GetState(), "capabilities": plugin.GetCapabilities()})
+			projection := struct {
+				Name         string   `json:"name"`
+				Version      string   `json:"version"`
+				Digest       string   `json:"digest"`
+				State        string   `json:"state"`
+				Capabilities []string `json:"capabilities"`
+			}{
+				Name: plugin.GetName(), Version: plugin.GetVersion(), Digest: plugin.GetDigest(), State: plugin.GetState(), Capabilities: plugin.GetCapabilities(),
+			}
+			encoded, err := json.Marshal(projection)
 			if err != nil {
 				return err
 			}
