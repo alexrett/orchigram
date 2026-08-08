@@ -11,9 +11,13 @@ trap 'rm -f "$temporary" "$normalized"' EXIT
 go run github.com/google/go-licenses@v1.6.0 report ./... \
   --ignore=github.com/alexrett/orchigram >"$temporary"
 
-# v1.7.1 omits its LICENSE file from the module zip. The upstream repository
-# and pkg.go.dev both classify modernc.org/mathutil as BSD-3-Clause.
-sed 's#modernc.org/mathutil,Unknown,Unknown#modernc.org/mathutil,https://gitlab.com/cznic/mathutil/-/blob/master/LICENSE,BSD-3-Clause#' "$temporary" \
+# Normalize known upstream metadata gaps so the inventory does not depend on
+# network/cache state. mathutil omits its license file from the module zip;
+# go-licenses can also intermittently omit cel.dev/expr's repository URL.
+sed \
+  -e 's#cel.dev/expr,Unknown,Apache-2.0#cel.dev/expr,https://github.com/cel-expr/cel-spec/blob/v0.25.2/LICENSE,Apache-2.0#' \
+  -e 's#modernc.org/mathutil,Unknown,Unknown#modernc.org/mathutil,https://gitlab.com/cznic/mathutil/-/blob/master/LICENSE,BSD-3-Clause#' \
+  "$temporary" \
   | LC_ALL=C sort >"$normalized"
 
 if grep -q ',Unknown,Unknown$' "$normalized"; then
