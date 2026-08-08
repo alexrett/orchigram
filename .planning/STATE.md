@@ -1,11 +1,11 @@
 # Project state
 
-Status: executing
+Status: ready for publication checkpoint
 Current phase: 7 of 7
 Current plan: 07-01
 Progress: 6/7 plans
 Last activity: 2026-08-08
-Current focus: live tracer checkpoints and the v0.1.0 release tag
+Current focus: operator-authorized v0.1.0 tag and GitHub attestations
 
 ## Decisions
 
@@ -19,7 +19,10 @@ Current focus: live tracer checkpoints and the v0.1.0 release tag
 - Phase 5 fixed GitHub issue-event cursors, run-isolated git workspaces, deterministic branches, and mutation reconciliation.
 - Phase 6 fixed pinned-plan graph replay, reconnecting OpenSSH StreamLocal contexts, CAS resource forms, and the hardened single-node install/upgrade path.
 - The source repository and terminal-first Pages site were published after explicit user authorization; the v0.1.0 tag remains gated on live external effects and release attestations.
+- Issue #7 completed the public GitHub provider-to-PR tracer, a sandbox Slack delivery, and reviewed demo-host operation.
+- Issue #12 made the complete 42-file release manifest byte-for-byte reproducible, including SPDX documents and dependency license inventory.
 
 ## Blockers
 
-None.
+The `v0.1.0` tag and draft-release workflow remain an explicit operator
+checkpoint. No technical implementation blocker remains.
