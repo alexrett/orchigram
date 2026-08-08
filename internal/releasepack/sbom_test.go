@@ -59,6 +59,7 @@ func TestNormalizeSPDXRejectsInvalidInput(t *testing.T) {
 	}{
 		{name: "json", document: `{`, date: "2026-08-08T12:25:49Z"},
 		{name: "trailing data", document: `{"spdxVersion":"SPDX-2.3","creationInfo":{}} true`, date: "2026-08-08T12:25:49Z"},
+		{name: "malformed trailing data", document: `{"spdxVersion":"SPDX-2.3","creationInfo":{}} {`, date: "2026-08-08T12:25:49Z"},
 		{name: "version", document: `{"spdxVersion":"SPDX-2.2","creationInfo":{}}`, date: "2026-08-08T12:25:49Z"},
 		{name: "creation info", document: `{"spdxVersion":"SPDX-2.3"}`, date: "2026-08-08T12:25:49Z"},
 		{name: "date", document: `{"spdxVersion":"SPDX-2.3","creationInfo":{}}`, date: "not-a-date"},

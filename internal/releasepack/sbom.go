@@ -27,8 +27,11 @@ func NormalizeSPDX(document, artifact []byte, created string) ([]byte, error) {
 	if err := decoder.Decode(&value); err != nil {
 		return nil, fmt.Errorf("decode SPDX JSON: %w", err)
 	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return nil, errors.New("decode SPDX JSON: trailing data")
+	var trailing any
+	if err := decoder.Decode(&trailing); err == nil {
+		return nil, errors.New("decode SPDX JSON: multiple JSON values")
+	} else if !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("decode SPDX JSON trailing data: %w", err)
 	}
 	if value["spdxVersion"] != "SPDX-2.3" {
 		return nil, fmt.Errorf("expected SPDX-2.3 document, got %v", value["spdxVersion"])
