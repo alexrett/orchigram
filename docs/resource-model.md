@@ -23,3 +23,6 @@ Apply rejects unknown fields. `resourceVersion` is a compare-and-swap preconditi
 `PluginInstallation` selects one immutable installed name, version, and digest.
 Its controller-owned status records observed generation, activation, protocol
 and health diagnostics. See [Declarative plugin installations](plugin-installations.md).
+
+List pagination, label selection, durable watch replay, YAML export, and run
+filters are defined in [Query and watch contracts](query-contracts.md).
