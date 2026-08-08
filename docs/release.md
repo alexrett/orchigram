@@ -38,11 +38,28 @@ module conformance test.
 
 ## External tracer checkpoints
 
-CI exercises the Teams flow only against an `httptest` receiver. Sending a
-real Teams Adaptive Card requires an operator-provided `SecretRef` and explicit
-confirmation. The GitHub issue-to-PR tracer uses recorded fixtures by default;
-a live run requires a dedicated repository and fine-grained PAT. Orchigram
-never merges the pull request or pushes to the default branch.
+CI exercises the Slack flow only against deterministic `httptest` receivers.
+They verify `200 ok`, bounded non-2xx retries, stable idempotency headers,
+payload shape, and secret non-disclosure. A real Slack post is optional until
+an operator supplies a sandbox webhook through the daemon's protected
+`SecretRef` backend and explicitly confirms the destination. Incoming Webhooks
+are limited to approximately one message per second, with short bursts
+tolerated; `429` includes `Retry-After`. Orchigram keeps the idempotency key
+stable, but Incoming Webhooks expose no documented deduplication identifier,
+so a crash after remote acceptance and before local completion can produce a
+duplicate.
+
+Slack documents [successful Incoming Webhook
+responses](https://api.slack.com/incoming-webhooks) and [the approximate
+one-message-per-second limit](https://docs.slack.dev/apis/web-api/rate-limits/).
+
+The compatible Teams example remains available but is not a v0.1 operator
+checkpoint. The GitHub issue-to-PR tracer uses recorded fixtures by default; a
+live run requires a dedicated repository and fine-grained PAT. Orchigram never
+merges the pull request or pushes to the default branch.
 
 Publishing a tag creates a draft GitHub release. Review its checksums, SBOMs,
-license inventory and attestations before making it public.
+license inventory and attestations before making it public. Snapshot builds do
+not create provenance: attestations exist only after the explicitly authorized
+tag workflow runs. The workflow limits release permissions to repository
+contents, OIDC identity, and attestations.

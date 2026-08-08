@@ -31,8 +31,12 @@ before the GitHub provider commits and pushes the deterministic issue branch
 and creates or reconciles a pull request.
 
 The flow never pushes the default branch, never merges, and never bypasses
-human pull-request review. Rejecting approval prevents implementation, testing,
-push, and pull-request creation.
+human pull-request review. In v0.1, revisions are ordinary operator Git/GitHub
+pushes to the existing branch and pull request; review-event automation is not
+implemented. A new provider-triggered Run has a new Run UID and derives a new
+deterministic branch. The pull request is merged only through normal GitHub
+controls after approval. Rejecting the Flow approval prevents implementation,
+testing, push, and pull-request creation.
 
 Create and apply the Trigger before adding the label. A new subscription uses
 its durable activation timestamp plus a bounded one-minute clock-skew overlap

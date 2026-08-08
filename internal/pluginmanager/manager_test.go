@@ -502,6 +502,31 @@ func TestMalformedStreamIsRejected(t *testing.T) {
 	}
 }
 
+func TestFailedTerminalPayloadDiagnostic(t *testing.T) {
+	terminalEvent := func(payload string) *pluginv1alpha1.ExecuteEvent {
+		return &pluginv1alpha1.ExecuteEvent{Sequence: 1, Type: "task.failed", PayloadJson: []byte(payload), OccurredAt: timestamppb.Now()}
+	}
+	t.Run("error is returned", func(t *testing.T) {
+		manager := &Manager{artifacts: t.TempDir()}
+		_, err := manager.consume(context.Background(), runArtifact{runUID: "run", nodeID: "node", attempt: 1}, &fakeReceiver{
+			events: []*pluginv1alpha1.ExecuteEvent{terminalEvent(`{"error":"HTTP status 502"}`)},
+		})
+		if err == nil || !strings.Contains(err.Error(), "plugin reported task.failed") || !strings.Contains(err.Error(), "HTTP status 502") {
+			t.Fatalf("terminal payload diagnostic=%v", err)
+		}
+	})
+	t.Run("error is redacted", func(t *testing.T) {
+		manager := &Manager{artifacts: t.TempDir()}
+		secret := []byte("payload-secret-value")
+		_, err := manager.consume(context.Background(), runArtifact{runUID: "run", nodeID: "node", attempt: 1, redactions: [][]byte{secret}}, &fakeReceiver{
+			events: []*pluginv1alpha1.ExecuteEvent{terminalEvent(`{"error":"request failed for payload-secret-value"}`)},
+		})
+		if err == nil || strings.Contains(err.Error(), string(secret)) || !strings.Contains(err.Error(), "request failed for [REDACTED]") {
+			t.Fatalf("redacted terminal payload diagnostic=%v", err)
+		}
+	})
+}
+
 func TestProviderBootstrapRequiresActivationFenceCapability(t *testing.T) {
 	t.Parallel()
 	activation := time.Date(2026, 8, 8, 10, 0, 0, 0, time.UTC)
