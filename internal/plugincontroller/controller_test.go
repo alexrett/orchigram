@@ -319,8 +319,33 @@ func firstStatusDiagnosticCode(status map[string]any) string {
 
 func TestSetEnabledReturnsNotFoundForUnknownPlugin(t *testing.T) {
 	t.Parallel()
-	controller := New(openControllerStore(t), &fakeRuntime{})
+	state := openControllerStore(t)
+	runtime := &fakeRuntime{records: []store.PluginRecord{pluginRecord("exec", "1.0.0", strings.Repeat("f", 64))}}
+	controller := New(state, runtime)
+	if err := controller.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	if err := controller.SetEnabled(context.Background(), "missing", "1.0.0", true); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("error=%v", err)
+	}
+	if err := controller.SetEnabled(context.Background(), "exec", "9.9.9", true); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("unknown version error=%v", err)
+	}
+	installation := installationByVersion(t, state, "1.0.0")
+	if installation.Spec.Enabled == nil || *installation.Spec.Enabled || len(runtime.enables) != 0 || len(runtime.disables) != 0 {
+		t.Fatalf("unknown version mutated state: installation=%+v runtime=%+v", installation, runtime)
+	}
+}
+
+func TestResourceNameIsDeterministicDNSLabelForLongSemanticVersion(t *testing.T) {
+	t.Parallel()
+	record := pluginRecord("community-provider", "1.0.0-"+strings.Repeat("preview", 20), strings.Repeat("a", 64))
+	name := ResourceName(record)
+	if len(name) > 63 || !strings.HasSuffix(name, "-aaaaaaaaaa") {
+		t.Fatalf("resource name=%q length=%d", name, len(name))
+	}
+	document := installationDocument(t, name, record.Name, record.Version, record.Digest, false)
+	if document.Metadata.Name != name || ResourceName(record) != name {
+		t.Fatalf("resource name is not stable: %q", name)
 	}
 }

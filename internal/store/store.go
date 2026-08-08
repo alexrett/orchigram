@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -373,7 +374,8 @@ func (s *Store) UpdateResourceStatus(ctx context.Context, kind, namespace, name 
 	if _, err := tx.ExecContext(ctx, `INSERT INTO resource_events(revision,event_type,kind,namespace,name,uid,resource_json,observed_at) VALUES(?,?,?,?,?,?,?,?)`, revision, "MODIFIED", kind, namespace, name, uid, doc.JSON, now); err != nil {
 		return resource.Document{}, fmt.Errorf("append resource status event: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO audit_records(revision,request_id,actor,context_name,operation,resource_uid,old_hash,new_hash,occurred_at) VALUES(?,?,?,?,?,?,?,?,?)`, revision, uuid.NewString(), "controller", "", "status", uid, digest(currentJSON), digest(doc.JSON), now); err != nil {
+	requestID := "status:" + uid + ":" + strconv.FormatUint(generation, 10) + ":" + digest(encodedStatus)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO audit_records(revision,request_id,actor,context_name,operation,resource_uid,old_hash,new_hash,occurred_at) VALUES(?,?,?,?,?,?,?,?,?)`, revision, requestID, "controller", "", "status", uid, digest(currentJSON), digest(doc.JSON), now); err != nil {
 		return resource.Document{}, fmt.Errorf("append resource status audit record: %w", err)
 	}
 	if err := tx.Commit(); err != nil {

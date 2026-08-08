@@ -240,14 +240,19 @@ func (c *Controller) SetEnabled(ctx context.Context, plugin, version string, ena
 		return err
 	}
 	found := false
+	targetFound := !enabled
 	ordered := make([]resource.PluginInstallation, 0)
 	if enabled {
 		for _, installation := range installations {
 			if installation.Spec.Plugin == plugin && installation.Spec.Version == version {
 				ordered = append(ordered, installation)
-				found = true
+				targetFound = true
 			}
 		}
+		if !targetFound {
+			return store.ErrNotFound
+		}
+		found = true
 	}
 	for _, installation := range installations {
 		if installation.Spec.Plugin != plugin || (enabled && installation.Spec.Version == version) {
@@ -502,20 +507,25 @@ func ResourceName(record store.PluginRecord) string {
 	if len(digest) > 10 {
 		digest = digest[:10]
 	}
-	version := sanitizeLabel(record.Version)
-	suffix := "-" + version
+	base := sanitizeLabel(record.Name + "-" + record.Version)
+	if base == "" {
+		base = "plugin"
+	}
+	suffix := ""
 	if digest != "" {
-		suffix += "-" + digest
+		suffix = "-" + digest
 	}
-	prefix := sanitizeLabel(record.Name)
-	maximumPrefix := 63 - len(suffix)
-	if maximumPrefix < 1 {
-		maximumPrefix = 1
+	maximumBase := 63 - len(suffix)
+	if maximumBase < 1 {
+		maximumBase = 1
 	}
-	if len(prefix) > maximumPrefix {
-		prefix = strings.Trim(prefix[:maximumPrefix], "-")
+	if len(base) > maximumBase {
+		base = strings.Trim(base[:maximumBase], "-")
 	}
-	return strings.Trim(prefix+suffix, "-")
+	if base == "" {
+		base = "p"
+	}
+	return base + suffix
 }
 
 func sanitizeLabel(value string) string {

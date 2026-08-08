@@ -30,6 +30,12 @@ selects an older immutable resource; neither its bundle nor contract is
 overwritten. A disabled resource may be deleted. If its verified bundle still
 exists, reconciliation recreates the canonical disabled projection.
 
+Generic ResourceService apply/delete acknowledges the durable desired-state
+mutation, not process convergence. Clients use `observedGeneration`, resource
+watches, and System health to observe the asynchronous controller result. This
+avoids returning an ambiguous RPC failure after the desired-state transaction
+has already committed.
+
 Only one version of a plugin may be enabled. If concurrent applies leave two
 versions enabled, both selected resources enter `Conflict`; the controller
 retains the current activation and never chooses a winner by list or timing

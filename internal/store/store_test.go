@@ -82,6 +82,18 @@ spec: {type: command, executable: fake-agent}
 	if err := json.Unmarshal(projected.JSON, &projection); err != nil || projection.Status["phase"] != "Ready" {
 		t.Fatalf("status=%+v err=%v", projection.Status, err)
 	}
+	encodedStatus, err := json.Marshal(status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var statusRequestID string
+	if err := s.db.QueryRowContext(ctx, `SELECT request_id FROM audit_records WHERE operation='status' AND resource_uid=?`, applied.Metadata.UID).Scan(&statusRequestID); err != nil {
+		t.Fatal(err)
+	}
+	wantRequestID := "status:" + applied.Metadata.UID + ":1:" + digest(encodedStatus)
+	if statusRequestID != wantRequestID {
+		t.Fatalf("status request ID=%q want=%q", statusRequestID, wantRequestID)
+	}
 	same, err := s.UpdateResourceStatus(ctx, "AgentProfile", applied.Metadata.Namespace, applied.Metadata.Name, applied.Metadata.Generation, status)
 	if err != nil || same.Metadata.ResourceVersion != projected.Metadata.ResourceVersion {
 		t.Fatalf("idempotent status=%+v err=%v", same.Metadata, err)

@@ -117,12 +117,6 @@ func (a *API) apply(ctx context.Context, request *controlv1alpha1.ApplyRequest, 
 	if err != nil {
 		return nil, rpcError(err)
 	}
-	if applied.Kind == "PluginInstallation" && a.pluginState != nil {
-		_ = a.pluginState.Reconcile(ctx)
-		if current, getErr := a.store.Get(ctx, applied.Kind, applied.Metadata.Namespace, applied.Metadata.Name); getErr == nil {
-			applied = current
-		}
-	}
 	return &controlv1alpha1.ApplyResponse{Resource: a.projectResource(ctx, applied), Diagnostics: diagnostics}, nil
 }
 
@@ -208,9 +202,6 @@ func (a *API) Delete(ctx context.Context, request *controlv1alpha1.DeleteRequest
 	}
 	if err := a.store.Delete(ctx, key.GetKind(), key.GetNamespace(), key.GetName(), request.GetExpectedResourceVersion(), request.GetMeta().GetRequestId()); err != nil {
 		return nil, rpcError(err)
-	}
-	if key.GetKind() == "PluginInstallation" && a.pluginState != nil {
-		_ = a.pluginState.Reconcile(ctx)
 	}
 	return &emptypb.Empty{}, nil
 }

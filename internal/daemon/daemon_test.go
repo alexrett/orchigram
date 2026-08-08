@@ -568,15 +568,27 @@ spec:
 	if err != nil || len(response.GetDiagnostics()) != 1 || response.GetDiagnostics()[0].GetCode() != "bundle_missing" || response.GetDiagnostics()[0].GetSeverity() != controlv1alpha1.Diagnostic_SEVERITY_WARNING {
 		t.Fatalf("apply response=%+v err=%v", response, err)
 	}
-	projection := decodePluginInstallationProjection(t, response.GetResource().GetJson())
+	var current *controlv1alpha1.ResourceDocument
+	var projection pluginInstallationProjection
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		current, err = client.Resources.Get(context.Background(), &controlv1alpha1.GetRequest{Key: response.GetResource().GetKey()})
+		if err == nil {
+			projection = decodePluginInstallationProjection(t, current.GetJson())
+			if projection.Status.Phase == "Error" && projection.Status.ObservedGeneration == projection.Metadata.Generation {
+				break
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 	if projection.Status.Phase != "Error" || projection.Status.ObservedGeneration != projection.Metadata.Generation {
-		t.Fatalf("projection=%+v", projection)
+		t.Fatalf("projection did not reconcile: %+v err=%v", projection, err)
 	}
 	healthResponse, err := client.System.Health(context.Background(), &emptypb.Empty{})
 	if err != nil || healthResponse.GetReady() {
 		t.Fatalf("health=%+v err=%v", healthResponse, err)
 	}
-	if _, err := client.Resources.Delete(context.Background(), &controlv1alpha1.DeleteRequest{Key: response.GetResource().GetKey(), ExpectedResourceVersion: response.GetResource().GetResourceVersion()}); err != nil {
+	if _, err := client.Resources.Delete(context.Background(), &controlv1alpha1.DeleteRequest{Key: response.GetResource().GetKey(), ExpectedResourceVersion: current.GetResourceVersion()}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := client.Resources.Get(context.Background(), &controlv1alpha1.GetRequest{Key: response.GetResource().GetKey()}); status.Code(err) != codes.NotFound {
