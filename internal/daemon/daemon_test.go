@@ -1645,6 +1645,9 @@ spec:
 	if err := instance.store.AdvanceTriggerCursor(context.Background(), trigger.Metadata.UID, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
+	if err := instance.triggers.ReconcileSchedulesNow(context.Background(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
 	waitForSystemHealth(t, client, true, "", "")
 }
 

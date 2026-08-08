@@ -131,6 +131,36 @@ spec: {type: command, executable: next-agent}
 	}
 }
 
+func TestResourceCreateCannotPersistClientOwnedStatus(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openTestStore(t)
+	document, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: AgentProfile
+metadata: {name: forged-status}
+spec: {type: command, executable: fake-agent}
+status: {observedGeneration: 999, phase: Active}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied, err := s.Apply(ctx, document, ApplyOptions{RequestID: "forged-status"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var projection map[string]any
+	if err := json.Unmarshal(applied.JSON, &projection); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := projection["status"]; exists || string(applied.Status) != `{}` {
+		t.Fatalf("client status persisted: %s", applied.JSON)
+	}
+	stored, err := s.Get(ctx, document.Kind, document.Metadata.Namespace, document.Metadata.Name)
+	if err != nil || strings.Contains(string(stored.JSON), `"phase":"Active"`) {
+		t.Fatalf("stored resource=%s err=%v", stored.JSON, err)
+	}
+}
+
 func TestTerminalRunTransitionsAreImmutable(t *testing.T) {
 	t.Parallel()
 	for _, terminal := range []string{"succeeded", "failed", "rejected", "cancelled"} {

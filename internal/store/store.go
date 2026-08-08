@@ -210,6 +210,11 @@ type ApplyOptions struct {
 
 // Apply atomically stores a resource, event, and audit record.
 func (s *Store) Apply(ctx context.Context, doc resource.Document, options ApplyOptions) (resource.Document, error) {
+	var err error
+	doc, err = doc.WithServerStatus(nil)
+	if err != nil {
+		return resource.Document{}, fmt.Errorf("strip client-owned resource status: %w", err)
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return resource.Document{}, err

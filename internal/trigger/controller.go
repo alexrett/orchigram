@@ -45,6 +45,7 @@ type Controller struct {
 	provider      Provider
 	now           func() time.Time
 	mu            sync.Mutex
+	scheduleMu    sync.Mutex
 	subscriptions map[string]subscription
 	health        *health.Tracker
 }
@@ -109,6 +110,9 @@ func (c *Controller) observeProviders(err error) {
 
 // ReconcileSchedules evaluates every schedule with at-most-one misfire catch-up.
 func (c *Controller) ReconcileSchedules(ctx context.Context, now time.Time) error {
+	c.scheduleMu.Lock()
+	defer c.scheduleMu.Unlock()
+
 	documents, _, err := c.store.List(ctx, "Trigger", resource.DefaultNamespace, 1000)
 	if err != nil {
 		return err
@@ -126,6 +130,14 @@ func (c *Controller) ReconcileSchedules(ctx context.Context, now time.Time) erro
 		}
 	}
 	return nil
+}
+
+// ReconcileSchedulesNow runs one synchronous schedule pass and records its
+// outcome in the public controller health projection.
+func (c *Controller) ReconcileSchedulesNow(ctx context.Context, now time.Time) error {
+	err := c.ReconcileSchedules(ctx, now)
+	c.observeSchedule(err)
+	return err
 }
 
 // NextOccurrences previews future schedule identities without changing state.
