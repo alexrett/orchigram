@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -73,6 +74,13 @@ func TestRuntimeHealthRetainsFailuresUntilSuccessfulRecovery(t *testing.T) {
 	durable := &healthEngine{fakeEngine: &fakeEngine{}}
 	control := New(state, flow.NewCompiler(nil), durable)
 	control.claimStaleAfter = 10 * time.Millisecond
+	var injectOutboxFailure atomic.Bool
+	control.SetFaultHook(func(boundary Boundary) error {
+		if boundary == BoundaryAfterRun && injectOutboxFailure.CompareAndSwap(true, false) {
+			return errors.New("private-outbox-payload-must-not-escape")
+		}
+		return nil
+	})
 	control.Start(ctx)
 	waitForHealthDiagnostics(t, control, func(codes map[string]string) bool { return len(codes) == 0 })
 
@@ -82,20 +90,12 @@ func TestRuntimeHealthRetainsFailuresUntilSuccessfulRecovery(t *testing.T) {
 	durable.setReconcileError(nil)
 	waitForHealthDiagnostics(t, control, func(codes map[string]string) bool { return codes["engine"] == "" })
 
-	var failOnce sync.Once
-	control.SetFaultHook(func(boundary Boundary) error {
-		var result error
-		if boundary == BoundaryAfterRun {
-			failOnce.Do(func() { result = errors.New("private-outbox-payload-must-not-escape") })
-		}
-		return result
-	})
+	injectOutboxFailure.Store(true)
 	if _, err := control.StartManual(ctx, "demo", "default", json.RawMessage(`{}`), "health-recovery"); err != nil {
 		t.Fatal(err)
 	}
 	waitForHealthDiagnostics(t, control, func(codes map[string]string) bool { return codes["outbox"] == "reconcile_failed" })
 	assertHealthDoesNotContain(t, control, "private-outbox-payload-must-not-escape")
-	control.SetFaultHook(nil)
 	waitForHealthDiagnostics(t, control, func(codes map[string]string) bool { return codes["outbox"] == "" })
 }
 
