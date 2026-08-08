@@ -24,6 +24,22 @@ type fakeRuntime struct {
 	disables   []string
 }
 
+type statusRaceStore struct {
+	ResourceStore
+	nextError error
+	calls     int
+}
+
+func (s *statusRaceStore) UpdateResourceStatus(ctx context.Context, kind, namespace, name string, generation uint64, status map[string]any) (resource.Document, error) {
+	s.calls++
+	if s.nextError != nil {
+		err := s.nextError
+		s.nextError = nil
+		return resource.Document{}, err
+	}
+	return s.ResourceStore.UpdateResourceStatus(ctx, kind, namespace, name, generation, status)
+}
+
 func (f *fakeRuntime) List(context.Context) ([]store.PluginRecord, error) {
 	return append([]store.PluginRecord(nil), f.records...), nil
 }
@@ -147,6 +163,30 @@ func TestNilRuntimeFailsReconciliationWithoutPanicking(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("health diagnostics=%+v", diagnostics)
+	}
+}
+
+func TestStatusProjectionRacesRetryOnNextReconciliation(t *testing.T) {
+	t.Parallel()
+	for name, raceError := range map[string]error{
+		"concurrent apply":  &store.StaleObservedGenerationError{Expected: 1, Current: 2},
+		"concurrent delete": store.ErrNotFound,
+	} {
+		t.Run(name, func(t *testing.T) {
+			state := openControllerStore(t)
+			racing := &statusRaceStore{ResourceStore: state, nextError: raceError}
+			controller := New(racing, &fakeRuntime{records: []store.PluginRecord{pluginRecord("exec", "0.1.0", strings.Repeat("1", 64))}})
+			if err := controller.Reconcile(context.Background()); err != nil {
+				t.Fatalf("transient race degraded reconciliation: %v", err)
+			}
+			if err := controller.Reconcile(context.Background()); err != nil {
+				t.Fatalf("retry reconciliation: %v", err)
+			}
+			installation := installationByVersion(t, state, "0.1.0")
+			if racing.calls < 2 || installation.Status["phase"] != "Installed" {
+				t.Fatalf("calls=%d status=%+v", racing.calls, installation.Status)
+			}
+		})
 	}
 }
 

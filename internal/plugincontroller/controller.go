@@ -176,6 +176,12 @@ func (c *Controller) reconcileLocked(ctx context.Context) error {
 	for _, installation := range installations {
 		status, issue := installationStatus(installation, groups[installation.Spec.Plugin], recordByVersion, activeByPlugin, failures)
 		if _, err := c.store.UpdateResourceStatus(ctx, "PluginInstallation", installation.Metadata.Namespace, installation.Metadata.Name, installation.Metadata.Generation, status); err != nil {
+			var stale *store.StaleObservedGenerationError
+			if errors.Is(err, store.ErrNotFound) || errors.As(err, &stale) {
+				// A concurrent desired-state Apply/Delete won the CAS boundary.
+				// Re-list on the next pass instead of degrading the controller.
+				continue
+			}
 			return err
 		}
 		if issue != nil {
