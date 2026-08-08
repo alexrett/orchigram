@@ -554,6 +554,19 @@ func (s *Store) CompleteOutbox(ctx context.Context, id int64) error {
 	return err
 }
 
+// CompleteStartIfRunCancelled suppresses a claimed start after cancellation.
+// The conditional update is the serialization point with cancellation: when it
+// does not complete the command, the outbox remains capable of starting the
+// workflow until the normal dispatch path completes it.
+func (s *Store) CompleteStartIfRunCancelled(ctx context.Context, id int64, runUID string) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE outbox SET state='completed',completed_at=?,last_error='' WHERE id=? AND command_type='start-run' AND aggregate_uid=? AND EXISTS (SELECT 1 FROM run_cancellations WHERE run_uid=?)`, s.timestamp(), id, runUID, runUID)
+	if err != nil {
+		return false, err
+	}
+	updated, err := result.RowsAffected()
+	return updated == 1, err
+}
+
 // RetryOutbox records an error and makes the command available later.
 func (s *Store) RetryOutbox(ctx context.Context, id int64, cause error, delay time.Duration) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE outbox SET state='pending',available_at=?,last_error=? WHERE id=?`, s.now().UTC().Add(delay).Format(time.RFC3339Nano), cause.Error(), id)
@@ -753,6 +766,19 @@ func (s *Store) UndeliveredRunCancellations(ctx context.Context, limit int) ([]R
 func (s *Store) MarkRunCancellationDelivered(ctx context.Context, runUID string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE run_cancellations SET delivery_completed=1,delivered_at=? WHERE run_uid=?`, s.timestamp(), runUID)
 	return err
+}
+
+// MarkRunCancellationDeliveredIfStartImpossible acknowledges a missing
+// workflow only after every durable start command for the Run is completed.
+// Keeping the predicate in the update prevents an outbox/cancellation race
+// from losing the cancellation intent.
+func (s *Store) MarkRunCancellationDeliveredIfStartImpossible(ctx context.Context, runUID string) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE run_cancellations SET delivery_completed=1,delivered_at=? WHERE run_uid=? AND delivery_completed=0 AND NOT EXISTS (SELECT 1 FROM outbox WHERE command_type='start-run' AND aggregate_uid=? AND state!='completed')`, s.timestamp(), runUID, runUID)
+	if err != nil {
+		return false, err
+	}
+	updated, err := result.RowsAffected()
+	return updated == 1, err
 }
 
 // RunEvent is an operator-visible durable transition.

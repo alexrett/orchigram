@@ -59,14 +59,15 @@ type ApprovalSignal struct {
 
 // Adapter runs one stable data-driven interpreter on go-workflows.
 type Adapter struct {
-	backend backend.Backend
-	client  *workflowClient.Client
-	worker  *worker.Worker
-	store   *store.Store
-	cancel  context.CancelFunc
-	done    chan error
-	runs    runCanceler
-	once    sync.Once
+	backend   backend.Backend
+	client    *workflowClient.Client
+	worker    *worker.Worker
+	store     *store.Store
+	cancel    context.CancelFunc
+	done      chan error
+	runs      runCanceler
+	lifecycle sync.Mutex
+	once      sync.Once
 }
 
 // Open starts the go-workflows worker against its private SQLite history database.
@@ -113,14 +114,23 @@ func Open(ctx context.Context, workflowDBPath string, state *store.Store, execut
 
 // Start idempotently starts a pinned interpreter instance.
 func (a *Adapter) Start(ctx context.Context, runUID string, plan flow.ExecutionPlan, input json.RawMessage) error {
+	a.lifecycle.Lock()
+	defer a.lifecycle.Unlock()
+	run, err := a.store.GetRun(ctx, runUID)
+	if err != nil {
+		return err
+	}
+	if run.Phase == "cancelled" {
+		return nil
+	}
 	if _, err := a.findInstance(ctx, runUID); err == nil {
 		return nil
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return err
 	}
-	_, err := a.client.CreateWorkflowInstance(ctx, workflowClient.WorkflowInstanceOptions{InstanceID: runUID}, workflowName, runUID, plan, input)
+	_, err = a.client.CreateWorkflowInstance(ctx, workflowClient.WorkflowInstanceOptions{InstanceID: runUID}, workflowName, runUID, plan, input)
 	if err == nil {
-		return nil
+		return a.cancelCreatedRunIfRequested(ctx, runUID)
 	}
 	// A crash/retry can race after durable workflow creation. Reconcile by identity.
 	if _, findErr := a.findInstance(ctx, runUID); findErr == nil {
@@ -136,6 +146,8 @@ func (a *Adapter) Signal(ctx context.Context, runUID, nodeID string, signal Appr
 
 // Cancel cancels a workflow instance after the daemon records operator intent.
 func (a *Adapter) Cancel(ctx context.Context, runUID, reason string) error {
+	a.lifecycle.Lock()
+	defer a.lifecycle.Unlock()
 	var providerErr error
 	if a.runs != nil {
 		providerErr = a.runs.CancelRun(ctx, runUID, reason)
@@ -148,6 +160,21 @@ func (a *Adapter) Cancel(ctx context.Context, runUID, reason string) error {
 		return err
 	}
 	return errors.Join(providerErr, a.client.CancelWorkflowInstance(ctx, instance))
+}
+
+func (a *Adapter) cancelCreatedRunIfRequested(ctx context.Context, runUID string) error {
+	run, err := a.store.GetRun(ctx, runUID)
+	if err != nil {
+		return err
+	}
+	if run.Phase != "cancelled" {
+		return nil
+	}
+	instance, err := a.findInstance(ctx, runUID)
+	if err != nil {
+		return err
+	}
+	return a.client.CancelWorkflowInstance(ctx, instance)
 }
 
 // Reconcile redelivers durable decisions not yet acknowledged by the engine boundary.
@@ -170,8 +197,15 @@ func (a *Adapter) Reconcile(ctx context.Context) error {
 		return err
 	}
 	for _, cancellation := range cancellations {
-		if err := a.Cancel(ctx, cancellation.RunUID, cancellation.Reason); err != nil && !errors.Is(err, store.ErrNotFound) {
-			return fmt.Errorf("redeliver cancellation %s: %w", cancellation.RunUID, err)
+		if err := a.Cancel(ctx, cancellation.RunUID, cancellation.Reason); err != nil {
+			if !errors.Is(err, store.ErrNotFound) {
+				return fmt.Errorf("redeliver cancellation %s: %w", cancellation.RunUID, err)
+			}
+			_, markErr := a.store.MarkRunCancellationDeliveredIfStartImpossible(ctx, cancellation.RunUID)
+			if markErr != nil {
+				return markErr
+			}
+			continue
 		}
 		if err := a.store.MarkRunCancellationDelivered(ctx, cancellation.RunUID); err != nil {
 			return err

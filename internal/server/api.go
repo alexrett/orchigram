@@ -351,8 +351,15 @@ func (a *API) Cancel(ctx context.Context, request *controlv1alpha1.CancelRunRequ
 	if err := a.store.RequestRunCancellation(ctx, request.GetRunUid(), request.GetReason()); err != nil {
 		return nil, rpcError(err)
 	}
-	if err := a.engine.Cancel(ctx, request.GetRunUid(), request.GetReason()); err != nil && !errors.Is(err, store.ErrNotFound) {
-		// Intent remains durable and engine reconciliation redelivers it.
+	if err := a.engine.Cancel(ctx, request.GetRunUid(), request.GetReason()); err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			// Intent remains durable and engine reconciliation redelivers it.
+			return &emptypb.Empty{}, nil
+		}
+		_, markErr := a.store.MarkRunCancellationDeliveredIfStartImpossible(ctx, request.GetRunUid())
+		if markErr != nil {
+			return nil, rpcError(markErr)
+		}
 		return &emptypb.Empty{}, nil
 	}
 	if err := a.store.MarkRunCancellationDelivered(ctx, request.GetRunUid()); err != nil {

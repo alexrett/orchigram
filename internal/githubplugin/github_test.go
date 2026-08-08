@@ -122,7 +122,8 @@ func TestCommentAndPullRequestReconcileByIdempotencyMarker(t *testing.T) {
 		case request.URL.Path == "/repos/acme/widget/pulls" && request.Method == http.MethodPost:
 			var body map[string]any
 			_ = json.NewDecoder(request.Body).Decode(&body)
-			created := map[string]any{"number": 7, "html_url": "https://example.invalid/pull/7", "body": body["body"], "head": map[string]any{"ref": body["head"]}}
+			number := len(pulls) + 7
+			created := map[string]any{"number": number, "html_url": fmt.Sprintf("https://example.invalid/pull/%d", number), "body": body["body"], "head": map[string]any{"ref": body["head"]}}
 			pulls = append(pulls, created)
 			writer.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(writer).Encode(created)
@@ -168,12 +169,30 @@ func TestCommentAndPullRequestReconcileByIdempotencyMarker(t *testing.T) {
 	}
 	distinctPull := pullRequest
 	distinctPull.IdempotencyKey = "stable/iteration-2"
+	var distinctConfig map[string]any
+	if err := json.Unmarshal(distinctPull.Config, &distinctConfig); err != nil {
+		t.Fatal(err)
+	}
+	distinctConfig["head"] = "orchigram/issue-42-iteration-2"
+	distinctPull.Config, err = json.Marshal(distinctConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
 	thirdPull, err := runtime.ensurePullRequest(context.Background(), distinctPull)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(pulls) != 2 || thirdPull.(map[string]any)["reconciled"] != false {
 		t.Fatalf("distinct-key pulls=%+v third=%+v", pulls, thirdPull)
+	}
+	sameBranch := distinctPull
+	sameBranch.IdempotencyKey = "stable/iteration-3"
+	fourthPull, err := runtime.ensurePullRequest(context.Background(), sameBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pulls) != 2 || fourthPull.(map[string]any)["reconciled"] != true || fourthPull.(map[string]any)["number"] != 8 {
+		t.Fatalf("same-branch pulls=%+v fourth=%+v", pulls, fourthPull)
 	}
 }
 

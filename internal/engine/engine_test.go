@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -211,6 +212,38 @@ func TestCancellationDeliveryReconcilesAfterEngineRestart(t *testing.T) {
 	run, err := state.GetRun(ctx, payload.RunUID)
 	if err != nil || run.Phase != "cancelled" {
 		t.Fatalf("run=%+v err=%v", run, err)
+	}
+}
+
+func TestStartSuppressesRunCancelledBeforeWorkflowCreation(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	state, err := store.Open(filepath.Join(root, "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	adapter, err := Open(ctx, filepath.Join(root, "workflows.sqlite"), state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = adapter.Close() }()
+	plan := flow.ExecutionPlan{
+		FlowUID: "flow-cancel-before-start", FlowGeneration: 1, InterpreterVersion: flow.InterpreterVersion, PlanHash: "cancel-before-start-plan",
+		Nodes: []flow.PlanNode{{ID: "effect", Uses: "core.noop", Timeout: "30s", RetryBackoff: "10ms"}},
+	}
+	payload := store.StartPayload{RunUID: "run-cancel-before-start", Input: json.RawMessage(`{}`)}
+	if _, err := state.EnsureRun(ctx, payload, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.RequestRunCancellation(ctx, payload.RunUID, "cancel before start"); err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Start(ctx, payload.RunUID, plan, payload.Input); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.findInstance(ctx, payload.RunUID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("cancelled run created a workflow instance: %v", err)
 	}
 }
 

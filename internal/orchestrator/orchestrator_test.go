@@ -108,6 +108,80 @@ func TestCrashBoundariesRecoverOnePinnedRun(t *testing.T) {
 	}
 }
 
+func TestCancelBeforeStartSuppressesOutboxAndReconcilesTerminalRun(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	state, err := store.Open(filepath.Join(root, "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	durable, err := engine.Open(ctx, filepath.Join(root, "workflows.sqlite"), state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = durable.Close() }()
+	applyFlow(ctx, t, state, `
+    - {id: effect, uses: core.noop}
+`, "", 0)
+	control := New(state, flow.NewCompiler(nil), durable)
+	receipt, err := control.StartManual(ctx, "demo", "default", json.RawMessage(`{}`), "cancel-before-start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("stop after ensuring run")
+	control.SetFaultHook(func(boundary Boundary) error {
+		if boundary == BoundaryAfterRun {
+			return injected
+		}
+		return nil
+	})
+	if err := control.ReconcileOne(ctx); !errors.Is(err, injected) {
+		t.Fatalf("initial outbox processing: %v", err)
+	}
+	if err := state.RequestRunCancellation(ctx, receipt.RunUID, "cancel before workflow start"); err != nil {
+		t.Fatal(err)
+	}
+	if err := durable.Cancel(ctx, receipt.RunUID, "cancel before workflow start"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("cancel missing workflow: %v", err)
+	}
+	pending, err := state.UndeliveredRunCancellations(ctx, 100)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("cancellation was acknowledged while start remained possible: pending=%+v err=%v", pending, err)
+	}
+
+	control.SetFaultHook(nil)
+	control.claimStaleAfter = 0
+	time.Sleep(time.Millisecond)
+	if err := control.ReconcileOne(ctx); err != nil {
+		t.Fatalf("cancelled outbox processing: %v", err)
+	}
+	if err := durable.Reconcile(ctx); err != nil {
+		t.Fatalf("cancellation reconciliation: %v", err)
+	}
+	pending, err = state.UndeliveredRunCancellations(ctx, 100)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("cancellation remained pending after start suppression: pending=%+v err=%v", pending, err)
+	}
+	run, err := state.GetRun(ctx, receipt.RunUID)
+	if err != nil || run.Phase != "cancelled" {
+		t.Fatalf("run=%+v err=%v", run, err)
+	}
+	events, err := state.RunEventsAfter(ctx, receipt.RunUID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Type == "node.started" || event.Type == "node.completed" {
+			t.Fatalf("cancelled run executed node event %q", event.Type)
+		}
+	}
+	if _, err := state.ClaimStart(ctx, time.Hour); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("durable start remained claimable: %v", err)
+	}
+}
+
 func applyFlow(ctx context.Context, t *testing.T, state *store.Store, nodes, edges string, expected uint64) resource.Document {
 	t.Helper()
 	doc, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1

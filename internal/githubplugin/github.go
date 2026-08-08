@@ -432,7 +432,7 @@ func (r *Runtime) ensurePullRequest(ctx context.Context, request pluginsdk.TaskR
 		next = nextLink(headers.Get("Link"))
 	}
 	for _, pull := range pulls {
-		if strings.Contains(pull.Body, marker) {
+		if strings.Contains(pull.Body, marker) || pull.Head.Ref == config.Head {
 			return map[string]any{"number": pull.Number, "url": pull.HTMLURL, "reconciled": true, "marker": marker}, nil
 		}
 	}
