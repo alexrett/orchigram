@@ -27,6 +27,8 @@ import (
 	"github.com/alexrett/orchigram/internal/resource"
 	"github.com/alexrett/orchigram/internal/store"
 	pluginsdk "github.com/alexrett/orchigram/sdk/plugin"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -134,6 +136,20 @@ spec:
 			t.Fatalf("%s raw artifact leak: %q err=%v", profileType, artifact, readErr)
 		}
 	}
+	applyResource(t, state, `apiVersion: orchigram.dev/v1alpha1
+kind: AgentProfile
+metadata: {name: fake-failure}
+spec:
+  type: command
+  executable: /bin/sh
+  args: ["-c", "echo expected-agent-failure >&2; exit 17"]
+`)
+	_, failureErr := manager.Execute(context.Background(), "run-agent-failure", flow.PlanNode{
+		ID: "agent", Uses: "agent-command.run", Timeout: "10s", With: map[string]any{"profile": "fake-failure"},
+	}, json.RawMessage(`{"prompt":"conformance"}`), nil, "stable-agent-failure")
+	if failureErr == nil || !strings.Contains(failureErr.Error(), "process exited with status 17") || strings.Contains(failureErr.Error(), "did not end immediately") {
+		t.Fatalf("agent failure diagnostic=%v", failureErr)
+	}
 
 	seenKeys := []string{}
 	seenBodies := []string{}
@@ -216,11 +232,12 @@ spec: {backend: env, key: ORCHIGRAM_TEST_GITHUB_PROVIDER_TOKEN}
 	providerContext, stopProvider := context.WithCancel(context.Background())
 	providerAccepted := make(chan *pluginv1alpha1.TriggerEvent, 1)
 	providerDone := make(chan error, 1)
+	providerActivation := time.Date(2026, 8, 8, 10, 0, 30, 0, time.UTC)
 	go func() {
 		providerDone <- manager.WatchTrigger(providerContext, "github", "trigger-fixture", map[string]any{
 			"owner": "acme", "repository": "widget", "apiBase": providerServer.URL, "label": "orchigram:ready", "pollInterval": "1h", "tokenSecret": "token",
 			"secretRefs": map[string]any{"token": "github-provider-token"},
-		}, "", func(event *pluginv1alpha1.TriggerEvent) error {
+		}, "", providerActivation, func(event *pluginv1alpha1.TriggerEvent) error {
 			providerAccepted <- event
 			return nil
 		})
@@ -454,15 +471,73 @@ func TestMalformedStreamIsRejected(t *testing.T) {
 	if err != nil || string(output) != `{"ok":true}` {
 		t.Fatalf("valid stream output=%s err=%v", output, err)
 	}
+	_, err = manager.consume(context.Background(), runArtifact{runUID: "run", nodeID: "node", attempt: 1}, &fakeReceiver{
+		events: []*pluginv1alpha1.ExecuteEvent{valid(1, "agent.failed", `{"outcome":"exited"}`)},
+		endErr: errors.New("process exited with status 17"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "plugin reported agent.failed") || !strings.Contains(err.Error(), "status 17") {
+		t.Fatalf("failed terminal diagnostic=%v", err)
+	}
+	_, err = manager.consume(context.Background(), runArtifact{runUID: "run", nodeID: "node", attempt: 1}, &fakeReceiver{
+		events: []*pluginv1alpha1.ExecuteEvent{valid(1, "agent.completed", `{}`)},
+		endErr: errors.New("transport reset"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "did not end immediately") {
+		t.Fatalf("successful terminal transport failure=%v", err)
+	}
+	secret := []byte("terminal-secret-value")
+	_, err = manager.consume(context.Background(), runArtifact{runUID: "run", nodeID: "node", attempt: 1, redactions: [][]byte{secret}}, &fakeReceiver{
+		events: []*pluginv1alpha1.ExecuteEvent{valid(1, "agent.failed", `{}`)},
+		endErr: status.Error(codes.Internal, "authentication failed for terminal-secret-value"),
+	})
+	if err == nil || status.Code(err) != codes.Internal || strings.Contains(err.Error(), string(secret)) || !strings.Contains(err.Error(), "[REDACTED]") {
+		t.Fatalf("redacted terminal diagnostic=%v", err)
+	}
+	doctorErr := drainDoctor(&fakeReceiver{
+		events: []*pluginv1alpha1.ExecuteEvent{valid(1, "agent.failed", `{}`)},
+		endErr: status.Error(codes.Internal, "authentication failed for terminal-secret-value"),
+	}, [][]byte{secret})
+	if doctorErr == nil || status.Code(doctorErr) != codes.Internal || strings.Contains(doctorErr.Error(), string(secret)) || !strings.Contains(doctorErr.Error(), "[REDACTED]") {
+		t.Fatalf("redacted doctor diagnostic=%v", doctorErr)
+	}
+}
+
+func TestProviderBootstrapRequiresActivationFenceCapability(t *testing.T) {
+	t.Parallel()
+	activation := time.Date(2026, 8, 8, 10, 0, 0, 0, time.UTC)
+	oldRecord := store.PluginRecord{Name: "github", ManifestJSON: json.RawMessage(`{"capabilities":["trigger.github.issues"]}`)}
+	if err := validateProviderBootstrap(oldRecord, "", time.Time{}, map[string]any{}); err == nil || !strings.Contains(err.Error(), "activation time is required") {
+		t.Fatalf("missing activation fence error=%v", err)
+	}
+	if err := validateProviderBootstrap(oldRecord, "", activation, map[string]any{}); err == nil || !strings.Contains(err.Error(), pluginsdk.ActivationFenceCapability) {
+		t.Fatalf("old provider bootstrap error=%v", err)
+	}
+	if err := validateProviderBootstrap(oldRecord, "77", activation, map[string]any{}); err != nil {
+		t.Fatalf("persisted cursor should not require activation fence: %v", err)
+	}
+	if err := validateProviderBootstrap(oldRecord, "", activation, map[string]any{"replayExisting": true}); err != nil {
+		t.Fatalf("explicit replay should allow an old provider: %v", err)
+	}
+	if err := validateProviderBootstrap(oldRecord, "", time.Time{}, map[string]any{"replayExisting": true}); err != nil {
+		t.Fatalf("explicit replay should allow a missing activation time: %v", err)
+	}
+	newRecord := store.PluginRecord{Name: "github", ManifestJSON: json.RawMessage(`{"capabilities":["trigger.github.issues","trigger.bootstrap.activation-fence"]}`)}
+	if err := validateProviderBootstrap(newRecord, "", activation, map[string]any{}); err != nil {
+		t.Fatalf("activation-fence provider bootstrap: %v", err)
+	}
 }
 
 type fakeReceiver struct {
 	events []*pluginv1alpha1.ExecuteEvent
 	index  int
+	endErr error
 }
 
 func (f *fakeReceiver) Recv() (*pluginv1alpha1.ExecuteEvent, error) {
 	if f.index >= len(f.events) {
+		if f.endErr != nil {
+			return nil, f.endErr
+		}
 		return nil, io.EOF
 	}
 	event := f.events[f.index]

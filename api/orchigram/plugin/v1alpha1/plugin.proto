@@ -42,7 +42,13 @@ message ExecuteEvent {
 message CancelRequest { CallMeta meta = 1; string reason = 2; }
 message CancelResponse { bool accepted = 1; string outcome = 2; }
 
-message WatchStart { string installation_uid = 1; string cursor = 2; bytes config_json = 3; map<string, bytes> secrets = 4; }
+message WatchStart {
+  string installation_uid = 1;
+  string cursor = 2;
+  bytes config_json = 3;
+  map<string, bytes> secrets = 4;
+  google.protobuf.Timestamp activated_at = 5;
+}
 message TriggerAck { string provider_event_id = 1; string cursor = 2; }
 message TriggerCommand { oneof value { WatchStart start = 1; TriggerAck ack = 2; } }
 message TriggerEvent { string provider_event_id = 1; string cursor = 2; google.protobuf.Timestamp occurred_at = 3; bytes payload_json = 4; }
@@ -68,4 +74,3 @@ service AgentRuntime {
   rpc Input(AgentInput) returns (google.protobuf.Empty);
   rpc Cancel(CancelRequest) returns (CancelResponse);
 }
-

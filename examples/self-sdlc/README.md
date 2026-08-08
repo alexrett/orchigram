@@ -33,3 +33,10 @@ and creates or reconciles a pull request.
 The flow never pushes the default branch, never merges, and never bypasses
 human pull-request review. Rejecting approval prevents implementation, testing,
 push, and pull-request creation.
+
+Create and apply the Trigger before adding the label. A new subscription uses
+its durable activation timestamp plus a bounded one-minute clock-skew overlap
+and ignores older matching repository events unless
+`provider.config.replayExisting` is explicitly set to `true`. Stable GitHub
+event IDs deduplicate the overlap. Once the first event is acknowledged, the
+current Trigger generation's persisted provider cursor owns restart replay.

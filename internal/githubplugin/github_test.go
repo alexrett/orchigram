@@ -10,8 +10,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	pluginv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/plugin/v1alpha1"
 	pluginsdk "github.com/alexrett/orchigram/sdk/plugin"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func TestIssueEventWithoutEmbeddedIssueOrURLIsRejected(t *testing.T) {
@@ -21,7 +26,7 @@ func TestIssueEventWithoutEmbeddedIssueOrURLIsRejected(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
 	})}
 	runtime := &Runtime{Client: client}
-	_, err := runtime.listReadyEvents(context.Background(), watchConfig{repositoryConfig: repositoryConfig{Owner: "acme", Repository: "widget", APIBase: "https://api.example.invalid", TokenSecret: "token"}, Label: "orchigram:ready"}, []byte("fixture-token"), 0)
+	_, err := runtime.listReadyEvents(context.Background(), watchConfig{repositoryConfig: repositoryConfig{Owner: "acme", Repository: "widget", APIBase: "https://api.example.invalid", TokenSecret: "token"}, Label: "orchigram:ready"}, []byte("fixture-token"), 0, time.Time{})
 	if err == nil || !strings.Contains(err.Error(), "neither an embedded issue nor issue_url") {
 		t.Fatalf("provider error=%v", err)
 	}
@@ -72,7 +77,7 @@ func TestPollingFixturesCoverPaginationRateLimitAndStableOrder(t *testing.T) {
 	}))
 	defer server.Close()
 	runtime := &Runtime{Client: server.Client()}
-	events, err := runtime.listReadyEvents(context.Background(), watchConfig{repositoryConfig: repositoryConfig{Owner: "acme", Repository: "widget", APIBase: server.URL, TokenSecret: "token"}, Label: "orchigram:ready"}, []byte("fixture-token"), 10)
+	events, err := runtime.listReadyEvents(context.Background(), watchConfig{repositoryConfig: repositoryConfig{Owner: "acme", Repository: "widget", APIBase: server.URL, TokenSecret: "token"}, Label: "orchigram:ready"}, []byte("fixture-token"), 10, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,6 +89,81 @@ func TestPollingFixturesCoverPaginationRateLimitAndStableOrder(t *testing.T) {
 	}
 	if issueRequests != 1 {
 		t.Fatalf("issue detail requests=%d, expected only issue_url fallback", issueRequests)
+	}
+}
+
+func TestInitialSubscriptionFiltersEventsBeforeDurableActivation(t *testing.T) {
+	t.Parallel()
+	activation := time.Date(2026, 8, 8, 10, 30, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`[
+          {"id":101,"event":"labeled","created_at":"2026-08-08T10:00:00Z","label":{"name":"orchigram:ready"},"issue":{"number":1,"title":"historical","body":"old","state":"closed"}},
+          {"id":102,"event":"labeled","created_at":"2026-08-08T11:00:00Z","label":{"name":"orchigram:ready"},"issue":{"number":7,"title":"new","body":"release","state":"open"}}
+        ]`))
+	}))
+	defer server.Close()
+	runtime := &Runtime{Client: server.Client()}
+	config := watchConfig{repositoryConfig: repositoryConfig{Owner: "acme", Repository: "widget", APIBase: server.URL, TokenSecret: "token"}, Label: "orchigram:ready"}
+	events, err := runtime.listReadyEvents(context.Background(), config, []byte("fixture-token"), 0, activation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].ID != 102 || events[0].Issue.Number != 7 {
+		t.Fatalf("initial events=%+v", events)
+	}
+	replayed, err := runtime.listReadyEvents(context.Background(), config, []byte("fixture-token"), 0, time.Time{})
+	if err != nil || len(replayed) != 2 {
+		t.Fatalf("explicit replay events=%+v err=%v", replayed, err)
+	}
+}
+
+func TestInitialSubscriptionUsesBoundedOverlapForSecondPrecisionAndClockSkew(t *testing.T) {
+	t.Parallel()
+	activation := time.Date(2026, 8, 8, 10, 30, 0, 900_000_000, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`[
+          {"id":201,"event":"labeled","created_at":"2026-08-08T10:28:59Z","label":{"name":"orchigram:ready"},"issue":{"number":1,"title":"outside overlap","state":"open"}},
+          {"id":202,"event":"labeled","created_at":"2026-08-08T10:29:30Z","label":{"name":"orchigram:ready"},"issue":{"number":2,"title":"clock skew","state":"open"}},
+          {"id":203,"event":"labeled","created_at":"2026-08-08T10:30:00Z","label":{"name":"orchigram:ready"},"issue":{"number":3,"title":"same second","state":"open"}}
+        ]`))
+	}))
+	defer server.Close()
+	runtime := &Runtime{Client: server.Client()}
+	config := watchConfig{repositoryConfig: repositoryConfig{Owner: "acme", Repository: "widget", APIBase: server.URL, TokenSecret: "token"}, Label: "orchigram:ready"}
+	events, err := runtime.listReadyEvents(context.Background(), config, []byte("fixture-token"), 0, activation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].ID != 202 || events[1].ID != 203 {
+		t.Fatalf("overlap events=%+v", events)
+	}
+}
+
+func TestProviderActivationFailsClosedForOlderHost(t *testing.T) {
+	t.Parallel()
+	if _, err := providerActivation(&pluginv1alpha1.WatchStart{}, false, 0); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("missing activation error=%v", err)
+	}
+	activation := time.Date(2026, 8, 8, 10, 30, 0, 0, time.UTC)
+	actual, err := providerActivation(&pluginv1alpha1.WatchStart{ActivatedAt: timestamppb.New(activation)}, false, 0)
+	if err != nil || !actual.Equal(activation) {
+		t.Fatalf("activation=%s err=%v", actual, err)
+	}
+	for name, test := range map[string]struct {
+		replay bool
+		cursor int64
+	}{
+		"explicit replay": {replay: true},
+		"durable cursor":  {cursor: 77},
+	} {
+		t.Run(name, func(t *testing.T) {
+			actual, err := providerActivation(&pluginv1alpha1.WatchStart{}, test.replay, test.cursor)
+			if err != nil || !actual.IsZero() {
+				t.Fatalf("activation=%s err=%v", actual, err)
+			}
+		})
 	}
 }
 

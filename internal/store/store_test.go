@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -168,6 +169,273 @@ func TestTriggerReceiptAndOutboxAreDeduplicated(t *testing.T) {
 	if _, err := s.ClaimStart(ctx, time.Hour); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("second command: %v", err)
 	}
+}
+
+func TestTriggerApplyPersistsActivationAndScopesProviderCursorToGeneration(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openTestStore(t)
+	firstActivation := time.Date(2026, 8, 8, 10, 0, 0, 123, time.UTC)
+	s.now = func() time.Time { return firstActivation }
+	document, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata: {name: ready-issues}
+spec:
+  flow: issue-to-pr
+  provider: {plugin: github, config: {repository: first}}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := s.Apply(ctx, document, ApplyOptions{RequestID: "create-trigger"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := s.TriggerState(ctx, created.Metadata.UID)
+	if err != nil || state.Generation != 1 || !state.CursorAt.Equal(firstActivation) {
+		t.Fatalf("initial trigger state=%+v err=%v", state, err)
+	}
+	if _, err := s.AcceptProviderTrigger(ctx, created.Metadata.UID, created.Metadata.Generation, "event-10", "issue-to-pr", "default", json.RawMessage(`{"issue":10}`), "10"); err != nil {
+		t.Fatal(err)
+	}
+
+	secondActivation := firstActivation.Add(time.Hour)
+	s.now = func() time.Time { return secondActivation }
+	updatedDocument, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata:
+  name: ready-issues
+  resourceVersion: 1
+spec:
+  flow: issue-to-pr
+  provider: {plugin: github, config: {repository: second}}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := s.Apply(ctx, updatedDocument, ApplyOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = s.TriggerState(ctx, created.Metadata.UID)
+	if err != nil || updated.Metadata.Generation != 2 || state.Generation != 2 || !state.CursorAt.Equal(secondActivation) {
+		t.Fatalf("updated trigger=%+v state=%+v err=%v", updated.Metadata, state, err)
+	}
+	cursor, eventID, err := s.ProviderCursor(ctx, created.Metadata.UID)
+	if err != nil || cursor != "" || eventID != "" {
+		t.Fatalf("generation retained provider cursor=%q event=%q err=%v", cursor, eventID, err)
+	}
+	if _, err := s.EnsureTriggerState(ctx, created.Metadata.UID, created.Metadata.Generation, true, secondActivation.Add(time.Minute)); err == nil {
+		t.Fatal("superseded controller watch rolled Trigger state backward")
+	} else {
+		var stale *StaleTriggerGenerationError
+		if !errors.As(err, &stale) || stale.Expected != 1 || stale.Current != 2 {
+			t.Fatalf("stale controller state error=%v", err)
+		}
+	}
+
+	if _, err := s.AcceptProviderTrigger(ctx, created.Metadata.UID, created.Metadata.Generation, "stale-event", "issue-to-pr", "default", json.RawMessage(`{"issue":19}`), "19"); err == nil {
+		t.Fatal("superseded provider watch mutated the new Trigger generation")
+	} else {
+		var stale *StaleTriggerGenerationError
+		if !errors.As(err, &stale) || stale.Expected != 1 || stale.Current != 2 {
+			t.Fatalf("stale provider error=%v", err)
+		}
+	}
+	if _, err := s.AcceptProviderTrigger(ctx, created.Metadata.UID, updated.Metadata.Generation, "event-20", "issue-to-pr", "default", json.RawMessage(`{"issue":20}`), "20"); err != nil {
+		t.Fatal(err)
+	}
+	noOp, err := s.Apply(ctx, updated, ApplyOptions{})
+	if err != nil || noOp.Metadata.Generation != 2 {
+		t.Fatalf("no-op trigger apply=%+v err=%v", noOp.Metadata, err)
+	}
+	cursor, eventID, err = s.ProviderCursor(ctx, created.Metadata.UID)
+	if err != nil || cursor != "20" || eventID != "event-20" {
+		t.Fatalf("no-op apply reset provider cursor=%q event=%q err=%v", cursor, eventID, err)
+	}
+}
+
+func TestProviderAcceptanceRequiresExistingEnabledTrigger(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openTestStore(t)
+	trigger := applyStoreTrigger(t, s, "provider-acceptance")
+	if _, err := s.AcceptProviderTrigger(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, "event-1", "target", "default", json.RawMessage(`{"issue":1}`), "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetTriggerEnabled(ctx, trigger.Metadata.UID, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptProviderTrigger(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, "event-2", "target", "default", json.RawMessage(`{"issue":2}`), "2"); !errors.Is(err, ErrTriggerDisabled) {
+		t.Fatalf("disabled Trigger acceptance error=%v", err)
+	}
+	if _, err := s.AcceptProviderTrigger(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, "event-1", "target", "default", json.RawMessage(`{"issue":1}`), "2"); !errors.Is(err, ErrTriggerDisabled) {
+		t.Fatalf("disabled Trigger duplicate error=%v", err)
+	}
+	cursor, eventID, err := s.ProviderCursor(ctx, trigger.Metadata.UID)
+	if err != nil || cursor != "1" || eventID != "event-1" {
+		t.Fatalf("disabled Trigger advanced cursor=%q event=%q err=%v", cursor, eventID, err)
+	}
+	receipts, err := s.TriggerReceipts(ctx, trigger.Metadata.UID, 10)
+	if err != nil || len(receipts) != 1 || receipts[0].OccurrenceID != "event-1" {
+		t.Fatalf("disabled Trigger persisted receipts=%+v err=%v", receipts, err)
+	}
+
+	deleted := applyStoreTrigger(t, s, "provider-deletion")
+	if _, err := s.AcceptProviderTrigger(ctx, deleted.Metadata.UID, deleted.Metadata.Generation, "event-before-delete", "target", "default", json.RawMessage(`{"issue":3}`), "3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Delete(ctx, "Trigger", deleted.Metadata.Namespace, deleted.Metadata.Name, deleted.Metadata.ResourceVersion, "delete-trigger"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptProviderTrigger(ctx, deleted.Metadata.UID, deleted.Metadata.Generation, "event-after-delete", "target", "default", json.RawMessage(`{"issue":4}`), "4"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted Trigger acceptance error=%v", err)
+	}
+	if _, err := s.TriggerState(ctx, deleted.Metadata.UID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted Trigger retained state: %v", err)
+	}
+	if cursor, eventID, err := s.ProviderCursor(ctx, deleted.Metadata.UID); err != nil || cursor != "" || eventID != "" {
+		t.Fatalf("deleted Trigger retained provider cursor=%q event=%q err=%v", cursor, eventID, err)
+	}
+	receipts, err = s.TriggerReceipts(ctx, deleted.Metadata.UID, 10)
+	if err != nil || len(receipts) != 1 || receipts[0].OccurrenceID != "event-before-delete" {
+		t.Fatalf("deleted Trigger persisted receipts=%+v err=%v", receipts, err)
+	}
+}
+
+func TestProviderAcceptanceLinearizesWithTriggerMutations(t *testing.T) {
+	t.Parallel()
+	for _, mutation := range []string{"disable", "delete"} {
+		mutation := mutation
+		t.Run(mutation+"/acceptance-first", func(t *testing.T) {
+			s := openTestStore(t)
+			trigger := applyStoreTrigger(t, s, "race-acceptance-first-"+mutation)
+			validated, releaseAcceptance := make(chan struct{}), make(chan struct{})
+			acceptDone := make(chan error, 1)
+			go func() {
+				_, err := s.acceptProviderTrigger(context.Background(), trigger.Metadata.UID, trigger.Metadata.Generation, "race-event", "target", "default", json.RawMessage(`{"issue":1}`), "1", func() {
+					close(validated)
+					<-releaseAcceptance
+				})
+				acceptDone <- err
+			}()
+			<-validated
+
+			waitCount := s.db.Stats().WaitCount
+			mutationDone := make(chan error, 1)
+			go func() { mutationDone <- mutateTriggerForTest(s, trigger, mutation, nil) }()
+			waitForDatabaseWaiter(t, s, waitCount, mutationDone)
+			close(releaseAcceptance)
+			if err := <-acceptDone; err != nil {
+				t.Fatalf("acceptance-first event: %v", err)
+			}
+			if err := <-mutationDone; err != nil {
+				t.Fatalf("acceptance-first %s: %v", mutation, err)
+			}
+			assertProviderRaceState(t, s, trigger.Metadata.UID, mutation, true)
+		})
+
+		t.Run(mutation+"/mutation-first", func(t *testing.T) {
+			s := openTestStore(t)
+			trigger := applyStoreTrigger(t, s, "race-mutation-first-"+mutation)
+			mutated, releaseMutation := make(chan struct{}), make(chan struct{})
+			mutationDone := make(chan error, 1)
+			go func() {
+				mutationDone <- mutateTriggerForTest(s, trigger, mutation, func() {
+					close(mutated)
+					<-releaseMutation
+				})
+			}()
+			<-mutated
+
+			_, err := s.AcceptProviderTrigger(context.Background(), trigger.Metadata.UID, trigger.Metadata.Generation, "race-event", "target", "default", json.RawMessage(`{"issue":1}`), "1")
+			if mutation == "disable" && !errors.Is(err, ErrTriggerDisabled) {
+				t.Fatalf("mutation-first disabled Trigger acceptance error=%v", err)
+			}
+			if mutation == "delete" && !errors.Is(err, ErrNotFound) {
+				t.Fatalf("mutation-first deleted Trigger acceptance error=%v", err)
+			}
+			close(releaseMutation)
+			if err := <-mutationDone; err != nil {
+				t.Fatalf("mutation-first %s: %v", mutation, err)
+			}
+			assertProviderRaceState(t, s, trigger.Metadata.UID, mutation, false)
+		})
+	}
+}
+
+func mutateTriggerForTest(s *Store, trigger resource.Document, mutation string, afterCommit func()) error {
+	if mutation == "disable" {
+		return s.setTriggerEnabled(context.Background(), trigger.Metadata.UID, false, afterCommit)
+	}
+	return s.delete(context.Background(), "Trigger", trigger.Metadata.Namespace, trigger.Metadata.Name, trigger.Metadata.ResourceVersion, "race-delete", afterCommit)
+}
+
+func waitForDatabaseWaiter(t *testing.T, s *Store, previous int64, operationDone <-chan error) {
+	t.Helper()
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if s.db.Stats().WaitCount > previous {
+			return
+		}
+		select {
+		case err := <-operationDone:
+			t.Fatalf("Trigger mutation crossed the uncommitted provider acceptance: %v", err)
+		case <-deadline.C:
+			t.Fatal("Trigger mutation did not contend on the provider acceptance transaction")
+		case <-ticker.C:
+		}
+	}
+}
+
+func assertProviderRaceState(t *testing.T, s *Store, triggerUID, mutation string, accepted bool) {
+	t.Helper()
+	receipts, err := s.TriggerReceipts(context.Background(), triggerUID, 10)
+	if err != nil || len(receipts) != boolIntTest(accepted) {
+		t.Fatalf("%s accepted=%t receipts=%+v err=%v", mutation, accepted, receipts, err)
+	}
+	cursor, eventID, err := s.ProviderCursor(context.Background(), triggerUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mutation == "delete" || !accepted {
+		if cursor != "" || eventID != "" {
+			t.Fatalf("%s accepted=%t cursor=%q event=%q", mutation, accepted, cursor, eventID)
+		}
+		return
+	}
+	if cursor != "1" || eventID != "race-event" {
+		t.Fatalf("%s accepted=%t cursor=%q event=%q", mutation, accepted, cursor, eventID)
+	}
+}
+
+func boolIntTest(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func applyStoreTrigger(t *testing.T, s *Store, name string) resource.Document {
+	t.Helper()
+	document, err := resource.DecodeStrict([]byte(fmt.Sprintf(`apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata: {name: %s}
+spec:
+  flow: target
+  provider: {plugin: github, config: {repository: fixture}}
+`, name)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied, err := s.Apply(context.Background(), document, ApplyOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return applied
 }
 
 func TestPluginVersionsActivateAndRollbackWithoutOverwrite(t *testing.T) {

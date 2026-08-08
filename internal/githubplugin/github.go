@@ -28,8 +28,9 @@ import (
 )
 
 const (
-	defaultAPIBase = "https://api.github.com"
-	maxResponse    = 4 << 20
+	defaultAPIBase    = "https://api.github.com"
+	maxResponse       = 4 << 20
+	activationOverlap = time.Minute
 )
 
 // Capabilities are declared by the first-party GitHub bundle.
@@ -54,8 +55,9 @@ type repositoryConfig struct {
 
 type watchConfig struct {
 	repositoryConfig
-	Label        string `json:"label,omitempty"`
-	PollInterval string `json:"pollInterval,omitempty"`
+	Label          string `json:"label,omitempty"`
+	PollInterval   string `json:"pollInterval,omitempty"`
+	ReplayExisting bool   `json:"replayExisting,omitempty"`
 }
 
 type issueConfig struct {
@@ -219,8 +221,12 @@ func (r *Runtime) Watch(stream pluginv1alpha1.TriggerProvider_WatchServer) error
 	if err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
+	activatedAt, err := providerActivation(start, config.ReplayExisting, cursor)
+	if err != nil {
+		return err
+	}
 	for {
-		events, listErr := r.listReadyEvents(stream.Context(), config, token, cursor)
+		events, listErr := r.listReadyEvents(stream.Context(), config, token, cursor, activatedAt)
 		if listErr != nil {
 			return listErr
 		}
@@ -254,13 +260,34 @@ func (r *Runtime) Watch(stream pluginv1alpha1.TriggerProvider_WatchServer) error
 	}
 }
 
+func providerActivation(start *pluginv1alpha1.WatchStart, replayExisting bool, cursor int64) (time.Time, error) {
+	activatedAt := start.GetActivatedAt()
+	if activatedAt != nil && !activatedAt.IsValid() {
+		return time.Time{}, status.Error(codes.InvalidArgument, "activated_at must be a valid timestamp")
+	}
+	if replayExisting || cursor > 0 {
+		return time.Time{}, nil
+	}
+	if activatedAt == nil {
+		return time.Time{}, status.Error(codes.FailedPrecondition, "activated_at is required for an empty-cursor non-replay subscription")
+	}
+	return activatedAt.AsTime(), nil
+}
+
 type readyEvent struct {
 	ID        int64
 	CreatedAt time.Time
 	Issue     issue
 }
 
-func (r *Runtime) listReadyEvents(ctx context.Context, config watchConfig, token []byte, cursor int64) ([]readyEvent, error) {
+func (r *Runtime) listReadyEvents(ctx context.Context, config watchConfig, token []byte, cursor int64, activatedAt time.Time) ([]readyEvent, error) {
+	if !activatedAt.IsZero() {
+		// GitHub issue-event timestamps are second-precision and originate on a
+		// different clock. A bounded overlap prevents same-second or ordinary
+		// clock-skew loss within the one-minute bound; stable event IDs keep
+		// restart replay deduplicated.
+		activatedAt = activatedAt.UTC().Truncate(time.Second).Add(-activationOverlap)
+	}
 	base := apiBase(config.APIBase)
 	next := fmt.Sprintf("%s/repos/%s/%s/issues/events?per_page=100", base, url.PathEscape(config.Owner), url.PathEscape(config.Repository))
 	result := []readyEvent{}
@@ -272,7 +299,7 @@ func (r *Runtime) listReadyEvents(ctx context.Context, config watchConfig, token
 		}
 		next = nextLink(headers.Get("Link"))
 		for _, event := range events {
-			if event.ID <= cursor || event.Event != "labeled" || event.Label.Name != config.Label {
+			if event.ID <= cursor || event.Event != "labeled" || event.Label.Name != config.Label || (!activatedAt.IsZero() && event.CreatedAt.Before(activatedAt)) {
 				continue
 			}
 			var item issue

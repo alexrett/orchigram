@@ -423,7 +423,7 @@ spec:
   flow: scheduled-noop
   schedule: {cron: "* * * * *", timezone: UTC, startingDeadline: 1h, concurrencyPolicy: forbid}
 `)
-	if _, err := first.store.EnsureTriggerState(firstContext, triggerDocument.Metadata.UID, triggerDocument.Metadata.Generation, true, now.Add(-2*time.Minute)); err != nil {
+	if err := first.store.AdvanceTriggerCursor(firstContext, triggerDocument.Metadata.UID, now.Add(-2*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if err := first.triggers.ReconcileSchedules(firstContext, now); err != nil {

@@ -1,7 +1,11 @@
 // Package firstparty is the canonical catalog of plugins shipped with Orchigram.
 package firstparty
 
-import "sort"
+import (
+	"sort"
+
+	pluginsdk "github.com/alexrett/orchigram/sdk/plugin"
+)
 
 // Plugin describes one independently built first-party plugin.
 type Plugin struct {
@@ -14,7 +18,7 @@ var catalog = []Plugin{
 	{Name: "agent-command", Command: "orchigram-plugin-agent-command", Capabilities: []string{"agent.codex", "agent.claude", "agent.command"}},
 	{Name: "exec", Command: "orchigram-plugin-exec", Capabilities: []string{"task.exec.run"}},
 	{Name: "github", Command: "orchigram-plugin-github", Capabilities: []string{
-		"trigger.github.issues", "task.github.issue.get", "task.github.issue.comment",
+		"trigger.github.issues", pluginsdk.ActivationFenceCapability, "task.github.issue.get", "task.github.issue.comment",
 		"task.github.workspace.checkout", "task.github.workspace.commit-push", "task.github.pr.ensure",
 	}},
 	{Name: "http", Command: "orchigram-plugin-http", Capabilities: []string{"task.http.request"}},

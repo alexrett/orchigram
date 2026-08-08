@@ -23,7 +23,7 @@ var cronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month 
 
 // Provider watches one active TriggerProvider and acknowledges callback success.
 type Provider interface {
-	WatchTrigger(context.Context, string, string, map[string]any, string, func(*pluginv1alpha1.TriggerEvent) error) error
+	WatchTrigger(context.Context, string, string, map[string]any, string, time.Time, func(*pluginv1alpha1.TriggerEvent) error) error
 }
 
 type subscription struct {
@@ -222,13 +222,14 @@ func (c *Controller) syncProviders(ctx context.Context) {
 func (c *Controller) watchProvider(ctx context.Context, trigger resource.Trigger) {
 	backoff := time.Second
 	for ctx.Err() == nil {
+		state, stateErr := c.store.EnsureTriggerState(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, true, c.now())
 		cursor, _, err := c.store.ProviderCursor(ctx, trigger.Metadata.UID)
-		if err == nil {
-			_ = c.provider.WatchTrigger(ctx, trigger.Spec.Provider.Plugin, trigger.Metadata.UID, trigger.Spec.Provider.Config, cursor, func(event *pluginv1alpha1.TriggerEvent) error {
+		if stateErr == nil && err == nil {
+			_ = c.provider.WatchTrigger(ctx, trigger.Spec.Provider.Plugin, trigger.Metadata.UID, trigger.Spec.Provider.Config, cursor, state.CursorAt, func(event *pluginv1alpha1.TriggerEvent) error {
 				if event.GetProviderEventId() == "" || event.GetCursor() == "" || !json.Valid(event.GetPayloadJson()) {
 					return errors.New("provider event identity, cursor, and JSON payload are required")
 				}
-				_, acceptErr := c.store.AcceptProviderTrigger(ctx, trigger.Metadata.UID, event.GetProviderEventId(), trigger.Spec.Flow, trigger.Metadata.Namespace, event.GetPayloadJson(), event.GetCursor())
+				_, acceptErr := c.store.AcceptProviderTrigger(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, event.GetProviderEventId(), trigger.Spec.Flow, trigger.Metadata.Namespace, event.GetPayloadJson(), event.GetCursor())
 				return acceptErr
 			})
 		}
