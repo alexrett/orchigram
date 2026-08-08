@@ -3,6 +3,28 @@ kind: Flow
 metadata:
   name: self-sdlc-issue-to-pr
 spec:
+  inputSchema:
+    type: object
+    properties:
+      repository:
+        type: object
+        properties:
+          owner: {type: string}
+          name: {type: string}
+        required: [owner, name]
+        additionalProperties: false
+      issue:
+        type: object
+        properties:
+          number: {type: integer}
+          title: {type: string}
+          body: {type: string}
+          html_url: {type: string}
+          state: {type: string}
+        required: [number, title, body, html_url, state]
+        additionalProperties: false
+    required: [repository, issue]
+    additionalProperties: false
   policies:
     timeout: 3h
     maxParallel: 1

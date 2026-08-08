@@ -38,16 +38,28 @@ func (handler) Execute(ctx context.Context, request plugin.TaskRequest, sink plu
 
 func main() {
 	plugin.Serve(plugin.Config{
-		Metadata: plugin.Metadata{Name: "echo", Version: "0.1.0", Capabilities: []string{"task.echo.echo"}},
+		Metadata: plugin.Metadata{
+			Name: "echo", Version: "0.1.0",
+			Capabilities: []string{"task.echo.echo"},
+			Actions: []plugin.ActionDescriptor{{
+				Action: "echo.echo",
+				ConfigSchema: json.RawMessage(`{"type":"object","additionalProperties":false}`),
+				InputSchema: json.RawMessage(`{"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false}`),
+				OutputSchema: json.RawMessage(`{"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false}`),
+			}},
+		},
 		Task: handler{},
 	})
 }
 ```
 
-Metadata names, strict semantic versions, capabilities, and optional JSON input
-and output schemas are validated before serving. Capability namespaces are
-limited to `task`, `trigger`, and `agent`; task capabilities must use
-`task.<plugin-name>.<action>`. Every request includes action,
+Metadata names, strict semantic versions, capabilities, and action-specific
+Draft 2020-12 config/input/output schemas are validated before serving. Every
+declared task action requires exactly one descriptor; agent runtimes declare
+`<plugin-name>.run`. Missing, duplicate, malformed, externally referenced, or
+capability-mismatched descriptors fail before the process serves. Capability
+namespaces are limited to `task`, `trigger`, and `agent`; task capabilities must
+use `task.<plugin-name>.<action>`. Every request includes action,
 input/config JSON, operation-scoped secrets, request/run/node/attempt identity,
 a stable idempotency key, and a deadline. Honor `ctx.Done()` promptly. External
 effects are at-least-once, so reconcile repeated idempotency keys instead of
@@ -56,12 +68,21 @@ duplicating effects. Never emit or persist secret values.
 The SDK negotiates protocol v1, assigns timestamps and gap-free sequences,
 rejects author terminal events, emits exactly one `task.completed` or
 `task.failed`, maps `Cancel` to the active handler context, and drains active
-work only until the shutdown deadline. Advanced trigger or agent providers may
+work only until the shutdown deadline. It applies the complete declared schema
+to config and input before calling a task handler and validates the handler's
+terminal output before publishing it. Advanced trigger or agent providers may
 implement the public generated `gen/orchigram/plugin/v1alpha1`
 `TriggerProviderServer` or `AgentRuntimeServer` and pass it in `Config.Trigger`
 or `Config.Agent`. Trigger watches participate in the same shutdown admission,
 cancellation, and drain accounting. Daemon, resource, bundle, and
 workflow-engine internals are not public APIs.
+
+The daemon canonicalizes and stores the negotiated contract with the immutable
+plugin installation. Enable and later process restarts must reproduce the same
+contract digest. Flow compilation pins the selected action schemas into the
+execution plan; activation changes cannot alter an accepted run. The supported
+static-analysis subset and warning behavior are documented in
+[`flow-contracts.md`](flow-contracts.md).
 
 A provider that honors `WatchStart.activated_at` for safe empty-cursor
 bootstrap must declare `trigger.bootstrap.activation-fence`. The host fails

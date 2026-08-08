@@ -8,7 +8,7 @@ CLI / TUI ── gRPC/UDS ── daemon ── SQLite WAL
     └── OpenSSH UDS ───────└────── gRPC plugin processes
 ```
 
-Resources use `orchigram.dev/v1alpha1`, strict decoding, Kubernetes-style metadata, revisions, generations, labels, status, events, and optimistic concurrency. Before acknowledging a trigger, the daemon compiles a `Flow` into an immutable `ExecutionPlan` and atomically persists that plan with the receipt and outbox command. Every `Run` pins its plan hash and interpreter version. Non-core plan nodes additionally pin the plugin version and digest plus referenced resource metadata/spec snapshots; secret values remain runtime-only.
+Resources use `orchigram.dev/v1alpha1`, strict decoding, Kubernetes-style metadata, revisions, generations, labels, status, events, and optimistic concurrency. Before acknowledging a trigger, the daemon compiles a `Flow` into an immutable `ExecutionPlan` and atomically persists that plan with the receipt and outbox command. Every `Run` pins its plan hash and interpreter version. Non-core plan nodes additionally pin the plugin version and digest, canonical action schemas and contract digest, plus referenced resource metadata/spec snapshots; secret values remain runtime-only.
 
 The daemon owns triggers, receipts, the transactional outbox, run state,
 physical attempt evidence, approvals, plugin lifecycle, workspaces, and
@@ -23,8 +23,11 @@ handshake, protocol-v1 negotiation, task adapters, cancellation registry,
 health/draining state, sequence/timestamp assignment, and exactly-one-terminal
 stream contract. The host uses the same bridge. Task authors work with JSON SDK
 types; only advanced trigger and agent implementations use the public generated
-protobuf package. Arbitrary plugin streams are still validated independently by
-the daemon before their output is trusted.
+protobuf package. Every task action publishes config/input/output schemas. The
+SDK and daemon validate those schemas independently, installation persists a
+canonical contract digest, and a later process restart must reproduce it.
+Arbitrary plugin streams are still validated independently by the daemon before
+their output is trusted.
 
 The interpreter schedules the compiled component DAG, not individual plugin
 processes. `maxParallel` bounds active components; stable topological admission

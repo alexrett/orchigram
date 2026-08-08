@@ -32,8 +32,35 @@ type Metadata struct {
 	Name         string
 	Version      string
 	Capabilities []string
+	Actions      []ActionDescriptor
+	Triggers     []TriggerDescriptor
+	// InputSchema and OutputSchema are retained only for protocol-v1 wire
+	// compatibility. New plugins must publish action-specific descriptors.
 	InputSchema  json.RawMessage
 	OutputSchema json.RawMessage
+}
+
+// ActionDescriptor declares the complete data contract for one Flow action.
+// Schemas use JSON Schema draft 2020-12 and are immutable plugin metadata.
+type ActionDescriptor struct {
+	Action       string          `json:"action"`
+	ConfigSchema json.RawMessage `json:"configSchema"`
+	InputSchema  json.RawMessage `json:"inputSchema"`
+	OutputSchema json.RawMessage `json:"outputSchema"`
+}
+
+// TriggerDescriptor declares configuration and emitted event data for one
+// TriggerProvider source capability.
+type TriggerDescriptor struct {
+	Source       string          `json:"source"`
+	ConfigSchema json.RawMessage `json:"configSchema"`
+	EventSchema  json.RawMessage `json:"eventSchema"`
+}
+
+// Contract is the canonical immutable schema projection persisted by a host.
+type Contract struct {
+	Actions  []ActionDescriptor  `json:"actions"`
+	Triggers []TriggerDescriptor `json:"triggers,omitempty"`
 }
 
 // Config describes the services exposed by one plugin binary.
@@ -105,9 +132,10 @@ type Runtime struct {
 	pluginv1alpha1.UnimplementedPluginControlServer
 	pluginv1alpha1.UnimplementedTaskProviderServer
 
-	metadata Metadata
-	handler  TaskHandler
-	actions  map[string]struct{}
+	metadata  Metadata
+	handler   TaskHandler
+	actions   map[string]struct{}
+	contracts map[string]compiledActionContract
 
 	mu         sync.Mutex
 	accepting  bool
@@ -128,7 +156,7 @@ type callIdentity struct {
 
 // New validates a public plugin configuration and constructs its service set.
 func New(config Config) (*Runtime, Servers, error) {
-	metadata, actions, err := validateMetadata(config.Metadata, config.Task != nil)
+	metadata, actions, contracts, err := validateMetadata(config.Metadata, config.Task != nil, config.Trigger != nil, config.Agent != nil)
 	if err != nil {
 		return nil, Servers{}, err
 	}
@@ -142,7 +170,7 @@ func New(config Config) (*Runtime, Servers, error) {
 			return nil, Servers{}, fmt.Errorf("capability %q requires an agent server", capability)
 		}
 	}
-	runtime := &Runtime{metadata: metadata, handler: config.Task, actions: actions, accepting: true, active: map[string]activeCall{}}
+	runtime := &Runtime{metadata: metadata, handler: config.Task, actions: actions, contracts: contracts, accepting: true, active: map[string]activeCall{}}
 	servers := Servers{Control: runtime}
 	if config.Trigger != nil {
 		servers.Trigger = &triggerAdapter{runtime: runtime, server: config.Trigger}
@@ -184,6 +212,7 @@ func (r *Runtime) Describe(_ context.Context, request *pluginv1alpha1.DescribeRe
 		Protocol:        &pluginv1alpha1.ProtocolRange{Minimum: ProtocolVersion, Maximum: ProtocolVersion},
 		Capabilities:    append([]string(nil), r.metadata.Capabilities...),
 		InputSchemaJson: append([]byte(nil), r.metadata.InputSchema...), OutputSchemaJson: append([]byte(nil), r.metadata.OutputSchema...),
+		Actions: actionDescriptorsPB(r.metadata.Actions), Triggers: triggerDescriptorsPB(r.metadata.Triggers),
 	}, nil
 }
 
@@ -243,6 +272,9 @@ func (r *Runtime) ValidateAction(ctx context.Context, request *pluginv1alpha1.Va
 	if !json.Valid(config) {
 		return nil, status.Error(codes.InvalidArgument, "config_json must be valid JSON")
 	}
+	if issue := r.contracts[request.GetAction()].validateConfig(config); issue != nil {
+		return &pluginv1alpha1.ValidateActionResponse{Issues: []*pluginv1alpha1.ValidationIssue{issue}}, nil
+	}
 	issues := r.handler.ValidateAction(ctx, request.GetAction(), config)
 	response := &pluginv1alpha1.ValidateActionResponse{Issues: make([]*pluginv1alpha1.ValidationIssue, 0, len(issues))}
 	for _, issue := range issues {
@@ -267,6 +299,13 @@ func (r *Runtime) Execute(request *pluginv1alpha1.ExecuteRequest, stream pluginv
 	if !json.Valid(input) || !json.Valid(config) {
 		return status.Error(codes.InvalidArgument, "input_json and config_json must be valid JSON")
 	}
+	contract := r.contracts[request.GetAction()]
+	if issue := contract.validateConfig(config); issue != nil {
+		return status.Error(codes.InvalidArgument, issue.GetMessage())
+	}
+	if issue := contract.validateInput(input); issue != nil {
+		return status.Error(codes.InvalidArgument, issue.GetMessage())
+	}
 	ctx, cancel := context.WithDeadline(stream.Context(), request.GetMeta().GetDeadline().AsTime())
 	if err := r.register(meta, cancel); err != nil {
 		cancel()
@@ -281,6 +320,9 @@ func (r *Runtime) Execute(request *pluginv1alpha1.ExecuteRequest, stream pluginv
 	}, sink)
 	if handlerErr != nil {
 		return sink.finish("task.failed", map[string]any{"error": handlerErr.Error()})
+	}
+	if issue := contract.validateOutputValue(result); issue != nil {
+		return sink.finish("task.failed", map[string]any{"error": issue.GetMessage()})
 	}
 	return sink.finish("task.completed", result)
 }
@@ -399,50 +441,60 @@ func (s *eventSink) send(eventType string, payload any, raw []byte, terminal boo
 	return nil
 }
 
-func validateMetadata(metadata Metadata, hasTask bool) (Metadata, map[string]struct{}, error) {
+func validateMetadata(metadata Metadata, hasTask, hasTrigger, hasAgent bool) (Metadata, map[string]struct{}, map[string]compiledActionContract, error) {
 	if !pluginName.MatchString(metadata.Name) {
-		return Metadata{}, nil, fmt.Errorf("invalid plugin name %q", metadata.Name)
+		return Metadata{}, nil, nil, fmt.Errorf("invalid plugin name %q", metadata.Name)
 	}
 	if _, err := semver.StrictNewVersion(metadata.Version); err != nil {
-		return Metadata{}, nil, fmt.Errorf("plugin version must be semantic: %w", err)
+		return Metadata{}, nil, nil, fmt.Errorf("plugin version must be semantic: %w", err)
 	}
 	if len(metadata.Capabilities) == 0 {
-		return Metadata{}, nil, errors.New("plugin capabilities must not be empty")
+		return Metadata{}, nil, nil, errors.New("plugin capabilities must not be empty")
 	}
 	seen, actions := map[string]struct{}{}, map[string]struct{}{}
 	for _, capability := range metadata.Capabilities {
 		if !capabilityName.MatchString(capability) {
-			return Metadata{}, nil, fmt.Errorf("invalid plugin capability %q", capability)
+			return Metadata{}, nil, nil, fmt.Errorf("invalid plugin capability %q", capability)
 		}
 		if _, duplicate := seen[capability]; duplicate {
-			return Metadata{}, nil, fmt.Errorf("duplicate plugin capability %q", capability)
+			return Metadata{}, nil, nil, fmt.Errorf("duplicate plugin capability %q", capability)
 		}
 		seen[capability] = struct{}{}
 		namespace := strings.SplitN(capability, ".", 2)[0]
 		if namespace != "task" && namespace != "trigger" && namespace != "agent" {
-			return Metadata{}, nil, fmt.Errorf("unsupported plugin capability namespace %q", namespace)
+			return Metadata{}, nil, nil, fmt.Errorf("unsupported plugin capability namespace %q", namespace)
 		}
 		if strings.HasPrefix(capability, "task.") {
 			prefix := "task." + metadata.Name + "."
 			if !strings.HasPrefix(capability, prefix) {
-				return Metadata{}, nil, fmt.Errorf("task capability %q must be rooted at plugin name %q", capability, metadata.Name)
+				return Metadata{}, nil, nil, fmt.Errorf("task capability %q must be rooted at plugin name %q", capability, metadata.Name)
 			}
 			actions[strings.TrimPrefix(capability, "task.")] = struct{}{}
 		}
 	}
 	if hasTask && len(actions) == 0 {
-		return Metadata{}, nil, errors.New("task handler requires at least one task.<action> capability")
+		return Metadata{}, nil, nil, errors.New("task handler requires at least one task.<action> capability")
 	}
 	for label, schema := range map[string]json.RawMessage{"input": metadata.InputSchema, "output": metadata.OutputSchema} {
 		if len(schema) > 0 && !json.Valid(schema) {
-			return Metadata{}, nil, fmt.Errorf("%s schema must be valid JSON", label)
+			return Metadata{}, nil, nil, fmt.Errorf("%s schema must be valid JSON", label)
 		}
+	}
+	validatedActions, contracts, err := validateActionDescriptors(metadata, actions, hasAgent)
+	if err != nil {
+		return Metadata{}, nil, nil, err
+	}
+	validatedTriggers, err := validateTriggerDescriptors(metadata, hasTrigger)
+	if err != nil {
+		return Metadata{}, nil, nil, err
 	}
 	metadata.Capabilities = append([]string(nil), metadata.Capabilities...)
 	sort.Strings(metadata.Capabilities)
 	metadata.InputSchema = append(json.RawMessage(nil), metadata.InputSchema...)
 	metadata.OutputSchema = append(json.RawMessage(nil), metadata.OutputSchema...)
-	return metadata, actions, nil
+	metadata.Actions = validatedActions
+	metadata.Triggers = validatedTriggers
+	return metadata, actions, contracts, nil
 }
 
 type triggerAdapter struct {

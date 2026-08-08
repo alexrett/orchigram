@@ -134,7 +134,7 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 				return
 			}
 			plan, diagnostics := flow.NewCompiler(nil).Compile(flowResource)
-			if len(diagnostics) > 0 {
+			if flow.HasErrors(diagnostics) {
 				events.SetText("[red]" + escape(diagnostics[0].Message))
 				return
 			}
@@ -246,7 +246,7 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 		flowResource, decodeErr := resource.DecodeFlow(flows.GetResources()[0].GetJson())
 		if decodeErr == nil {
 			plan, diagnostics := flow.NewCompiler(nil).Compile(flowResource)
-			if len(diagnostics) == 0 {
+			if !flow.HasErrors(diagnostics) {
 				graph.SetPlan(plan)
 				if selected, ok := graph.Selected(); ok {
 					setInspector(selected)

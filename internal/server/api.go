@@ -95,12 +95,12 @@ func (a *API) apply(ctx context.Context, request *controlv1alpha1.ApplyRequest, 
 		for _, diagnostic := range compilerDiagnostics {
 			diagnostics = append(diagnostics, diagnosticPB(diagnostic))
 		}
-		if len(diagnostics) > 0 {
+		if flow.HasErrors(compilerDiagnostics) {
 			return &controlv1alpha1.ApplyResponse{Resource: resourcePB(doc), Diagnostics: diagnostics}, nil
 		}
 	}
 	if dryRun {
-		return &controlv1alpha1.ApplyResponse{Resource: resourcePB(doc)}, nil
+		return &controlv1alpha1.ApplyResponse{Resource: resourcePB(doc), Diagnostics: diagnostics}, nil
 	}
 	meta := request.GetMeta()
 	applied, err := a.store.Apply(ctx, doc, store.ApplyOptions{
@@ -112,7 +112,7 @@ func (a *API) apply(ctx context.Context, request *controlv1alpha1.ApplyRequest, 
 	if err != nil {
 		return nil, rpcError(err)
 	}
-	return &controlv1alpha1.ApplyResponse{Resource: resourcePB(applied)}, nil
+	return &controlv1alpha1.ApplyResponse{Resource: resourcePB(applied), Diagnostics: diagnostics}, nil
 }
 
 // Get returns one resource.
@@ -222,7 +222,7 @@ func (a *API) Compile(_ context.Context, request *controlv1alpha1.CompileRequest
 	for _, diagnostic := range diagnostics {
 		result.Diagnostics = append(result.Diagnostics, diagnosticPB(diagnostic))
 	}
-	if len(diagnostics) == 0 {
+	if !flow.HasErrors(diagnostics) {
 		result.ExecutionPlanJson, err = json.Marshal(plan)
 		if err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
@@ -679,7 +679,11 @@ func resourcePB(doc resource.Document) *controlv1alpha1.ResourceDocument {
 }
 
 func diagnosticPB(diagnostic flow.Diagnostic) *controlv1alpha1.Diagnostic {
-	return &controlv1alpha1.Diagnostic{Severity: controlv1alpha1.Diagnostic_SEVERITY_ERROR, Path: diagnostic.Path, Code: diagnostic.Code, Message: diagnostic.Message}
+	severity := controlv1alpha1.Diagnostic_SEVERITY_ERROR
+	if diagnostic.Severity == flow.SeverityWarning {
+		severity = controlv1alpha1.Diagnostic_SEVERITY_WARNING
+	}
+	return &controlv1alpha1.Diagnostic{Severity: severity, Path: diagnostic.Path, Code: diagnostic.Code, Message: diagnostic.Message}
 }
 
 func runPB(run store.Run) *controlv1alpha1.RunSummary {

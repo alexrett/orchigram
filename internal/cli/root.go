@@ -206,12 +206,16 @@ func newApplyCommand(opts *options) *cobra.Command {
 				return err
 			}
 			if len(response.GetDiagnostics()) > 0 {
+				hasErrors := false
 				for _, diagnostic := range response.GetDiagnostics() {
+					hasErrors = hasErrors || diagnostic.GetSeverity() == controlv1alpha1.Diagnostic_SEVERITY_ERROR || diagnostic.GetSeverity() == controlv1alpha1.Diagnostic_SEVERITY_UNSPECIFIED
 					if _, writeErr := fmt.Fprintf(cmd.ErrOrStderr(), "%s: %s (%s)\n", diagnostic.GetPath(), diagnostic.GetMessage(), diagnostic.GetCode()); writeErr != nil {
 						return writeErr
 					}
 				}
-				return errors.New("resource validation failed")
+				if hasErrors {
+					return errors.New("resource validation failed")
+				}
 			}
 			return printDocument(cmd.OutOrStdout(), response.GetResource().GetJson(), opts.output)
 		})
@@ -293,12 +297,16 @@ func newFlowCommand(opts *options) *cobra.Command {
 				return err
 			}
 			if len(response.GetDiagnostics()) > 0 {
+				hasErrors := false
 				for _, diagnostic := range response.GetDiagnostics() {
+					hasErrors = hasErrors || diagnostic.GetSeverity() == controlv1alpha1.Diagnostic_SEVERITY_ERROR || diagnostic.GetSeverity() == controlv1alpha1.Diagnostic_SEVERITY_UNSPECIFIED
 					if _, writeErr := fmt.Fprintf(cmd.ErrOrStderr(), "%s: %s (%s)\n", diagnostic.GetPath(), diagnostic.GetMessage(), diagnostic.GetCode()); writeErr != nil {
 						return writeErr
 					}
 				}
-				return errors.New("flow compilation failed")
+				if hasErrors {
+					return errors.New("flow compilation failed")
+				}
 			}
 			_, err = fmt.Fprintf(cmd.OutOrStdout(), "planHash: %s\n", response.GetPlanHash())
 			return err

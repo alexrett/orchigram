@@ -28,6 +28,7 @@ import (
 	"github.com/alexrett/orchigram/internal/backup"
 	clientpkg "github.com/alexrett/orchigram/internal/client"
 	"github.com/alexrett/orchigram/internal/config"
+	"github.com/alexrett/orchigram/internal/firstparty"
 	"github.com/alexrett/orchigram/internal/githubplugin"
 	"github.com/alexrett/orchigram/internal/pluginbundle"
 	"github.com/alexrett/orchigram/internal/pluginruntime"
@@ -45,21 +46,21 @@ func TestMain(m *testing.M) {
 	if os.Getenv(pluginsdk.Handshake.MagicCookieKey) == pluginsdk.Handshake.MagicCookieValue {
 		executable, _ := os.Executable()
 		name := filepath.Base(filepath.Dir(filepath.Dir(executable)))
-		config := pluginsdk.Config{Metadata: pluginsdk.Metadata{Name: name, Version: "0.1.0"}}
+		catalogPlugin, _ := firstparty.Find(name)
+		config := pluginsdk.Config{Metadata: pluginsdk.Metadata{
+			Name: name, Version: "0.1.0", Capabilities: catalogPlugin.Capabilities,
+			Actions: catalogPlugin.Actions, Triggers: catalogPlugin.Triggers,
+		}}
 		switch name {
 		case "exec":
-			config.Metadata.Capabilities = []string{"task.exec.run"}
 			config.Task = &pluginruntime.Exec{Runner: process.NewRunner()}
 		case "agent-command":
-			config.Metadata.Capabilities = []string{"agent.codex", "agent.claude", "agent.command"}
 			config.Agent = &pluginruntime.Agent{Runner: process.NewRunner()}
 		case "github":
-			config.Metadata.Capabilities = githubplugin.Capabilities
 			githubRuntime := &githubplugin.Runtime{Runner: process.NewRunner()}
 			config.Task = githubRuntime
 			config.Trigger = githubRuntime
 		case "http":
-			config.Metadata.Capabilities = []string{"task.http.request"}
 			config.Task = &pluginruntime.HTTP{}
 		default:
 			os.Exit(2)
@@ -1084,6 +1085,28 @@ spec:
 kind: Flow
 metadata: {name: github-fixture}
 spec:
+  inputSchema:
+    type: object
+    properties:
+      repository:
+        type: object
+        properties:
+          owner: {type: string}
+          name: {type: string}
+        required: [owner, name]
+        additionalProperties: false
+      issue:
+        type: object
+        properties:
+          number: {type: integer}
+          title: {type: string}
+          body: {type: string}
+          html_url: {type: string}
+          state: {type: string}
+        required: [number, title, body, html_url, state]
+        additionalProperties: false
+    required: [repository, issue]
+    additionalProperties: false
   policies: {timeout: 10m, maxParallel: 1}
   nodes:
     - id: fetch
@@ -1728,8 +1751,10 @@ func applyClientResource(t *testing.T, client *clientpkg.Client, source string) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(response.GetDiagnostics()) > 0 {
-		t.Fatalf("apply diagnostics: %+v", response.GetDiagnostics())
+	for _, diagnostic := range response.GetDiagnostics() {
+		if diagnostic.GetSeverity() == controlv1alpha1.Diagnostic_SEVERITY_ERROR || diagnostic.GetSeverity() == controlv1alpha1.Diagnostic_SEVERITY_UNSPECIFIED {
+			t.Fatalf("apply diagnostics: %+v", response.GetDiagnostics())
+		}
 	}
 	return response.GetResource()
 }

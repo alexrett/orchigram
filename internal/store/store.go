@@ -1413,13 +1413,15 @@ func (s *Store) MarkApprovalSignaled(ctx context.Context, runUID, nodeID string)
 
 // PluginRecord is the authoritative immutable installation projection.
 type PluginRecord struct {
-	Name         string
-	Version      string
-	Digest       string
-	ManifestJSON json.RawMessage
-	State        string
-	InstalledAt  time.Time
-	Active       bool
+	Name           string
+	Version        string
+	Digest         string
+	ManifestJSON   json.RawMessage
+	ContractJSON   json.RawMessage
+	ContractDigest string
+	State          string
+	InstalledAt    time.Time
+	Active         bool
 }
 
 // PutPlugin records one immutable plugin version idempotently.
@@ -1429,11 +1431,19 @@ func (s *Store) PutPlugin(ctx context.Context, record PluginRecord) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	var existingDigest string
-	err = tx.QueryRowContext(ctx, `SELECT digest FROM plugin_installations WHERE name=? AND version=?`, record.Name, record.Version).Scan(&existingDigest)
+	var existingDigest, existingContractDigest string
+	var existingContract []byte
+	err = tx.QueryRowContext(ctx, `SELECT digest,contract_json,contract_digest FROM plugin_installations WHERE name=? AND version=?`, record.Name, record.Version).Scan(&existingDigest, &existingContract, &existingContractDigest)
 	if err == nil {
 		if existingDigest != record.Digest {
 			return fmt.Errorf("plugin %s version %s already has digest %s", record.Name, record.Version, existingDigest)
+		}
+		if existingContractDigest == "" && len(existingContract) == 0 && record.ContractDigest != "" {
+			if _, err := tx.ExecContext(ctx, `UPDATE plugin_installations SET contract_json=?,contract_digest=? WHERE name=? AND version=? AND contract_digest=''`, []byte(record.ContractJSON), record.ContractDigest, record.Name, record.Version); err != nil {
+				return err
+			}
+		} else if existingContractDigest != record.ContractDigest {
+			return fmt.Errorf("plugin %s version %s action contract changed under the same immutable digest", record.Name, record.Version)
 		}
 		return tx.Commit()
 	}
@@ -1448,7 +1458,10 @@ func (s *Store) PutPlugin(ctx context.Context, record PluginRecord) error {
 	if installedAt.IsZero() {
 		installedAt = s.now().UTC()
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO plugin_installations(name,version,digest,manifest_json,state,installed_at) VALUES(?,?,?,?,?,?)`, record.Name, record.Version, record.Digest, []byte(record.ManifestJSON), state, installedAt.Format(time.RFC3339Nano)); err != nil {
+	if record.ContractDigest == "" || len(record.ContractJSON) == 0 {
+		return errors.New("plugin action contract is required")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO plugin_installations(name,version,digest,manifest_json,contract_json,contract_digest,state,installed_at) VALUES(?,?,?,?,?,?,?,?)`, record.Name, record.Version, record.Digest, []byte(record.ManifestJSON), []byte(record.ContractJSON), record.ContractDigest, state, installedAt.Format(time.RFC3339Nano)); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -1500,16 +1513,16 @@ func (s *Store) DisablePlugin(ctx context.Context, name string) error {
 
 // Plugin returns one installed version, or the active version when version is empty.
 func (s *Store) Plugin(ctx context.Context, name, version string) (PluginRecord, error) {
-	query := `SELECT p.name,p.version,p.digest,p.manifest_json,p.state,p.installed_at,CASE WHEN a.version=p.version THEN 1 ELSE 0 END FROM plugin_installations p LEFT JOIN plugin_activations a ON a.name=p.name WHERE p.name=? AND p.version=?`
+	query := `SELECT p.name,p.version,p.digest,p.manifest_json,p.contract_json,p.contract_digest,p.state,p.installed_at,CASE WHEN a.version=p.version THEN 1 ELSE 0 END FROM plugin_installations p LEFT JOIN plugin_activations a ON a.name=p.name WHERE p.name=? AND p.version=?`
 	arguments := []any{name, version}
 	if version == "" {
-		query = `SELECT p.name,p.version,p.digest,p.manifest_json,p.state,p.installed_at,1 FROM plugin_activations a JOIN plugin_installations p ON p.name=a.name AND p.version=a.version WHERE p.name=?`
+		query = `SELECT p.name,p.version,p.digest,p.manifest_json,p.contract_json,p.contract_digest,p.state,p.installed_at,1 FROM plugin_activations a JOIN plugin_installations p ON p.name=a.name AND p.version=a.version WHERE p.name=?`
 		arguments = []any{name}
 	}
 	var record PluginRecord
 	var installed string
 	var active int
-	if err := s.db.QueryRowContext(ctx, query, arguments...).Scan(&record.Name, &record.Version, &record.Digest, &record.ManifestJSON, &record.State, &installed, &active); err != nil {
+	if err := s.db.QueryRowContext(ctx, query, arguments...).Scan(&record.Name, &record.Version, &record.Digest, &record.ManifestJSON, &record.ContractJSON, &record.ContractDigest, &record.State, &installed, &active); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return PluginRecord{}, ErrNotFound
 		}
@@ -1522,7 +1535,7 @@ func (s *Store) Plugin(ctx context.Context, name, version string) (PluginRecord,
 
 // ListPlugins returns immutable versions in stable name/version order.
 func (s *Store) ListPlugins(ctx context.Context) ([]PluginRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT p.name,p.version,p.digest,p.manifest_json,p.state,p.installed_at,CASE WHEN a.version=p.version THEN 1 ELSE 0 END FROM plugin_installations p LEFT JOIN plugin_activations a ON a.name=p.name ORDER BY p.name,p.version`)
+	rows, err := s.db.QueryContext(ctx, `SELECT p.name,p.version,p.digest,p.manifest_json,p.contract_json,p.contract_digest,p.state,p.installed_at,CASE WHEN a.version=p.version THEN 1 ELSE 0 END FROM plugin_installations p LEFT JOIN plugin_activations a ON a.name=p.name ORDER BY p.name,p.version`)
 	if err != nil {
 		return nil, err
 	}
@@ -1532,7 +1545,7 @@ func (s *Store) ListPlugins(ctx context.Context) ([]PluginRecord, error) {
 		var record PluginRecord
 		var installed string
 		var active int
-		if err := rows.Scan(&record.Name, &record.Version, &record.Digest, &record.ManifestJSON, &record.State, &installed, &active); err != nil {
+		if err := rows.Scan(&record.Name, &record.Version, &record.Digest, &record.ManifestJSON, &record.ContractJSON, &record.ContractDigest, &record.State, &installed, &active); err != nil {
 			return nil, err
 		}
 		record.InstalledAt, _ = time.Parse(time.RFC3339Nano, installed)

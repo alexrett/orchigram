@@ -5,14 +5,18 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/alexrett/orchigram/internal/actioncontract"
 	"github.com/alexrett/orchigram/internal/resource"
 	"github.com/google/cel-go/cel"
+	exprpb "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
 )
 
 const (
@@ -42,10 +46,19 @@ type ActionBinder interface {
 
 // Diagnostic is a stable compiler diagnostic.
 type Diagnostic struct {
-	Path    string `json:"path"`
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Severity string `json:"severity,omitempty"`
+	Path     string `json:"path"`
+	Code     string `json:"code"`
+	Message  string `json:"message"`
 }
+
+const (
+	SeverityError   = "error"
+	SeverityWarning = "warning"
+)
+
+// IsError treats the zero value as an error for backward-compatible binders.
+func (d Diagnostic) IsError() bool { return d.Severity == "" || d.Severity == SeverityError }
 
 // PluginBinding pins one immutable installed plugin binary.
 type PluginBinding struct {
@@ -67,9 +80,19 @@ type ResourceBinding struct {
 	Spec            json.RawMessage `json:"spec"`
 }
 
+// ActionContract pins the canonical schemas accepted with the Flow. Replay
+// never consults a mutable current plugin descriptor.
+type ActionContract struct {
+	Digest       string          `json:"digest"`
+	ConfigSchema json.RawMessage `json:"configSchema"`
+	InputSchema  json.RawMessage `json:"inputSchema"`
+	OutputSchema json.RawMessage `json:"outputSchema"`
+}
+
 // ActionBinding is the compiler-facing resolved action contract.
 type ActionBinding struct {
 	Plugin    PluginBinding
+	Contract  ActionContract
 	Config    map[string]any
 	Resources []ResourceBinding
 }
@@ -85,6 +108,7 @@ type PlanNode struct {
 	Timeout           string            `json:"timeout"`
 	LoopMaxIterations int               `json:"loopMaxIterations,omitempty"`
 	Plugin            *PluginBinding    `json:"plugin,omitempty"`
+	Contract          *ActionContract   `json:"contract,omitempty"`
 	Resources         []ResourceBinding `json:"resources,omitempty"`
 }
 
@@ -97,16 +121,17 @@ type PlanEdge struct {
 
 // ExecutionPlan is the immutable data interpreted by the durable engine.
 type ExecutionPlan struct {
-	APIVersion         string     `json:"apiVersion"`
-	FlowUID            string     `json:"flowUID"`
-	FlowGeneration     uint64     `json:"flowGeneration"`
-	InterpreterVersion string     `json:"interpreterVersion"`
-	Timeout            string     `json:"timeout"`
-	MaxParallel        int        `json:"maxParallel"`
-	Nodes              []PlanNode `json:"nodes"`
-	Edges              []PlanEdge `json:"edges"`
-	Components         [][]string `json:"components"`
-	PlanHash           string     `json:"planHash"`
+	APIVersion         string          `json:"apiVersion"`
+	FlowUID            string          `json:"flowUID"`
+	FlowGeneration     uint64          `json:"flowGeneration"`
+	InterpreterVersion string          `json:"interpreterVersion"`
+	Timeout            string          `json:"timeout"`
+	MaxParallel        int             `json:"maxParallel"`
+	InputSchema        json.RawMessage `json:"inputSchema"`
+	Nodes              []PlanNode      `json:"nodes"`
+	Edges              []PlanEdge      `json:"edges"`
+	Components         [][]string      `json:"components"`
+	PlanHash           string          `json:"planHash"`
 }
 
 // Compiler validates and canonicalizes Flow graphs.
@@ -147,6 +172,35 @@ func EvaluateEdges(edges []PlanEdge, input, result, nodes map[string]any) ([]boo
 	return activated, nil
 }
 
+// ValidateRunInput enforces the input schema pinned into an accepted plan.
+func ValidateRunInput(plan ExecutionPlan, raw json.RawMessage) error {
+	if len(plan.InputSchema) == 0 {
+		return nil
+	}
+	if len(raw) == 0 {
+		raw = json.RawMessage(`{}`)
+	}
+	var value any
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
+		return errors.New("run input is not valid JSON")
+	}
+	schema, err := actioncontract.Compile(plan.InputSchema)
+	if err != nil {
+		return errors.New("pinned run input schema is invalid")
+	}
+	violations := schema.Validate(value)
+	if len(violations) == 0 {
+		return nil
+	}
+	path := "input"
+	if len(violations[0].Path) > 0 {
+		path += "." + strings.Join(violations[0].Path, ".")
+	}
+	return fmt.Errorf("%s violates the Flow input schema (%s)", path, violations[0].Code)
+}
+
 // NewCompiler creates a compiler with an optional plugin capability resolver.
 func NewCompiler(capabilities CapabilityResolver) *Compiler {
 	return &Compiler{capabilities: capabilities}
@@ -155,6 +209,20 @@ func NewCompiler(capabilities CapabilityResolver) *Compiler {
 // Compile returns a stable plan or all deterministic validation diagnostics.
 func (c *Compiler) Compile(input resource.Flow) (ExecutionPlan, []Diagnostic) {
 	diagnostics := make([]Diagnostic, 0)
+	inputSchemaJSON := json.RawMessage(`{"type":"object","additionalProperties":true}`)
+	if len(input.Spec.InputSchema) > 0 {
+		encoded, marshalErr := json.Marshal(input.Spec.InputSchema)
+		if marshalErr != nil {
+			diagnostics = append(diagnostics, Diagnostic{Path: "spec.inputSchema", Code: "invalid_schema", Message: marshalErr.Error()})
+		} else {
+			inputSchemaJSON = encoded
+		}
+	}
+	compiledInput, schemaErr := actioncontract.Compile(inputSchemaJSON)
+	if schemaErr != nil {
+		diagnostics = append(diagnostics, Diagnostic{Path: "spec.inputSchema", Code: "invalid_schema", Message: schemaErr.Error()})
+		compiledInput, _ = actioncontract.Compile(json.RawMessage(`{"type":"object","additionalProperties":true}`))
+	}
 	timeout, err := resource.ParseDuration(input.Spec.Policies.Timeout, defaultTimeout)
 	if err != nil {
 		diagnostics = append(diagnostics, Diagnostic{Path: "spec.policies.timeout", Code: "invalid_duration", Message: err.Error()})
@@ -169,6 +237,8 @@ func (c *Compiler) Compile(input resource.Flow) (ExecutionPlan, []Diagnostic) {
 	}
 
 	nodes := make(map[string]resource.FlowNode, len(input.Spec.Nodes))
+	nodeContracts := make(map[string]ActionContract, len(input.Spec.Nodes))
+	nodeConfigs := make(map[string]map[string]any, len(input.Spec.Nodes))
 	planNodes := make([]PlanNode, 0, len(input.Spec.Nodes))
 	for i, node := range input.Spec.Nodes {
 		path := fmt.Sprintf("spec.nodes[%d]", i)
@@ -237,9 +307,22 @@ func (c *Compiler) Compile(input resource.Flow) (ExecutionPlan, []Diagnostic) {
 		if binding != nil {
 			planNode.With = binding.Config
 			planNode.Plugin = &binding.Plugin
+			planNode.Contract = &binding.Contract
 			planNode.Resources = binding.Resources
+			nodeContracts[node.ID] = binding.Contract
+			if len(binding.Contract.InputSchema) > 0 {
+				actionInput, inputErr := actioncontract.Compile(binding.Contract.InputSchema)
+				if inputErr != nil {
+					diagnostics = append(diagnostics, Diagnostic{Path: path + ".uses", Code: "invalid_action_schema", Message: "pinned action input schema is invalid"})
+				} else if compatible, _ := actioncontract.Compatible(compiledInput.ResolveDot(nil), actionInput.ResolveDot(nil)); !compatible {
+					diagnostics = append(diagnostics, Diagnostic{Path: path + ".uses", Code: "action_input_type_mismatch", Message: "Flow input type is incompatible with the action input schema"})
+				}
+			}
+		} else if strings.HasPrefix(node.Uses, "core.") {
+			nodeContracts[node.ID] = coreActionContract(node)
 		}
 		planNodes = append(planNodes, planNode)
+		nodeConfigs[node.ID] = planNode.With
 	}
 
 	celEnv, celErr := cel.NewEnv(cel.Variable("input", cel.DynType), cel.Variable("result", cel.DynType), cel.Variable("nodes", cel.DynType))
@@ -262,6 +345,8 @@ func (c *Compiler) Compile(input resource.Flow) (ExecutionPlan, []Diagnostic) {
 				diagnostics = append(diagnostics, Diagnostic{Path: path + ".when", Code: "invalid_cel", Message: issues.Err().Error()})
 			} else if ast.OutputType() != cel.BoolType && ast.OutputType() != cel.DynType {
 				diagnostics = append(diagnostics, Diagnostic{Path: path + ".when", Code: "cel_not_boolean", Message: "condition must produce bool"})
+			} else if ast.OutputType() == cel.DynType {
+				diagnostics = append(diagnostics, typedCELDiagnostics(path+".when", ast.Expr(), edge.From, compiledInput, nodeContracts)...)
 			}
 		}
 		if _, fromOK := nodes[edge.From]; fromOK {
@@ -275,7 +360,7 @@ func (c *Compiler) Compile(input resource.Flow) (ExecutionPlan, []Diagnostic) {
 		sort.Strings(adjacency[id])
 	}
 	for i, node := range input.Spec.Nodes {
-		diagnostics = append(diagnostics, validateMappings(i, node, nodes)...)
+		diagnostics = append(diagnostics, validateMappings(i, node, nodes, adjacency, compiledInput, nodeContracts, nodeConfigs[node.ID])...)
 	}
 	components := stronglyConnected(sortedKeys(nodes), adjacency)
 	for _, component := range components {
@@ -310,8 +395,8 @@ func (c *Compiler) Compile(input resource.Flow) (ExecutionPlan, []Diagnostic) {
 		}
 		return edges[i].From < edges[j].From
 	})
-	plan := ExecutionPlan{APIVersion: resource.APIVersion, FlowUID: input.Metadata.UID, FlowGeneration: input.Metadata.Generation, InterpreterVersion: InterpreterVersion, Timeout: timeout.String(), MaxParallel: maxParallel, Nodes: planNodes, Edges: edges, Components: components}
-	if len(diagnostics) == 0 {
+	plan := ExecutionPlan{APIVersion: resource.APIVersion, FlowUID: input.Metadata.UID, FlowGeneration: input.Metadata.Generation, InterpreterVersion: InterpreterVersion, Timeout: timeout.String(), MaxParallel: maxParallel, InputSchema: inputSchemaJSON, Nodes: planNodes, Edges: edges, Components: components}
+	if !hasErrorDiagnostics(diagnostics) {
 		encoded, marshalErr := json.Marshal(plan)
 		if marshalErr != nil {
 			panic(marshalErr)
@@ -329,7 +414,117 @@ func nodeConfigDiagnosticPath(nodePath, pluginPath string) string {
 	return nodePath + ".with." + strings.TrimPrefix(pluginPath, "config.")
 }
 
-func validateMappings(nodeIndex int, node resource.FlowNode, nodes map[string]resource.FlowNode) []Diagnostic {
+func validateMappings(nodeIndex int, node resource.FlowNode, nodes map[string]resource.FlowNode, adjacency map[string][]string, inputSchema *actioncontract.Schema, contracts map[string]ActionContract, boundConfig map[string]any) []Diagnostic {
+	path := fmt.Sprintf("spec.nodes[%d].with", nodeIndex)
+	contract, hasContract := contracts[node.ID]
+	if !hasContract || len(contract.ConfigSchema) == 0 {
+		return validateMappingShapeOnly(nodeIndex, node, nodes)
+	}
+	configSchema, err := actioncontract.Compile(contract.ConfigSchema)
+	if err != nil {
+		return []Diagnostic{{Path: path, Code: "invalid_action_schema", Message: "pinned action config schema is invalid"}}
+	}
+	projected, err := cloneMap(boundConfig)
+	if err != nil {
+		return []Diagnostic{{Path: path, Code: "invalid_config", Message: err.Error()}}
+	}
+	delete(projected, "secretRefs")
+	rawMappings, hasMappings := projected["mappings"]
+	delete(projected, "mappings")
+	diagnostics := []Diagnostic{}
+	if hasMappings {
+		items, ok := rawMappings.([]any)
+		if !ok {
+			return []Diagnostic{{Path: path + ".mappings", Code: "invalid_mapping", Message: "must be a list of {from,to} mappings"}}
+		}
+		for index, item := range items {
+			itemPath := fmt.Sprintf("%s.mappings[%d]", path, index)
+			mapping, ok := item.(map[string]any)
+			if !ok {
+				diagnostics = append(diagnostics, Diagnostic{Path: itemPath, Code: "invalid_mapping", Message: "must be an object"})
+				continue
+			}
+			for key := range mapping {
+				if key != "from" && key != "to" {
+					diagnostics = append(diagnostics, Diagnostic{Path: itemPath + "." + key, Code: "unknown_field", Message: "only from and to are allowed"})
+				}
+			}
+			from, fromOK := mapping["from"].(string)
+			to, toOK := mapping["to"].(string)
+			source, sourceOK, sourceDiagnostics := mappingSource(itemPath+".from", from, fromOK, node.ID, nodes, adjacency, inputSchema, contracts)
+			diagnostics = append(diagnostics, sourceDiagnostics...)
+			if !toOK || !strings.HasPrefix(to, "/") || to == "/" {
+				diagnostics = append(diagnostics, Diagnostic{Path: itemPath + ".to", Code: "invalid_target", Message: "must be a non-root JSON pointer"})
+				continue
+			}
+			target := configSchema.ResolvePointer(to)
+			if !target.Exists {
+				diagnostics = append(diagnostics, Diagnostic{Path: itemPath + ".to", Code: "unknown_target", Message: fmt.Sprintf("target %q is not declared by the action config schema", to)})
+				continue
+			}
+			if sourceOK {
+				compatible, dynamic := actioncontract.Compatible(source, target)
+				if !compatible {
+					diagnostics = append(diagnostics, Diagnostic{Path: itemPath, Code: "mapping_type_mismatch", Message: "mapping source type is incompatible with the destination action field"})
+				} else if dynamic {
+					diagnostics = append(diagnostics, Diagnostic{Severity: SeverityWarning, Path: itemPath, Code: "dynamic_mapping", Message: "mapping crosses an explicitly open schema region and will be validated again at runtime"})
+				}
+			}
+			if !hasErrorAt(diagnostics, itemPath) {
+				if err := actioncontract.SetPointer(projected, to, actioncontract.Placeholder(target)); err != nil {
+					diagnostics = append(diagnostics, Diagnostic{Path: itemPath + ".to", Code: "invalid_target", Message: err.Error()})
+				}
+			}
+		}
+	}
+	for _, violation := range configSchema.Validate(projected) {
+		diagnostics = append(diagnostics, schemaDiagnostic(path, violation))
+	}
+	return diagnostics
+}
+
+func mappingSource(path, from string, fromOK bool, destination string, nodes map[string]resource.FlowNode, adjacency map[string][]string, inputSchema *actioncontract.Schema, contracts map[string]ActionContract) (actioncontract.Resolution, bool, []Diagnostic) {
+	if !fromOK || from == "" || (from != "input" && !strings.HasPrefix(from, "input.") && !strings.HasPrefix(from, "nodes.")) {
+		return actioncontract.Resolution{}, false, []Diagnostic{{Path: path, Code: "invalid_source", Message: "must start with input or nodes.<nodeID>"}}
+	}
+	if from == "input" || strings.HasPrefix(from, "input.") {
+		parts := []string{}
+		if from != "input" {
+			parts = strings.Split(strings.TrimPrefix(from, "input."), ".")
+		}
+		resolution := inputSchema.ResolveDot(parts)
+		if !resolution.Exists {
+			return resolution, false, []Diagnostic{{Path: path, Code: "unknown_source_field", Message: fmt.Sprintf("source %q is not declared by spec.inputSchema", from)}}
+		}
+		return resolution, true, nil
+	}
+	parts := strings.Split(strings.TrimPrefix(from, "nodes."), ".")
+	if len(parts) < 2 || parts[0] == "" {
+		return actioncontract.Resolution{}, false, []Diagnostic{{Path: path, Code: "invalid_source", Message: "node output source must include nodes.<nodeID>.<field>"}}
+	}
+	sourceNode := parts[0]
+	if _, exists := nodes[sourceNode]; !exists {
+		return actioncontract.Resolution{}, false, []Diagnostic{{Path: path, Code: "unknown_node", Message: fmt.Sprintf("node %q does not exist", sourceNode)}}
+	}
+	if !reaches(sourceNode, destination, adjacency) {
+		return actioncontract.Resolution{}, false, []Diagnostic{{Path: path, Code: "source_not_predecessor", Message: fmt.Sprintf("node %q is not a predecessor of %q", sourceNode, destination)}}
+	}
+	contract, exists := contracts[sourceNode]
+	if !exists || len(contract.OutputSchema) == 0 {
+		return actioncontract.Resolution{Exists: true, Dynamic: true}, true, nil
+	}
+	schema, err := actioncontract.Compile(contract.OutputSchema)
+	if err != nil {
+		return actioncontract.Resolution{}, false, []Diagnostic{{Path: path, Code: "invalid_action_schema", Message: "source node output schema is invalid"}}
+	}
+	resolution := schema.ResolveDot(parts[1:])
+	if !resolution.Exists {
+		return resolution, false, []Diagnostic{{Path: path, Code: "unknown_source_field", Message: fmt.Sprintf("source %q is not declared by node %q output schema", from, sourceNode)}}
+	}
+	return resolution, true, nil
+}
+
+func validateMappingShapeOnly(nodeIndex int, node resource.FlowNode, nodes map[string]resource.FlowNode) []Diagnostic {
 	raw, exists := node.With["mappings"]
 	if !exists {
 		return nil
@@ -346,11 +541,6 @@ func validateMappings(nodeIndex int, node resource.FlowNode, nodes map[string]re
 		if !ok {
 			diagnostics = append(diagnostics, Diagnostic{Path: itemPath, Code: "invalid_mapping", Message: "must be an object"})
 			continue
-		}
-		for key := range mapping {
-			if key != "from" && key != "to" {
-				diagnostics = append(diagnostics, Diagnostic{Path: itemPath + "." + key, Code: "unknown_field", Message: "only from and to are allowed"})
-			}
 		}
 		from, fromOK := mapping["from"].(string)
 		to, toOK := mapping["to"].(string)
@@ -370,6 +560,190 @@ func validateMappings(nodeIndex int, node resource.FlowNode, nodes map[string]re
 	}
 	return diagnostics
 }
+
+func typedCELDiagnostics(path string, expression *exprpb.Expr, resultNode string, inputSchema *actioncontract.Schema, contracts map[string]ActionContract) []Diagnostic {
+	inferred, exists, dynamic := inferCELType(expression, resultNode, inputSchema, contracts)
+	if !exists {
+		return []Diagnostic{{Path: path, Code: "unknown_cel_field", Message: "condition references a field that is absent from its declared schema"}}
+	}
+	if inferred != actioncontract.TypeUnknown && inferred&actioncontract.TypeBoolean == 0 {
+		return []Diagnostic{{Path: path, Code: "cel_not_boolean", Message: "condition resolves to a non-boolean schema type"}}
+	}
+	if inferred == actioncontract.TypeUnknown || dynamic {
+		return []Diagnostic{{Severity: SeverityWarning, Path: path, Code: "dynamic_cel", Message: "condition crosses an explicitly open schema region and will be type-checked again at runtime"}}
+	}
+	return nil
+}
+
+func inferCELType(expression *exprpb.Expr, resultNode string, inputSchema *actioncontract.Schema, contracts map[string]ActionContract) (actioncontract.Type, bool, bool) {
+	if root, parts, ok := celSelectPath(expression); ok {
+		var schema *actioncontract.Schema
+		switch root {
+		case "input":
+			schema = inputSchema
+		case "result":
+			schema = outputSchema(contracts[resultNode])
+		case "nodes":
+			if len(parts) == 0 {
+				return actioncontract.TypeObject, true, true
+			}
+			schema = outputSchema(contracts[parts[0]])
+			parts = parts[1:]
+		default:
+			return actioncontract.TypeUnknown, true, true
+		}
+		if schema == nil {
+			return actioncontract.TypeUnknown, true, true
+		}
+		resolution := schema.ResolveDot(parts)
+		return resolution.Type, resolution.Exists, resolution.Dynamic
+	}
+	if constant := expression.GetConstExpr(); constant != nil {
+		switch constant.GetConstantKind().(type) {
+		case *exprpb.Constant_BoolValue:
+			return actioncontract.TypeBoolean, true, false
+		case *exprpb.Constant_Int64Value, *exprpb.Constant_Uint64Value:
+			return actioncontract.TypeInteger, true, false
+		case *exprpb.Constant_DoubleValue:
+			return actioncontract.TypeNumber, true, false
+		case *exprpb.Constant_StringValue, *exprpb.Constant_BytesValue:
+			return actioncontract.TypeString, true, false
+		case *exprpb.Constant_NullValue:
+			return actioncontract.TypeNull, true, false
+		}
+	}
+	if call := expression.GetCallExpr(); call != nil {
+		switch call.GetFunction() {
+		case "_==_", "_!=_", "_<_", "_<=_", "_>_", "_>=_", "_&&_", "_||_", "!_", "@in", "_in_":
+			dynamic := false
+			arguments := append([]*exprpb.Expr(nil), call.GetArgs()...)
+			if call.GetTarget() != nil {
+				arguments = append(arguments, call.GetTarget())
+			}
+			for _, argument := range arguments {
+				_, exists, argumentDynamic := inferCELType(argument, resultNode, inputSchema, contracts)
+				if !exists {
+					return actioncontract.TypeBoolean, false, false
+				}
+				dynamic = dynamic || argumentDynamic
+			}
+			return actioncontract.TypeBoolean, true, dynamic
+		case "_?_:_":
+			arguments := call.GetArgs()
+			if len(arguments) == 3 {
+				left, leftExists, leftDynamic := inferCELType(arguments[1], resultNode, inputSchema, contracts)
+				right, rightExists, rightDynamic := inferCELType(arguments[2], resultNode, inputSchema, contracts)
+				return left | right, leftExists && rightExists, leftDynamic || rightDynamic
+			}
+		}
+	}
+	return actioncontract.TypeUnknown, true, true
+}
+
+func celSelectPath(expression *exprpb.Expr) (string, []string, bool) {
+	if identifier := expression.GetIdentExpr(); identifier != nil {
+		return identifier.GetName(), nil, true
+	}
+	selection := expression.GetSelectExpr()
+	if selection == nil {
+		return "", nil, false
+	}
+	root, parts, ok := celSelectPath(selection.GetOperand())
+	if !ok {
+		return "", nil, false
+	}
+	return root, append(parts, selection.GetField()), true
+}
+
+func outputSchema(contract ActionContract) *actioncontract.Schema {
+	if len(contract.OutputSchema) == 0 {
+		return nil
+	}
+	schema, err := actioncontract.Compile(contract.OutputSchema)
+	if err != nil {
+		return nil
+	}
+	return schema
+}
+
+func coreActionContract(node resource.FlowNode) ActionContract {
+	if node.Uses != "core.approval" {
+		return ActionContract{}
+	}
+	return ActionContract{
+		Digest:       "core.approval/v1",
+		ConfigSchema: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
+		InputSchema:  json.RawMessage(`{"type":"object","additionalProperties":true}`),
+		OutputSchema: json.RawMessage(`{"type":"object","properties":{"approved":{"type":"boolean"},"state":{"type":"string"},"reason":{"type":"string"}},"required":["approved","state","reason"],"additionalProperties":false}`),
+	}
+}
+
+func schemaDiagnostic(base string, violation actioncontract.Violation) Diagnostic {
+	path := base
+	for _, segment := range violation.Path {
+		if _, err := strconv.Atoi(segment); err == nil {
+			path += "[" + segment + "]"
+		} else {
+			path += "." + segment
+		}
+	}
+	return Diagnostic{Path: path, Code: violation.Code, Message: violation.Message}
+}
+
+func cloneMap(source map[string]any) (map[string]any, error) {
+	if source == nil {
+		return map[string]any{}, nil
+	}
+	encoded, err := json.Marshal(source)
+	if err != nil {
+		return nil, err
+	}
+	var result map[string]any
+	if err := json.Unmarshal(encoded, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func reaches(source, target string, adjacency map[string][]string) bool {
+	queue := []string{source}
+	seen := map[string]bool{source: true}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		for _, next := range adjacency[current] {
+			if next == target {
+				return true
+			}
+			if !seen[next] {
+				seen[next] = true
+				queue = append(queue, next)
+			}
+		}
+	}
+	return false
+}
+
+func hasErrorAt(diagnostics []Diagnostic, path string) bool {
+	for _, diagnostic := range diagnostics {
+		if diagnostic.IsError() && strings.HasPrefix(diagnostic.Path, path) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasErrorDiagnostics(diagnostics []Diagnostic) bool {
+	for _, diagnostic := range diagnostics {
+		if diagnostic.IsError() {
+			return true
+		}
+	}
+	return false
+}
+
+// HasErrors reports whether diagnostics contain a compile-blocking error.
+func HasErrors(diagnostics []Diagnostic) bool { return hasErrorDiagnostics(diagnostics) }
 
 func validAction(action string) bool {
 	parts := strings.Split(action, ".")

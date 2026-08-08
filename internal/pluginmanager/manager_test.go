@@ -19,6 +19,7 @@ import (
 	"time"
 
 	pluginv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/plugin/v1alpha1"
+	"github.com/alexrett/orchigram/internal/firstparty"
 	"github.com/alexrett/orchigram/internal/flow"
 	"github.com/alexrett/orchigram/internal/githubplugin"
 	"github.com/alexrett/orchigram/internal/pluginbundle"
@@ -38,19 +39,19 @@ func TestMain(m *testing.M) {
 	if os.Getenv(pluginsdk.Handshake.MagicCookieKey) == pluginsdk.Handshake.MagicCookieValue {
 		executable, _ := os.Executable()
 		name := filepath.Base(filepath.Dir(filepath.Dir(executable)))
-		config := pluginsdk.Config{Metadata: pluginsdk.Metadata{Name: name, Version: conformanceVersion}}
+		catalogPlugin, _ := firstparty.Find(name)
+		config := pluginsdk.Config{Metadata: pluginsdk.Metadata{
+			Name: name, Version: conformanceVersion, Capabilities: catalogPlugin.Capabilities,
+			Actions: catalogPlugin.Actions, Triggers: catalogPlugin.Triggers,
+		}}
 		switch name {
 		case "exec":
-			config.Metadata.Capabilities = []string{"task.exec.run"}
 			config.Task = &pluginruntime.Exec{Runner: process.NewRunner()}
 		case "agent-command":
-			config.Metadata.Capabilities = []string{"agent.codex", "agent.claude", "agent.command"}
 			config.Agent = &pluginruntime.Agent{Runner: process.NewRunner()}
 		case "http":
-			config.Metadata.Capabilities = []string{"task.http.request"}
 			config.Task = &pluginruntime.HTTP{}
 		case "github":
-			config.Metadata.Capabilities = githubplugin.Capabilities
 			githubRuntime := &githubplugin.Runtime{Runner: process.NewRunner()}
 			config.Task = githubRuntime
 			config.Trigger = githubRuntime
@@ -80,6 +81,10 @@ func TestFirstPartyPluginConformance(t *testing.T) {
 		}
 		if record.Name != name || record.Version != conformanceVersion {
 			t.Fatalf("unexpected installation: %+v", record)
+		}
+		contract, contractErr := pluginsdk.DecodeContract(record.ContractJSON)
+		if contractErr != nil || record.ContractDigest == "" || len(contract.Actions) == 0 {
+			t.Fatalf("%s contract=%+v digest=%q err=%v", name, contract, record.ContractDigest, contractErr)
 		}
 		if err := manager.Enable(context.Background(), name, conformanceVersion); err != nil {
 			t.Fatalf("enable %s: %v", name, err)
@@ -409,8 +414,8 @@ spec:
 		t.Fatalf("plan=%+v diagnostics=%+v", plan, diagnostics)
 	}
 	node := plan.Nodes[0]
-	if node.Plugin == nil || node.Plugin.Version != record.Version || node.Plugin.Digest != record.Digest || len(node.Resources) != 2 {
-		t.Fatalf("compiled binding=%+v resources=%+v", node.Plugin, node.Resources)
+	if node.Plugin == nil || node.Plugin.Version != record.Version || node.Plugin.Digest != record.Digest || node.Contract == nil || node.Contract.Digest != record.ContractDigest || len(node.Contract.ConfigSchema) == 0 || len(node.Contract.OutputSchema) == 0 || len(node.Resources) != 2 {
+		t.Fatalf("compiled binding=%+v contract=%+v resources=%+v", node.Plugin, node.Contract, node.Resources)
 	}
 	if encoded, marshalErr := json.Marshal(plan); marshalErr != nil || strings.Contains(string(encoded), "runtime-only-test-value") {
 		t.Fatalf("compiled plan leaked a secret value: %s err=%v", encoded, marshalErr)

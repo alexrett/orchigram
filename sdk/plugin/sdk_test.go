@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,7 +17,7 @@ import (
 
 func TestNewRejectsInvalidMetadata(t *testing.T) {
 	t.Parallel()
-	valid := Config{Metadata: Metadata{Name: "echo", Version: "0.1.0", Capabilities: []string{"task.echo.echo"}}, Task: TaskHandlerFuncs{}}
+	valid := Config{Metadata: Metadata{Name: "echo", Version: "0.1.0", Capabilities: []string{"task.echo.echo"}, Actions: []ActionDescriptor{testActionDescriptor()}}, Task: TaskHandlerFuncs{}}
 	for name, mutate := range map[string]func(*Config){
 		"name":        func(c *Config) { c.Metadata.Name = "Echo!" },
 		"version":     func(c *Config) { c.Metadata.Version = "latest" },
@@ -36,13 +37,104 @@ func TestNewRejectsInvalidMetadata(t *testing.T) {
 	}
 }
 
+func TestNewRejectsInvalidActionDescriptors(t *testing.T) {
+	t.Parallel()
+	for name, mutate := range map[string]func(*Config){
+		"missing": func(config *Config) { config.Metadata.Actions = nil },
+		"duplicate": func(config *Config) {
+			config.Metadata.Actions = append(config.Metadata.Actions, testActionDescriptor())
+		},
+		"capability mismatch": func(config *Config) { config.Metadata.Actions[0].Action = "echo.missing" },
+		"empty schema":        func(config *Config) { config.Metadata.Actions[0].OutputSchema = nil },
+		"malformed schema":    func(config *Config) { config.Metadata.Actions[0].ConfigSchema = json.RawMessage(`{`) },
+		"non-object config":   func(config *Config) { config.Metadata.Actions[0].ConfigSchema = json.RawMessage(`{"type":"string"}`) },
+		"external reference": func(config *Config) {
+			config.Metadata.Actions[0].OutputSchema = json.RawMessage(`{"$ref":"https://example.invalid/schema"}`)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			config := Config{Metadata: Metadata{
+				Name: "echo", Version: "0.1.0", Capabilities: []string{"task.echo.echo"}, Actions: []ActionDescriptor{testActionDescriptor()},
+			}, Task: TaskHandlerFuncs{}}
+			mutate(&config)
+			if _, _, err := New(config); err == nil {
+				t.Fatal("invalid descriptor was accepted")
+			}
+		})
+	}
+}
+
+func TestTaskRuntimeEnforcesDeclaredSchemas(t *testing.T) {
+	t.Parallel()
+	descriptor := ActionDescriptor{
+		Action:       "echo.echo",
+		ConfigSchema: json.RawMessage(`{"type":"object","properties":{"prefix":{"type":"string"}},"required":["prefix"],"additionalProperties":false}`),
+		InputSchema:  json.RawMessage(`{"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false}`),
+		OutputSchema: json.RawMessage(`{"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false}`),
+	}
+	called := false
+	runtime, _, err := New(Config{Metadata: Metadata{
+		Name: "echo", Version: "0.1.0", Capabilities: []string{"task.echo.echo"}, Actions: []ActionDescriptor{descriptor},
+	}, Task: TaskHandlerFuncs{
+		Validate: func(context.Context, string, json.RawMessage) []ValidationIssue { called = true; return nil },
+		Run: func(context.Context, TaskRequest, EventSink) (any, error) {
+			return map[string]any{"message": 42}, nil
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := runtime.ValidateAction(context.Background(), &pluginv1alpha1.ValidateActionRequest{Action: "echo.echo", ConfigJson: []byte(`{}`)})
+	if err != nil || len(response.GetIssues()) != 1 || called {
+		t.Fatalf("response=%+v called=%v err=%v", response, called, err)
+	}
+	request := testExecuteRequest()
+	request.ConfigJson = []byte(`{"prefix":"ok"}`)
+	request.InputJson = []byte(`{"message":"hello"}`)
+	stream := &captureStream{ctx: context.Background()}
+	if err := runtime.Execute(request, stream); err != nil {
+		t.Fatal(err)
+	}
+	events := stream.snapshot()
+	if len(events) != 1 || events[0].GetType() != "task.failed" || strings.Contains(string(events[0].GetPayloadJson()), "42") {
+		t.Fatalf("events=%+v", events)
+	}
+}
+
+func TestValidateDescriptionReturnsStableCanonicalDigest(t *testing.T) {
+	t.Parallel()
+	descriptor := testActionDescriptor()
+	description := &pluginv1alpha1.DescribeResponse{
+		Name: "echo", Version: "0.1.0", Protocol: &pluginv1alpha1.ProtocolRange{Minimum: 1, Maximum: 1},
+		Capabilities: []string{"task.echo.echo"},
+		Actions: []*pluginv1alpha1.ActionDescriptor{{
+			Action: descriptor.Action, ConfigSchemaJson: descriptor.ConfigSchema,
+			InputSchemaJson: descriptor.InputSchema, OutputSchemaJson: descriptor.OutputSchema,
+		}},
+	}
+	contract, digest, err := ValidateDescription(description)
+	if err != nil || len(contract.Actions) != 1 || len(digest) != 64 {
+		t.Fatalf("contract=%+v digest=%q err=%v", contract, digest, err)
+	}
+	_, repeated, err := ValidateDescription(description)
+	if err != nil || repeated != digest {
+		t.Fatalf("repeated digest=%q err=%v", repeated, err)
+	}
+	description.Actions = append(description.Actions, description.Actions[0])
+	if _, _, err := ValidateDescription(description); err == nil {
+		t.Fatal("duplicate host descriptor was accepted")
+	}
+}
+
 func TestShutdownCancelsAndDrainsActiveTriggerWatch(t *testing.T) {
 	t.Parallel()
 	started := make(chan struct{})
 	provider := &blockingTriggerProvider{started: started}
 	runtime, servers, err := New(Config{
-		Metadata: Metadata{Name: "echo", Version: "0.1.0", Capabilities: []string{"trigger.events.watch"}},
-		Trigger:  provider,
+		Metadata: Metadata{Name: "events", Version: "0.1.0", Capabilities: []string{"trigger.events.watch"}, Triggers: []TriggerDescriptor{{
+			Source: "events.watch", ConfigSchema: json.RawMessage(`{"type":"object"}`), EventSchema: json.RawMessage(`{"type":"object"}`),
+		}}},
+		Trigger: provider,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -169,11 +261,18 @@ func TestShutdownIsBoundedWhenHandlerIgnoresCancellation(t *testing.T) {
 
 func newTestRuntime(t *testing.T, handler TaskHandler) *Runtime {
 	t.Helper()
-	runtime, _, err := New(Config{Metadata: Metadata{Name: "echo", Version: "0.1.0", Capabilities: []string{"task.echo.echo"}}, Task: handler})
+	runtime, _, err := New(Config{Metadata: Metadata{Name: "echo", Version: "0.1.0", Capabilities: []string{"task.echo.echo"}, Actions: []ActionDescriptor{testActionDescriptor()}}, Task: handler})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return runtime
+}
+
+func testActionDescriptor() ActionDescriptor {
+	return ActionDescriptor{
+		Action: "echo.echo", ConfigSchema: json.RawMessage(`{"type":"object"}`),
+		InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`),
+	}
 }
 
 func testMeta() *pluginv1alpha1.CallMeta {
