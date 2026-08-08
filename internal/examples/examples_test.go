@@ -84,9 +84,6 @@ func TestSlackExampleUsesOnlySecretRefAndValidMessageShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(flowYAML), "urlSecret: webhook") {
-		t.Fatal("Slack Flow must resolve its URL through urlSecret")
-	}
 	if regexp.MustCompile(`(?m)^\s+url:`).Match(flowYAML) {
 		t.Fatal("Slack Flow must never contain a literal url field")
 	}

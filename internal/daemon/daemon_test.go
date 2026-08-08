@@ -34,6 +34,7 @@ import (
 	"github.com/alexrett/orchigram/internal/process"
 	"github.com/alexrett/orchigram/internal/resource"
 	"github.com/alexrett/orchigram/internal/store"
+	triggercontroller "github.com/alexrett/orchigram/internal/trigger"
 	pluginsdk "github.com/alexrett/orchigram/sdk/plugin"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -131,7 +132,7 @@ func runSlackWeekdayFlowCase(t *testing.T, statuses []int, wantPhase string, wan
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	cfg := config.Development(filepath.Join(root, "state"))
-	stop := serveTestDaemon(t, cfg)
+	instance, stop := serveTestDaemonInstance(t, cfg)
 	stopped := false
 	defer func() {
 		if !stopped {
@@ -170,16 +171,52 @@ spec:
 		t.Fatal(err)
 	}
 	apply(string(flowYAML))
+	triggerYAML, err := os.ReadFile(filepath.Join("..", "..", "examples", "slack", "weekday-trigger.yaml")) //nolint:gosec // Test loads the shipped Trigger.
+	if err != nil {
+		t.Fatal(err)
+	}
+	triggerDocument := applyClientResource(t, client, string(triggerYAML))
+	projections = append(projections, append([]byte(nil), triggerDocument.GetJson()...))
 	for _, projection := range projections {
 		assertSecretAbsent(t, "resource projection", projection, sentinel, webhookURL)
 	}
 
-	run, err := client.Runs.Start(context.Background(), &controlv1alpha1.StartRunRequest{Flow: "weekday-engineering-reminder", InputJson: []byte(`{}`), IdempotencyKey: "slack-daemon-acceptance"})
+	triggerResource, err := resource.DecodeTrigger(triggerDocument.GetJson())
 	if err != nil {
 		t.Fatal(err)
 	}
-	events := collectRunEventsUntil(t, client, run.GetUid(), "run."+wantPhase)
-	summary, err := client.Runs.Reconcile(context.Background(), &controlv1alpha1.ReconcileRequest{RunUid: run.GetUid()})
+	berlin, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tomorrow := time.Now().In(berlin).AddDate(0, 0, 1)
+	for tomorrow.Weekday() == time.Saturday || tomorrow.Weekday() == time.Sunday {
+		tomorrow = tomorrow.AddDate(0, 0, 1)
+	}
+	occurrence := time.Date(tomorrow.Year(), tomorrow.Month(), tomorrow.Day(), 9, 0, 0, 0, berlin)
+	if _, err := instance.store.EnsureTriggerState(context.Background(), triggerDocument.GetKey().GetUid(), triggerDocument.GetGeneration(), true, occurrence.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.store.AdvanceTriggerCursor(context.Background(), triggerDocument.GetKey().GetUid(), occurrence.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.triggers.ReconcileSchedules(context.Background(), occurrence.Add(30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	receipt := waitForTriggerReceipt(t, client, triggerDocument.GetKey().GetUid())
+	expectedOccurrence := triggercontroller.OccurrenceIdentity(triggerResource, occurrence)
+	if receipt.GetOccurrenceId() != expectedOccurrence {
+		t.Fatalf("schedule occurrence=%q want=%q", receipt.GetOccurrenceId(), expectedOccurrence)
+	}
+	if receipt.GetRunUid() == "" {
+		t.Fatal("schedule receipt has no outbox Run UID")
+	}
+	if !receipt.GetDeduplicated() {
+		t.Fatal("schedule receipt does not enforce stable occurrence idempotency")
+	}
+	runUID := receipt.GetRunUid()
+	events := collectRunEventsUntil(t, client, runUID, "run."+wantPhase)
+	summary, err := client.Runs.Reconcile(context.Background(), &controlv1alpha1.ReconcileRequest{RunUid: runUID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -791,7 +828,19 @@ func TestGitHubIssueApprovalToPullRequestTracer(t *testing.T) {
 	t.Setenv("ORCHIGRAM_TEST_GITHUB_TOKEN", "fixture-token")
 	cfg := config.Development(filepath.Join(root, "state"))
 	stop := serveTestDaemon(t, cfg)
+	stopped := false
+	defer func() {
+		if !stopped {
+			stop()
+		}
+	}()
 	client := dialReadyClient(t, cfg.SocketPath)
+	clientClosed := false
+	defer func() {
+		if !clientClosed {
+			_ = client.Close()
+		}
+	}()
 	for name, capabilities := range map[string][]string{
 		"exec": {"task.exec.run"}, "agent-command": {"agent.codex", "agent.claude", "agent.command"}, "github": githubplugin.Capabilities,
 	} {
@@ -994,10 +1043,63 @@ spec:
 	if commentCount != 2 || pullCount != 1 || pullHead != branch {
 		t.Fatalf("approved GitHub effects: comments=%d pulls=%d head=%q", commentCount, pullCount, pullHead)
 	}
+
+	fixture.mu.Lock()
+	fixture.events = append(fixture.events, map[string]any{
+		"id": 7002, "event": "labeled", "created_at": time.Now().UTC().Format(time.RFC3339),
+		"label": map[string]any{"name": "orchigram:ready"},
+		"issue": map[string]any{"number": 42, "title": "Reject tracer", "body": "fixture", "html_url": "https://example.invalid/issues/42", "state": "open"},
+	})
+	fixture.mu.Unlock()
+	receipts := waitForTriggerReceipts(t, client, trigger.GetKey().GetUid(), 2)
+	var rejectedReceipt *controlv1alpha1.TriggerReceipt
+	for _, candidate := range receipts {
+		if candidate.GetOccurrenceId() == "github:acme/widget:issue-label-event:7002" {
+			rejectedReceipt = candidate
+			break
+		}
+	}
+	if rejectedReceipt == nil {
+		t.Fatalf("second provider occurrence missing from receipts: %+v", receipts)
+	}
+	if rejectedReceipt.GetRunUid() == receipt.GetRunUid() {
+		t.Fatal("second provider occurrence reused the first Run UID")
+	}
+	waitForRunEvent(t, client, rejectedReceipt.GetRunUid(), 0, "approval.waiting")
+	rejectedWorkspace := filepath.Join(cfg.StateDir, "workspaces", rejectedReceipt.GetRunUid())
+	rejectedBranch := "orchigram/issue-42-" + strings.ReplaceAll(rejectedReceipt.GetRunUid(), "-", "")[:8]
+	if _, err := client.Runs.Reject(context.Background(), &controlv1alpha1.ApprovalRequest{RunUid: rejectedReceipt.GetRunUid(), NodeId: "approval", Reason: "fixture rejection"}); err != nil {
+		t.Fatal(err)
+	}
+	rejectedEvents := collectRunEventsUntil(t, client, rejectedReceipt.GetRunUid(), "run.rejected")
+	if _, err := os.Stat(filepath.Join(rejectedWorkspace, "implemented.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("implementation ran after rejection: %v", err)
+	}
+	if output := runDaemonGit(t, "", "--git-dir", origin, "for-each-ref", "--format=%(refname)", "refs/heads/"+rejectedBranch); strings.TrimSpace(output) != "" {
+		t.Fatalf("rejected run pushed deterministic branch: %s", output)
+	}
+	if !nodeCompletedWithReconciled(t, rejectedEvents, "publish") {
+		t.Error("rejected run did not reconcile its planning comment")
+	}
+	for _, nodeID := range []string{"implement", "tests", "push", "pr", "final"} {
+		for _, event := range rejectedEvents {
+			if event.GetNodeId() == nodeID && event.GetType() == "node.completed" {
+				t.Errorf("rejected run completed forbidden node %q", nodeID)
+			}
+		}
+	}
+	fixture.mu.Lock()
+	rejectedCommentCount, rejectedPullCount := len(fixture.comments[42]), len(fixture.pulls)
+	fixture.mu.Unlock()
+	if rejectedCommentCount != 3 || rejectedPullCount != 1 {
+		t.Fatalf("rejected GitHub effects: comments=%d pulls=%d", rejectedCommentCount, rejectedPullCount)
+	}
 	if err := client.Close(); err != nil {
 		t.Fatal(err)
 	}
+	clientClosed = true
 	stop()
+	stopped = true
 
 	stopRestarted := serveTestDaemon(t, cfg)
 	defer stopRestarted()
@@ -1005,15 +1107,23 @@ spec:
 	defer func() { _ = restarted.Close() }()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		receipts, err := restarted.Triggers.Receipts(context.Background(), &controlv1alpha1.ReceiptRequest{TriggerUid: trigger.GetKey().GetUid(), Limit: 10})
+		receiptsContext, cancelReceipts := context.WithTimeout(context.Background(), time.Second)
+		receipts, err := restarted.Triggers.Receipts(receiptsContext, &controlv1alpha1.ReceiptRequest{TriggerUid: trigger.GetKey().GetUid(), Limit: 10})
+		cancelReceipts()
 		if err != nil {
 			t.Fatal(err)
 		}
-		runs, err := restarted.Runs.List(context.Background(), &controlv1alpha1.ListRunsRequest{Limit: 10})
+		runsContext, cancelRuns := context.WithTimeout(context.Background(), time.Second)
+		runs, err := restarted.Runs.List(runsContext, &controlv1alpha1.ListRunsRequest{Limit: 10})
+		cancelRuns()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(receipts.GetReceipts()) != 1 || receipts.GetReceipts()[0].GetRunUid() != receipt.GetRunUid() || len(runs.GetRuns()) != 1 {
+		seenRuns := map[string]bool{}
+		for _, candidate := range receipts.GetReceipts() {
+			seenRuns[candidate.GetRunUid()] = true
+		}
+		if len(receipts.GetReceipts()) != 2 || !seenRuns[receipt.GetRunUid()] || !seenRuns[rejectedReceipt.GetRunUid()] || len(runs.GetRuns()) != 2 {
 			t.Fatalf("provider replay created duplicate state: receipts=%d runs=%d", len(receipts.GetReceipts()), len(runs.GetRuns()))
 		}
 		time.Sleep(25 * time.Millisecond)
@@ -1028,20 +1138,25 @@ spec:
 
 func waitForTriggerReceipt(t *testing.T, client *clientpkg.Client, triggerUID string) *controlv1alpha1.TriggerReceipt {
 	t.Helper()
+	return waitForTriggerReceipts(t, client, triggerUID, 1)[0]
+}
+
+func waitForTriggerReceipts(t *testing.T, client *clientpkg.Client, triggerUID string, wanted int) []*controlv1alpha1.TriggerReceipt {
+	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
 	for {
 		response, err := client.Triggers.Receipts(context.Background(), &controlv1alpha1.ReceiptRequest{TriggerUid: triggerUID, Limit: 10})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(response.GetReceipts()) == 1 {
-			return response.GetReceipts()[0]
+		if len(response.GetReceipts()) == wanted {
+			return response.GetReceipts()
 		}
-		if len(response.GetReceipts()) > 1 {
-			t.Fatalf("provider created %d receipts", len(response.GetReceipts()))
+		if len(response.GetReceipts()) > wanted {
+			t.Fatalf("trigger created %d receipts, want %d", len(response.GetReceipts()), wanted)
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("provider event did not create a receipt")
+			t.Fatalf("trigger created %d receipts, want %d", len(response.GetReceipts()), wanted)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -1180,6 +1295,12 @@ func TestDefaultConfigurationOpensNoNetworkListener(t *testing.T) {
 
 func serveTestDaemon(t *testing.T, cfg config.Config) func() {
 	t.Helper()
+	_, stop := serveTestDaemonInstance(t, cfg)
+	return stop
+}
+
+func serveTestDaemonInstance(t *testing.T, cfg config.Config) (*Daemon, func()) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	instance, err := Open(ctx, cfg, nil)
 	if err != nil {
@@ -1188,7 +1309,7 @@ func serveTestDaemon(t *testing.T, cfg config.Config) func() {
 	}
 	served := make(chan error, 1)
 	go func() { served <- instance.Serve(ctx) }()
-	return func() {
+	return instance, func() {
 		cancel()
 		select {
 		case serveErr := <-served:

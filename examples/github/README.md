@@ -6,9 +6,11 @@ run/node marker, waits for durable TUI approval, implements and tests the
 change, pushes a deterministic branch, and creates or reconciles a pull
 request. It never merges and never pushes the default branch.
 
-Human reviewers request revisions through ordinary GitHub controls. Revisions
-reuse the deterministic issue branch and existing pull request; only normal
-GitHub review and merge controls can merge it.
+In v0.1, revisions are ordinary operator Git/GitHub pushes to the existing
+branch and pull request; Orchigram does not automate review events. A new
+provider-triggered Run has a new Run UID and therefore derives a new
+deterministic branch. Only normal GitHub review and merge controls can merge a
+pull request.
 
 The example names the dedicated `alexrett/orchigram-e2e` repository from the
 v0.1 acceptance plan. Create it as a private test repository before running a

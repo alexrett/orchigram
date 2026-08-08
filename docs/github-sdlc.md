@@ -56,9 +56,10 @@ workspace and reconciles the same branch head. The branch is always
 
 Approval rejection terminates interpretation before implementation, tests,
 commit, push, and PR creation. Orchigram never merges a PR and never pushes the
-default branch. Human reviewers request changes through ordinary GitHub
-controls; revisions reuse the deterministic branch and existing PR, and the
-reviewed PR is merged only through ordinary GitHub controls.
+default branch. In v0.1, revisions are ordinary operator Git/GitHub pushes to
+the existing branch and PR; review-event automation is not implemented. A new
+provider-triggered Run has a new Run UID and derives a new deterministic branch.
+The reviewed PR is merged only through ordinary GitHub controls.
 
 [`examples/self-sdlc`](../examples/self-sdlc/README.md) is the portable version
 used to operate a repository through its own Unix-socket-only daemon. Its owner,
@@ -72,7 +73,9 @@ Automated tests use recorded-shaped `httptest` GitHub responses and a real
 local bare Git repository. They cover pagination, a rate-limit retry, provider
 identity, one receipt and Run UID across provider restart replay, durable
 approval, test-before-push ordering, deterministic branch reuse, and ambiguous
-comment/PR successes reconciled by hidden marker. A real private-repository
-gate is intentionally manual because it mutates external state; follow the
-operator steps in `examples/github/README.md` only with a disposable issue and
-explicit confirmation.
+comment/PR successes reconciled by hidden marker. A second provider occurrence
+is rejected after its reconciled planning comment and proves that no
+implementation, remote branch, push, or additional PR follows. A real
+private-repository gate is intentionally manual because it mutates external
+state; follow the operator steps in `examples/github/README.md` only with a
+disposable issue and explicit confirmation.
