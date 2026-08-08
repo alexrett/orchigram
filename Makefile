@@ -69,7 +69,7 @@ cross-build:
 check: generate-check fmt vet test race lint buf-check secret-scan build
 
 release-check: check history-scan cross-build release-tools
-	PATH="$(BIN_DIR):$$PATH" $(GO) run github.com/goreleaser/goreleaser/v2@v2.12.7 release --snapshot --clean
+	PATH="$(BIN_DIR):$$PATH" $(GO) run github.com/goreleaser/goreleaser/v2@v2.12.7 release --snapshot --clean --parallelism 1
 
 clean:
 	rm -rf $(BIN_DIR) dist .release coverage.out

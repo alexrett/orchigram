@@ -25,8 +25,9 @@ Every release contains:
 
 Build timestamps come from the source commit. Go binaries use `-trimpath`,
 `-buildvcs=false`, a cleared build ID, and fixed version/commit/date values.
-Plugin tar/gzip headers are normalized to the Unix epoch. The release packager
-has a byte-for-byte reproducibility test.
+Plugin tar/gzip headers are normalized to the Unix epoch. GoReleaser runs with
+one packaging worker so archive member ordering is stable; the release packager
+also has a byte-for-byte reproducibility test.
 
 ## External tracer checkpoints
 
