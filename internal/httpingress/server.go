@@ -22,12 +22,12 @@ const maxBody = 1 << 20
 
 // SecretResolver returns values without exposing them through resource APIs.
 type SecretResolver interface {
-	ResolveSecret(context.Context, string) ([]byte, error)
+	ResolveSecret(context.Context, string, string) ([]byte, error)
 }
 
 // Acceptor owns compilation and the durable receipt/plan/outbox boundary.
 type Acceptor interface {
-	AcceptTrigger(context.Context, string, string, string, string, json.RawMessage, bool) (store.Receipt, error)
+	AcceptTrigger(context.Context, string, uint64, string, string, string, json.RawMessage, bool) (store.Receipt, error)
 }
 
 // Server owns the one explicitly configured HTTP listener.
@@ -120,7 +120,7 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		writeError(writer, http.StatusNotFound, "hook_not_found")
 		return
 	}
-	secret, err := s.secrets.ResolveSecret(request.Context(), trigger.Spec.Webhook.BearerSecretRef)
+	secret, err := s.secrets.ResolveSecret(request.Context(), trigger.Metadata.Namespace, trigger.Spec.Webhook.BearerSecretRef)
 	if err != nil {
 		writeError(writer, http.StatusServiceUnavailable, "hook_secret_unavailable")
 		return
@@ -152,14 +152,26 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	if idempotencyKey == "" {
 		idempotencyKey = uuid.NewString()
 	}
-	receipt, err := s.acceptor.AcceptTrigger(request.Context(), trigger.Metadata.UID, "webhook:"+idempotencyKey, trigger.Spec.Flow, trigger.Metadata.Namespace, body, deduplicated)
+	receipt, err := s.acceptor.AcceptTrigger(request.Context(), trigger.Metadata.UID, trigger.Metadata.Generation, "webhook:"+idempotencyKey, trigger.Spec.Flow, trigger.Metadata.Namespace, body, deduplicated)
 	if err != nil {
+		if unavailableTrigger(err) {
+			writeError(writer, http.StatusNotFound, "hook_not_found")
+			return
+		}
 		writeError(writer, http.StatusInternalServerError, "persistence_failed")
 		return
 	}
 	writer.Header().Set("Content-Type", "application/json")
 	writer.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(writer).Encode(map[string]any{"receiptUID": receipt.UID, "runUID": receipt.RunUID, "duplicate": receipt.Existing, "deduplicated": receipt.Deduplicated})
+}
+
+func unavailableTrigger(err error) bool {
+	var staleFlow *store.StaleFlowPlanError
+	var staleTrigger *store.StaleTriggerGenerationError
+	var changedReference *store.TriggerReferenceChangedError
+	return errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrTriggerDisabled) ||
+		errors.As(err, &staleFlow) || errors.As(err, &staleTrigger) || errors.As(err, &changedReference)
 }
 
 func writeError(writer http.ResponseWriter, statusCode int, code string) {

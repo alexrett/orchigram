@@ -73,7 +73,7 @@ func (o *Orchestrator) StartManual(ctx context.Context, flowName, namespace stri
 	if idempotencyKey == "" {
 		idempotencyKey = uuid.NewString()
 	}
-	receipt, err := o.AcceptTrigger(ctx, "manual:"+namespace+":"+flowName, idempotencyKey, flowName, namespace, input, deduplicated)
+	receipt, err := o.AcceptTrigger(ctx, "manual:"+namespace+":"+flowName, 0, idempotencyKey, flowName, namespace, input, deduplicated)
 	if err != nil {
 		return store.Receipt{}, err
 	}
@@ -87,7 +87,7 @@ func (o *Orchestrator) StartManual(ctx context.Context, flowName, namespace stri
 // AcceptTrigger compiles the referenced Flow before acknowledging the
 // occurrence and atomically stores the resulting immutable plan with the
 // receipt and outbox command.
-func (o *Orchestrator) AcceptTrigger(ctx context.Context, triggerUID, occurrenceID, flowName, namespace string, input json.RawMessage, deduplicated bool) (store.Receipt, error) {
+func (o *Orchestrator) AcceptTrigger(ctx context.Context, triggerUID string, triggerGeneration uint64, occurrenceID, flowName, namespace string, input json.RawMessage, deduplicated bool) (store.Receipt, error) {
 	if existing, err := o.store.ReceiptByOccurrence(ctx, triggerUID, occurrenceID); err == nil {
 		existing.Existing = true
 		return existing, nil
@@ -101,7 +101,7 @@ func (o *Orchestrator) AcceptTrigger(ctx context.Context, triggerUID, occurrence
 	if err := flow.ValidateRunInput(plan, input); err != nil {
 		return store.Receipt{}, err
 	}
-	return o.store.AcceptTriggerWithPlan(ctx, triggerUID, occurrenceID, flowName, namespace, input, deduplicated, plan)
+	return o.store.AcceptTriggerWithPlan(ctx, triggerUID, triggerGeneration, occurrenceID, flowName, namespace, input, deduplicated, plan)
 }
 
 // AcceptProviderTrigger applies the same immutable acceptance boundary while

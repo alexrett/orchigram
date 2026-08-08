@@ -17,7 +17,7 @@ import (
 
 type staticSecrets map[string][]byte
 
-func (s staticSecrets) ResolveSecret(_ context.Context, name string) ([]byte, error) {
+func (s staticSecrets) ResolveSecret(_ context.Context, _ string, name string) ([]byte, error) {
 	return s[name], nil
 }
 

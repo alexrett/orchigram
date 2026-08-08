@@ -305,11 +305,11 @@ func TestTriggerReceiptAndOutboxAreDeduplicated(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s := openTestStore(t)
-	first, err := s.AcceptTrigger(ctx, "manual", "key-1", "demo", "default", json.RawMessage(`{"x":1}`), true)
+	first, err := s.AcceptTrigger(ctx, "manual", 0, "key-1", "demo", "default", json.RawMessage(`{"x":1}`), true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := s.AcceptTrigger(ctx, "manual", "key-1", "demo", "default", json.RawMessage(`{"x":2}`), true)
+	second, err := s.AcceptTrigger(ctx, "manual", 0, "key-1", "demo", "default", json.RawMessage(`{"x":2}`), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,13 +332,26 @@ func TestAcceptedPlanAndOutboxAreCommittedTogether(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s := openTestStore(t)
+	flowDocument, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: demo}
+spec:
+  nodes: [{id: accepted, uses: core.noop}]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedFlow, err := s.Apply(ctx, flowDocument, ApplyOptions{RequestID: "accepted-plan-flow"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	plan := flow.ExecutionPlan{
-		APIVersion: resource.APIVersion, FlowUID: "flow-accepted", FlowGeneration: 7,
+		APIVersion: resource.APIVersion, FlowUID: storedFlow.Metadata.UID, FlowGeneration: storedFlow.Metadata.Generation,
 		InterpreterVersion: flow.InterpreterVersion, Timeout: "1h0m0s", MaxParallel: 1,
 		Nodes:    []flow.PlanNode{{ID: "accepted", Name: "accepted", Uses: "core.noop", Timeout: "1h0m0s", RetryBackoff: "1s"}},
 		PlanHash: "accepted-plan-hash",
 	}
-	receipt, err := s.AcceptTriggerWithPlan(ctx, "manual", "accepted-occurrence", "demo", "default", json.RawMessage(`{"x":1}`), true, plan)
+	receipt, err := s.AcceptTriggerWithPlan(ctx, "manual", 0, "accepted-occurrence", "demo", "default", json.RawMessage(`{"x":1}`), true, plan)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,6 +365,143 @@ func TestAcceptedPlanAndOutboxAreCommittedTogether(t *testing.T) {
 	}
 	if command.Payload.RunUID != receipt.RunUID || command.Payload.PlanHash != plan.PlanHash {
 		t.Fatalf("command=%+v receipt=%+v", command, receipt)
+	}
+}
+
+func TestAcceptanceRejectsAFlowChangedAfterCompilation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openTestStore(t)
+	storedFlow := applyAcceptanceFlow(t, s, "stale-flow", "first")
+	plan := acceptancePlan(storedFlow, "stale-plan")
+	updatedDocument, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: stale-flow}
+spec:
+  nodes: [{id: done, uses: core.noop, with: {result: second}}]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Apply(ctx, updatedDocument, ApplyOptions{ExpectedResourceVersion: storedFlow.Metadata.ResourceVersion, RequestID: "change-flow"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.AcceptTriggerWithPlan(ctx, "manual:default:stale-flow", 0, "stale-occurrence", "stale-flow", resource.DefaultNamespace, json.RawMessage(`{}`), true, plan)
+	var stale *StaleFlowPlanError
+	if !errors.As(err, &stale) {
+		t.Fatalf("stale plan acceptance error=%v", err)
+	}
+	if _, err := s.ReceiptByOccurrence(ctx, "manual:default:stale-flow", "stale-occurrence"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("stale plan wrote a receipt: %v", err)
+	}
+	if _, err := s.GetPlan(ctx, plan.PlanHash); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("stale plan was persisted: %v", err)
+	}
+	if _, err := s.ClaimStart(ctx, time.Hour); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("stale plan wrote an outbox command: %v", err)
+	}
+
+	deletedStore := openTestStore(t)
+	deletedFlow := applyAcceptanceFlow(t, deletedStore, "deleted-flow", "first")
+	deletedPlan := acceptancePlan(deletedFlow, "deleted-plan")
+	if err := deletedStore.Delete(ctx, "Flow", resource.DefaultNamespace, "deleted-flow", deletedFlow.Metadata.ResourceVersion, "delete-flow"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deletedStore.AcceptTriggerWithPlan(ctx, "manual:default:deleted-flow", 0, "deleted-occurrence", "deleted-flow", resource.DefaultNamespace, json.RawMessage(`{}`), true, deletedPlan); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted Flow acceptance error=%v", err)
+	}
+	if _, err := deletedStore.ReceiptByOccurrence(ctx, "manual:default:deleted-flow", "deleted-occurrence"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted Flow wrote a receipt: %v", err)
+	}
+}
+
+func TestAcceptanceAndFlowMutationHaveOneTransactionOrder(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openTestStore(t)
+	storedFlow := applyAcceptanceFlow(t, s, "linearized-flow", "first")
+	trigger := applyStoreTriggerForFlow(t, s, "linearized-trigger", "linearized-flow")
+	plan := acceptancePlan(storedFlow, "linearized-plan")
+	validated, releaseAcceptance := make(chan struct{}), make(chan struct{})
+	acceptDone := make(chan error, 1)
+	go func() {
+		_, err := s.acceptTrigger(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, "linearized-occurrence", "linearized-flow", resource.DefaultNamespace, json.RawMessage(`{}`), true, "", "", func() {
+			close(validated)
+			<-releaseAcceptance
+		}, &plan)
+		acceptDone <- err
+	}()
+	<-validated
+
+	updatedDocument, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: linearized-flow}
+spec:
+  nodes: [{id: done, uses: core.noop, with: {result: second}}]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitCount := s.db.Stats().WaitCount
+	mutationDone := make(chan error, 1)
+	go func() {
+		_, applyErr := s.Apply(ctx, updatedDocument, ApplyOptions{ExpectedResourceVersion: storedFlow.Metadata.ResourceVersion, RequestID: "linearized-update"})
+		mutationDone <- applyErr
+	}()
+	waitForDatabaseWaiter(t, s, waitCount, mutationDone)
+	close(releaseAcceptance)
+	if err := <-acceptDone; err != nil {
+		t.Fatalf("acceptance-first receipt: %v", err)
+	}
+	if err := <-mutationDone; err != nil {
+		t.Fatalf("acceptance-first Flow mutation: %v", err)
+	}
+	receipt, err := s.ReceiptByOccurrence(ctx, trigger.Metadata.UID, "linearized-occurrence")
+	if err != nil || receipt.RunUID == "" {
+		t.Fatalf("accepted receipt=%+v err=%v", receipt, err)
+	}
+}
+
+func TestResourceTriggerAcceptancePinsGenerationAndFlowReference(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openTestStore(t)
+	storedFlow := applyAcceptanceFlow(t, s, "trigger-target", "first")
+	otherFlow := applyAcceptanceFlow(t, s, "other-target", "other")
+	trigger := applyStoreTriggerForFlow(t, s, "strict-trigger", "trigger-target")
+	plan := acceptancePlan(otherFlow, "wrong-flow-plan")
+	_, err := s.AcceptTriggerWithPlan(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, "wrong-flow", "other-target", resource.DefaultNamespace, json.RawMessage(`{}`), true, plan)
+	var changed *TriggerReferenceChangedError
+	if !errors.As(err, &changed) {
+		t.Fatalf("changed Trigger reference error=%v", err)
+	}
+	updatedTriggerDocument, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata: {name: strict-trigger}
+spec:
+  flow: trigger-target
+  provider: {plugin: github, config: {repository: changed}}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedTrigger, err := s.Apply(ctx, updatedTriggerDocument, ApplyOptions{ExpectedResourceVersion: trigger.Metadata.ResourceVersion, RequestID: "update-trigger"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan = acceptancePlan(storedFlow, "stale-trigger-plan")
+	_, err = s.AcceptTriggerWithPlan(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, "stale-trigger", "trigger-target", resource.DefaultNamespace, json.RawMessage(`{}`), true, plan)
+	var staleTrigger *StaleTriggerGenerationError
+	if !errors.As(err, &staleTrigger) {
+		t.Fatalf("stale Trigger generation error=%v", err)
+	}
+	trigger = updatedTrigger
+	if err := s.SetTriggerEnabled(ctx, trigger.Metadata.UID, false); err != nil {
+		t.Fatal(err)
+	}
+	plan = acceptancePlan(storedFlow, "disabled-plan")
+	if _, err := s.AcceptTriggerWithPlan(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, "disabled", "trigger-target", resource.DefaultNamespace, json.RawMessage(`{}`), true, plan); !errors.Is(err, ErrTriggerDisabled) {
+		t.Fatalf("disabled Trigger acceptance error=%v", err)
 	}
 }
 
@@ -604,14 +754,18 @@ func boolIntTest(value bool) int {
 }
 
 func applyStoreTrigger(t *testing.T, s *Store, name string) resource.Document {
+	return applyStoreTriggerForFlow(t, s, name, "target")
+}
+
+func applyStoreTriggerForFlow(t *testing.T, s *Store, name, flowName string) resource.Document {
 	t.Helper()
 	document, err := resource.DecodeStrict([]byte(fmt.Sprintf(`apiVersion: orchigram.dev/v1alpha1
 kind: Trigger
 metadata: {name: %s}
 spec:
-  flow: target
+  flow: %s
   provider: {plugin: github, config: {repository: fixture}}
-`, name)))
+`, name, flowName)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -620,6 +774,33 @@ spec:
 		t.Fatal(err)
 	}
 	return applied
+}
+
+func applyAcceptanceFlow(t *testing.T, s *Store, name, result string) resource.Document {
+	t.Helper()
+	document, err := resource.DecodeStrict([]byte(fmt.Sprintf(`apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: %s}
+spec:
+  nodes: [{id: done, uses: core.noop, with: {result: %s}}]
+`, name, result)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied, err := s.Apply(context.Background(), document, ApplyOptions{RequestID: "acceptance-flow-" + name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return applied
+}
+
+func acceptancePlan(document resource.Document, hash string) flow.ExecutionPlan {
+	return flow.ExecutionPlan{
+		APIVersion: resource.APIVersion, FlowUID: document.Metadata.UID, FlowGeneration: document.Metadata.Generation,
+		InterpreterVersion: flow.InterpreterVersion, Timeout: "1h0m0s", MaxParallel: 1,
+		Nodes:    []flow.PlanNode{{ID: "done", Name: "done", Uses: "core.noop", Timeout: "1h0m0s", RetryBackoff: "1s"}},
+		PlanHash: hash,
+	}
 }
 
 func TestPluginVersionsActivateAndRollbackWithoutOverwrite(t *testing.T) {

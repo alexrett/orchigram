@@ -5,7 +5,7 @@ Current milestone: v0.1.0 First Real Release
 Current phase: 9 of 12
 Progress: 1/5 release phases
 Last activity: 2026-08-08
-Current focus: consistent cross-resource resolution and the complete live operator surface
+Current focus: declarative PluginInstallation reconciliation and the complete live operator surface
 
 ## Reality check
 
@@ -35,6 +35,10 @@ delivered through public issues and independently reviewed pull requests.
 The first Phase 9 gate now passes strict first-party action contracts, pinned
 plugin schema digests, compile-time mapping and typed CEL diagnostics, and
 runtime validation against the accepted immutable plan.
+
+The second Phase 9 gate now passes namespace-local resource resolution,
+provider config/event contracts, server-owned readiness conditions, and
+transactional Trigger/Flow generation checks at the durable acceptance boundary.
 
 ## Active phase gate
 

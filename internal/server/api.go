@@ -23,6 +23,7 @@ import (
 	"github.com/alexrett/orchigram/internal/orchestrator"
 	"github.com/alexrett/orchigram/internal/pluginbundle"
 	"github.com/alexrett/orchigram/internal/pluginmanager"
+	"github.com/alexrett/orchigram/internal/references"
 	"github.com/alexrett/orchigram/internal/resource"
 	"github.com/alexrett/orchigram/internal/store"
 	triggercontroller "github.com/alexrett/orchigram/internal/trigger"
@@ -43,6 +44,7 @@ type API struct {
 	orchestrator *orchestrator.Orchestrator
 	engine       engine.DurableEngine
 	plugins      *pluginmanager.Manager
+	references   *references.Resolver
 	triggers     *triggercontroller.Controller
 	stateDir     string
 	startedAt    time.Time
@@ -50,7 +52,7 @@ type API struct {
 
 // NewAPI constructs the public service implementation.
 func NewAPI(state *store.Store, compiler *flow.Compiler, control *orchestrator.Orchestrator, durable engine.DurableEngine, plugins *pluginmanager.Manager, triggers *triggercontroller.Controller, stateDir string) *API {
-	return &API{store: state, compiler: compiler, orchestrator: control, engine: durable, plugins: plugins, triggers: triggers, stateDir: stateDir, startedAt: time.Now()}
+	return &API{store: state, compiler: compiler, orchestrator: control, engine: durable, plugins: plugins, references: references.New(state, plugins), triggers: triggers, stateDir: stateDir, startedAt: time.Now()}
 }
 
 // Register binds every public service to one gRPC server.
@@ -85,19 +87,16 @@ func (a *API) apply(ctx context.Context, request *controlv1alpha1.ApplyRequest, 
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	diagnostics := []*controlv1alpha1.Diagnostic{}
-	if doc.Kind == "Flow" {
-		flowResource, decodeErr := resource.DecodeFlow(doc.JSON)
-		if decodeErr != nil {
-			return nil, status.Error(codes.InvalidArgument, decodeErr.Error())
-		}
-		_, compilerDiagnostics := a.compiler.Compile(flowResource)
-		for _, diagnostic := range compilerDiagnostics {
-			diagnostics = append(diagnostics, diagnosticPB(diagnostic))
-		}
-		if flow.HasErrors(compilerDiagnostics) {
-			return &controlv1alpha1.ApplyResponse{Resource: resourcePB(doc), Diagnostics: diagnostics}, nil
-		}
+	resourceDiagnostics, diagnosticErr := a.resourceDiagnostics(ctx, doc)
+	if diagnosticErr != nil {
+		return nil, status.Error(codes.InvalidArgument, diagnosticErr.Error())
+	}
+	diagnostics := make([]*controlv1alpha1.Diagnostic, 0, len(resourceDiagnostics))
+	for _, diagnostic := range resourceDiagnostics {
+		diagnostics = append(diagnostics, diagnosticPB(diagnostic))
+	}
+	if flow.HasErrors(resourceDiagnostics) {
+		return &controlv1alpha1.ApplyResponse{Resource: resourcePB(doc), Diagnostics: diagnostics}, nil
 	}
 	if dryRun {
 		return &controlv1alpha1.ApplyResponse{Resource: resourcePB(doc), Diagnostics: diagnostics}, nil
@@ -139,18 +138,41 @@ func (a *API) List(ctx context.Context, request *controlv1alpha1.ListRequest) (*
 }
 
 func (a *API) projectResource(ctx context.Context, document resource.Document) *controlv1alpha1.ResourceDocument {
-	if document.Kind != "SecretRef" {
+	if document.Kind == "SecretRef" {
+		state, backend := "Missing", "unknown"
+		if a.plugins != nil {
+			state, backend = a.plugins.SecretStatus(ctx, document.Metadata.Namespace, document.Metadata.Name)
+		}
+		projected, err := document.WithServerStatus(map[string]any{"state": state, "backend": backend})
+		if err == nil {
+			document = projected
+		}
 		return resourcePB(document)
 	}
-	state, backend := a.plugins.SecretStatus(ctx, document.Metadata.Name)
-	var value map[string]any
-	if json.Unmarshal(document.JSON, &value) == nil {
-		value["status"] = map[string]any{"state": state, "backend": backend}
-		if projected, err := json.Marshal(value); err == nil {
-			document.JSON = projected
+	if document.Kind == "Flow" || references.Supports(document.Kind) {
+		diagnostics, err := a.resourceDiagnostics(ctx, document)
+		if err == nil {
+			if projected, projectionErr := document.WithServerStatus(references.Status(document, diagnostics)); projectionErr == nil {
+				document = projected
+			}
 		}
 	}
 	return resourcePB(document)
+}
+
+func (a *API) resourceDiagnostics(ctx context.Context, document resource.Document) ([]flow.Diagnostic, error) {
+	diagnostics := make([]flow.Diagnostic, 0)
+	if document.Kind == "Flow" {
+		flowResource, err := resource.DecodeFlow(document.JSON)
+		if err != nil {
+			return nil, err
+		}
+		_, diagnostics = a.compiler.Compile(flowResource)
+	}
+	if references.Supports(document.Kind) {
+		diagnostics = append(diagnostics, a.references.Diagnostics(ctx, document)...)
+	}
+	return diagnostics, nil
 }
 
 // Delete CAS-deletes a resource.
@@ -179,7 +201,7 @@ func (a *API) Watch(request *controlv1alpha1.WatchRequest, stream grpc.ServerStr
 				if decodeErr != nil {
 					return status.Error(codes.Internal, "stored resource event is invalid")
 				}
-				document = resourcePB(doc)
+				document = a.projectResource(stream.Context(), doc)
 			}
 			if err := stream.Send(&controlv1alpha1.ResourceEvent{Revision: event.Revision, Type: event.Type, Resource: document, ObservedAt: timestamppb.New(event.ObservedAt)}); err != nil {
 				return err
@@ -711,9 +733,16 @@ func artifactPB(artifact store.ArtifactRecord) *controlv1alpha1.ArtifactInfo {
 
 func rpcError(err error) error {
 	var conflict *store.ConflictError
+	var staleFlow *store.StaleFlowPlanError
+	var staleTrigger *store.StaleTriggerGenerationError
+	var changedReference *store.TriggerReferenceChangedError
 	switch {
 	case errors.As(err, &conflict):
 		return status.Error(codes.Aborted, conflict.Error())
+	case errors.As(err, &staleFlow), errors.As(err, &staleTrigger), errors.As(err, &changedReference):
+		return status.Error(codes.Aborted, err.Error())
+	case errors.Is(err, store.ErrTriggerDisabled):
+		return status.Error(codes.FailedPrecondition, err.Error())
 	case errors.Is(err, store.ErrNotFound):
 		return status.Error(codes.NotFound, err.Error())
 	default:

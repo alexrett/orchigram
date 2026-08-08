@@ -24,12 +24,12 @@ var cronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month 
 
 // Provider watches one active TriggerProvider and acknowledges callback success.
 type Provider interface {
-	WatchTrigger(context.Context, string, string, map[string]any, string, time.Time, func(*pluginv1alpha1.TriggerEvent) error) error
+	WatchTrigger(context.Context, string, string, string, map[string]any, string, time.Time, func(*pluginv1alpha1.TriggerEvent) error) error
 }
 
 // Acceptor owns compilation and the durable receipt/plan/outbox boundary.
 type Acceptor interface {
-	AcceptTrigger(context.Context, string, string, string, string, json.RawMessage, bool) (store.Receipt, error)
+	AcceptTrigger(context.Context, string, uint64, string, string, string, json.RawMessage, bool) (store.Receipt, error)
 	AcceptProviderTrigger(context.Context, string, uint64, string, string, string, json.RawMessage, string) (store.Receipt, error)
 }
 
@@ -213,7 +213,7 @@ func (c *Controller) reconcileSchedule(ctx context.Context, trigger resource.Tri
 		}
 	}
 	payload, _ := json.Marshal(map[string]any{"trigger": map[string]any{"type": "schedule", "scheduledAt": selected.UTC().Format(time.RFC3339Nano), "occurrenceId": identity}})
-	if _, err := c.acceptor.AcceptTrigger(ctx, trigger.Metadata.UID, identity, trigger.Spec.Flow, trigger.Metadata.Namespace, payload, true); err != nil {
+	if _, err := c.acceptor.AcceptTrigger(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, identity, trigger.Spec.Flow, trigger.Metadata.Namespace, payload, true); err != nil {
 		return err
 	}
 	return c.store.AdvanceTriggerCursor(ctx, trigger.Metadata.UID, last)
@@ -275,7 +275,7 @@ func (c *Controller) watchProvider(ctx context.Context, trigger resource.Trigger
 		watchMessage := "provider subscription failed and is waiting to retry"
 		if stateErr == nil && err == nil {
 			c.health.Clear(providerHealthKey(trigger.Metadata.UID))
-			watchErr := c.provider.WatchTrigger(ctx, trigger.Spec.Provider.Plugin, trigger.Metadata.UID, trigger.Spec.Provider.Config, cursor, state.CursorAt, func(event *pluginv1alpha1.TriggerEvent) error {
+			watchErr := c.provider.WatchTrigger(ctx, trigger.Spec.Provider.Plugin, trigger.Metadata.UID, trigger.Metadata.Namespace, trigger.Spec.Provider.Config, cursor, state.CursorAt, func(event *pluginv1alpha1.TriggerEvent) error {
 				if event.GetProviderEventId() == "" || event.GetCursor() == "" || !json.Valid(event.GetPayloadJson()) {
 					return errors.New("provider event identity, cursor, and JSON payload are required")
 				}

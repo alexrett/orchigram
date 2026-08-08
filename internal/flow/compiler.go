@@ -43,7 +43,7 @@ type ActionValidator interface {
 // a non-core node. Bindings are private execution-plan data, never public Flow
 // schema fields.
 type ActionBinder interface {
-	BindAction(action string, config map[string]any) (ActionBinding, []Diagnostic)
+	BindAction(namespace, action string, config map[string]any) (ActionBinding, []Diagnostic)
 }
 
 // Diagnostic is a stable compiler diagnostic.
@@ -105,6 +105,7 @@ type ActionBinding struct {
 type PlanNode struct {
 	ID                string            `json:"id"`
 	Name              string            `json:"name"`
+	Namespace         string            `json:"namespace"`
 	Uses              string            `json:"uses"`
 	With              map[string]any    `json:"with,omitempty"`
 	RetryLimit        int               `json:"retryLimit"`
@@ -265,7 +266,7 @@ func (c *Compiler) Compile(input resource.Flow) (ExecutionPlan, []Diagnostic) {
 			diagnostics = append(diagnostics, Diagnostic{Path: path + ".uses", Code: "unknown_action", Message: fmt.Sprintf("no enabled plugin provides %q", node.Uses)})
 		} else if !strings.HasPrefix(node.Uses, "core.") {
 			if binder, ok := c.capabilities.(ActionBinder); ok {
-				resolved, bindingDiagnostics := binder.BindAction(node.Uses, node.With)
+				resolved, bindingDiagnostics := binder.BindAction(input.Metadata.Namespace, node.Uses, node.With)
 				for _, diagnostic := range bindingDiagnostics {
 					diagnostic.Path = nodeConfigDiagnosticPath(path, diagnostic.Path)
 					diagnostics = append(diagnostics, diagnostic)
@@ -311,7 +312,7 @@ func (c *Compiler) Compile(input resource.Flow) (ExecutionPlan, []Diagnostic) {
 		if name == "" {
 			name = node.ID
 		}
-		planNode := PlanNode{ID: node.ID, Name: name, Uses: node.Uses, With: node.With, RetryLimit: retryLimit, RetryBackoff: retryBackoff, Timeout: nodeTimeout.String(), LoopMaxIterations: loopMax}
+		planNode := PlanNode{ID: node.ID, Name: name, Namespace: input.Metadata.Namespace, Uses: node.Uses, With: node.With, RetryLimit: retryLimit, RetryBackoff: retryBackoff, Timeout: nodeTimeout.String(), LoopMaxIterations: loopMax}
 		if binding != nil {
 			planNode.With = binding.Config
 			planNode.Plugin = &binding.Plugin
