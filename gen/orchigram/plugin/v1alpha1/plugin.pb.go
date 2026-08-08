@@ -801,6 +801,7 @@ type WatchStart struct {
 	Cursor          string                 `protobuf:"bytes,2,opt,name=cursor,proto3" json:"cursor,omitempty"`
 	ConfigJson      []byte                 `protobuf:"bytes,3,opt,name=config_json,json=configJson,proto3" json:"config_json,omitempty"`
 	Secrets         map[string][]byte      `protobuf:"bytes,4,rep,name=secrets,proto3" json:"secrets,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	ActivatedAt     *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=activated_at,json=activatedAt,proto3" json:"activated_at,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -859,6 +860,13 @@ func (x *WatchStart) GetConfigJson() []byte {
 func (x *WatchStart) GetSecrets() map[string][]byte {
 	if x != nil {
 		return x.Secrets
+	}
+	return nil
+}
+
+func (x *WatchStart) GetActivatedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ActivatedAt
 	}
 	return nil
 }
@@ -1256,14 +1264,15 @@ const file_orchigram_plugin_v1alpha1_plugin_proto_rawDesc = "" +
 	"\x06reason\x18\x02 \x01(\tR\x06reason\"F\n" +
 	"\x0eCancelResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12\x18\n" +
-	"\aoutcome\x18\x02 \x01(\tR\aoutcome\"\xfa\x01\n" +
+	"\aoutcome\x18\x02 \x01(\tR\aoutcome\"\xb9\x02\n" +
 	"\n" +
 	"WatchStart\x12)\n" +
 	"\x10installation_uid\x18\x01 \x01(\tR\x0finstallationUid\x12\x16\n" +
 	"\x06cursor\x18\x02 \x01(\tR\x06cursor\x12\x1f\n" +
 	"\vconfig_json\x18\x03 \x01(\fR\n" +
 	"configJson\x12L\n" +
-	"\asecrets\x18\x04 \x03(\v22.orchigram.plugin.v1alpha1.WatchStart.SecretsEntryR\asecrets\x1a:\n" +
+	"\asecrets\x18\x04 \x03(\v22.orchigram.plugin.v1alpha1.WatchStart.SecretsEntryR\asecrets\x12=\n" +
+	"\factivated_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\vactivatedAt\x1a:\n" +
 	"\fSecretsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value:\x028\x01\"P\n" +
@@ -1360,37 +1369,38 @@ var file_orchigram_plugin_v1alpha1_plugin_proto_depIdxs = []int32{
 	22, // 7: orchigram.plugin.v1alpha1.ExecuteEvent.occurred_at:type_name -> google.protobuf.Timestamp
 	0,  // 8: orchigram.plugin.v1alpha1.CancelRequest.meta:type_name -> orchigram.plugin.v1alpha1.CallMeta
 	20, // 9: orchigram.plugin.v1alpha1.WatchStart.secrets:type_name -> orchigram.plugin.v1alpha1.WatchStart.SecretsEntry
-	13, // 10: orchigram.plugin.v1alpha1.TriggerCommand.start:type_name -> orchigram.plugin.v1alpha1.WatchStart
-	14, // 11: orchigram.plugin.v1alpha1.TriggerCommand.ack:type_name -> orchigram.plugin.v1alpha1.TriggerAck
-	22, // 12: orchigram.plugin.v1alpha1.TriggerEvent.occurred_at:type_name -> google.protobuf.Timestamp
-	0,  // 13: orchigram.plugin.v1alpha1.AgentRequest.meta:type_name -> orchigram.plugin.v1alpha1.CallMeta
-	21, // 14: orchigram.plugin.v1alpha1.AgentRequest.secrets:type_name -> orchigram.plugin.v1alpha1.AgentRequest.SecretsEntry
-	0,  // 15: orchigram.plugin.v1alpha1.AgentInput.meta:type_name -> orchigram.plugin.v1alpha1.CallMeta
-	2,  // 16: orchigram.plugin.v1alpha1.PluginControl.Describe:input_type -> orchigram.plugin.v1alpha1.DescribeRequest
-	23, // 17: orchigram.plugin.v1alpha1.PluginControl.Health:input_type -> google.protobuf.Empty
-	5,  // 18: orchigram.plugin.v1alpha1.PluginControl.Shutdown:input_type -> orchigram.plugin.v1alpha1.ShutdownRequest
-	6,  // 19: orchigram.plugin.v1alpha1.TaskProvider.ValidateAction:input_type -> orchigram.plugin.v1alpha1.ValidateActionRequest
-	9,  // 20: orchigram.plugin.v1alpha1.TaskProvider.Execute:input_type -> orchigram.plugin.v1alpha1.ExecuteRequest
-	11, // 21: orchigram.plugin.v1alpha1.TaskProvider.Cancel:input_type -> orchigram.plugin.v1alpha1.CancelRequest
-	15, // 22: orchigram.plugin.v1alpha1.TriggerProvider.Watch:input_type -> orchigram.plugin.v1alpha1.TriggerCommand
-	17, // 23: orchigram.plugin.v1alpha1.AgentRuntime.Execute:input_type -> orchigram.plugin.v1alpha1.AgentRequest
-	18, // 24: orchigram.plugin.v1alpha1.AgentRuntime.Input:input_type -> orchigram.plugin.v1alpha1.AgentInput
-	11, // 25: orchigram.plugin.v1alpha1.AgentRuntime.Cancel:input_type -> orchigram.plugin.v1alpha1.CancelRequest
-	3,  // 26: orchigram.plugin.v1alpha1.PluginControl.Describe:output_type -> orchigram.plugin.v1alpha1.DescribeResponse
-	4,  // 27: orchigram.plugin.v1alpha1.PluginControl.Health:output_type -> orchigram.plugin.v1alpha1.HealthResponse
-	23, // 28: orchigram.plugin.v1alpha1.PluginControl.Shutdown:output_type -> google.protobuf.Empty
-	8,  // 29: orchigram.plugin.v1alpha1.TaskProvider.ValidateAction:output_type -> orchigram.plugin.v1alpha1.ValidateActionResponse
-	10, // 30: orchigram.plugin.v1alpha1.TaskProvider.Execute:output_type -> orchigram.plugin.v1alpha1.ExecuteEvent
-	12, // 31: orchigram.plugin.v1alpha1.TaskProvider.Cancel:output_type -> orchigram.plugin.v1alpha1.CancelResponse
-	16, // 32: orchigram.plugin.v1alpha1.TriggerProvider.Watch:output_type -> orchigram.plugin.v1alpha1.TriggerEvent
-	10, // 33: orchigram.plugin.v1alpha1.AgentRuntime.Execute:output_type -> orchigram.plugin.v1alpha1.ExecuteEvent
-	23, // 34: orchigram.plugin.v1alpha1.AgentRuntime.Input:output_type -> google.protobuf.Empty
-	12, // 35: orchigram.plugin.v1alpha1.AgentRuntime.Cancel:output_type -> orchigram.plugin.v1alpha1.CancelResponse
-	26, // [26:36] is the sub-list for method output_type
-	16, // [16:26] is the sub-list for method input_type
-	16, // [16:16] is the sub-list for extension type_name
-	16, // [16:16] is the sub-list for extension extendee
-	0,  // [0:16] is the sub-list for field type_name
+	22, // 10: orchigram.plugin.v1alpha1.WatchStart.activated_at:type_name -> google.protobuf.Timestamp
+	13, // 11: orchigram.plugin.v1alpha1.TriggerCommand.start:type_name -> orchigram.plugin.v1alpha1.WatchStart
+	14, // 12: orchigram.plugin.v1alpha1.TriggerCommand.ack:type_name -> orchigram.plugin.v1alpha1.TriggerAck
+	22, // 13: orchigram.plugin.v1alpha1.TriggerEvent.occurred_at:type_name -> google.protobuf.Timestamp
+	0,  // 14: orchigram.plugin.v1alpha1.AgentRequest.meta:type_name -> orchigram.plugin.v1alpha1.CallMeta
+	21, // 15: orchigram.plugin.v1alpha1.AgentRequest.secrets:type_name -> orchigram.plugin.v1alpha1.AgentRequest.SecretsEntry
+	0,  // 16: orchigram.plugin.v1alpha1.AgentInput.meta:type_name -> orchigram.plugin.v1alpha1.CallMeta
+	2,  // 17: orchigram.plugin.v1alpha1.PluginControl.Describe:input_type -> orchigram.plugin.v1alpha1.DescribeRequest
+	23, // 18: orchigram.plugin.v1alpha1.PluginControl.Health:input_type -> google.protobuf.Empty
+	5,  // 19: orchigram.plugin.v1alpha1.PluginControl.Shutdown:input_type -> orchigram.plugin.v1alpha1.ShutdownRequest
+	6,  // 20: orchigram.plugin.v1alpha1.TaskProvider.ValidateAction:input_type -> orchigram.plugin.v1alpha1.ValidateActionRequest
+	9,  // 21: orchigram.plugin.v1alpha1.TaskProvider.Execute:input_type -> orchigram.plugin.v1alpha1.ExecuteRequest
+	11, // 22: orchigram.plugin.v1alpha1.TaskProvider.Cancel:input_type -> orchigram.plugin.v1alpha1.CancelRequest
+	15, // 23: orchigram.plugin.v1alpha1.TriggerProvider.Watch:input_type -> orchigram.plugin.v1alpha1.TriggerCommand
+	17, // 24: orchigram.plugin.v1alpha1.AgentRuntime.Execute:input_type -> orchigram.plugin.v1alpha1.AgentRequest
+	18, // 25: orchigram.plugin.v1alpha1.AgentRuntime.Input:input_type -> orchigram.plugin.v1alpha1.AgentInput
+	11, // 26: orchigram.plugin.v1alpha1.AgentRuntime.Cancel:input_type -> orchigram.plugin.v1alpha1.CancelRequest
+	3,  // 27: orchigram.plugin.v1alpha1.PluginControl.Describe:output_type -> orchigram.plugin.v1alpha1.DescribeResponse
+	4,  // 28: orchigram.plugin.v1alpha1.PluginControl.Health:output_type -> orchigram.plugin.v1alpha1.HealthResponse
+	23, // 29: orchigram.plugin.v1alpha1.PluginControl.Shutdown:output_type -> google.protobuf.Empty
+	8,  // 30: orchigram.plugin.v1alpha1.TaskProvider.ValidateAction:output_type -> orchigram.plugin.v1alpha1.ValidateActionResponse
+	10, // 31: orchigram.plugin.v1alpha1.TaskProvider.Execute:output_type -> orchigram.plugin.v1alpha1.ExecuteEvent
+	12, // 32: orchigram.plugin.v1alpha1.TaskProvider.Cancel:output_type -> orchigram.plugin.v1alpha1.CancelResponse
+	16, // 33: orchigram.plugin.v1alpha1.TriggerProvider.Watch:output_type -> orchigram.plugin.v1alpha1.TriggerEvent
+	10, // 34: orchigram.plugin.v1alpha1.AgentRuntime.Execute:output_type -> orchigram.plugin.v1alpha1.ExecuteEvent
+	23, // 35: orchigram.plugin.v1alpha1.AgentRuntime.Input:output_type -> google.protobuf.Empty
+	12, // 36: orchigram.plugin.v1alpha1.AgentRuntime.Cancel:output_type -> orchigram.plugin.v1alpha1.CancelResponse
+	27, // [27:37] is the sub-list for method output_type
+	17, // [17:27] is the sub-list for method input_type
+	17, // [17:17] is the sub-list for extension type_name
+	17, // [17:17] is the sub-list for extension extendee
+	0,  // [0:17] is the sub-list for field type_name
 }
 
 func init() { file_orchigram_plugin_v1alpha1_plugin_proto_init() }

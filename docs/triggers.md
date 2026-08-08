@@ -32,6 +32,9 @@ public routing are deliberately outside Orchigram v0.1.
 ## Provider stream
 
 Provider plugins open a bidirectional gRPC watch from their persisted cursor.
+The initial watch also receives the Trigger generation's durable activation
+timestamp so providers can default to events that occurred after subscription
+creation without losing events across daemon restart.
 The daemon sends an acknowledgement only after receipt, outbox, and cursor are
 committed together. A stream restart therefore replays safely. The bundled
 GitHub provider uses polling rather than requiring public ingress.

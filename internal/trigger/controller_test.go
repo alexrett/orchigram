@@ -117,14 +117,16 @@ spec:
 }
 
 type fakeProvider struct {
-	accepted chan string
-	cancel   context.CancelFunc
+	accepted  chan string
+	activated chan time.Time
+	cancel    context.CancelFunc
 }
 
-func (f *fakeProvider) WatchTrigger(ctx context.Context, _, _ string, _ map[string]any, cursor string, accept func(*pluginv1alpha1.TriggerEvent) error) error {
+func (f *fakeProvider) WatchTrigger(ctx context.Context, _, _ string, _ map[string]any, cursor string, activatedAt time.Time, accept func(*pluginv1alpha1.TriggerEvent) error) error {
 	if cursor != "" {
 		return ctx.Err()
 	}
+	f.activated <- activatedAt
 	event := &pluginv1alpha1.TriggerEvent{ProviderEventId: "provider-event-1", Cursor: "cursor-1", OccurredAt: timestamppb.Now(), PayloadJson: []byte(`{"issue":42}`)}
 	if err := accept(event); err != nil {
 		return err
@@ -145,9 +147,19 @@ spec:
   provider: {plugin: fake, config: {repository: example}}
 `)
 	ctx, cancel := context.WithCancel(context.Background())
-	provider := &fakeProvider{accepted: make(chan string, 1), cancel: cancel}
+	activation := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	provider := &fakeProvider{accepted: make(chan string, 1), activated: make(chan time.Time, 1), cancel: cancel}
 	controller := NewController(state, provider)
+	controller.now = func() time.Time { return activation }
 	go controller.watchProvider(ctx, trigger)
+	select {
+	case activatedAt := <-provider.activated:
+		if !activatedAt.Equal(activation) {
+			t.Fatalf("activatedAt=%s want=%s", activatedAt, activation)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("provider did not receive durable activation time")
+	}
 	select {
 	case cursor := <-provider.accepted:
 		if cursor != "cursor-1" {

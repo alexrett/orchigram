@@ -365,7 +365,7 @@ func (m *Manager) Execute(ctx context.Context, runUID string, node flow.PlanNode
 
 // WatchTrigger runs one bidirectional provider stream and acknowledges an
 // event only after the controller callback has durably persisted it.
-func (m *Manager) WatchTrigger(ctx context.Context, pluginName, triggerUID string, config map[string]any, cursor string, accept func(*pluginv1alpha1.TriggerEvent) error) error {
+func (m *Manager) WatchTrigger(ctx context.Context, pluginName, triggerUID string, config map[string]any, cursor string, activatedAt time.Time, accept func(*pluginv1alpha1.TriggerEvent) error) error {
 	process, record, err := m.activeProcess(ctx, pluginName)
 	if err != nil {
 		return err
@@ -386,7 +386,11 @@ func (m *Manager) WatchTrigger(ctx context.Context, pluginName, triggerUID strin
 	if err != nil {
 		return err
 	}
-	if err := stream.Send(&pluginv1alpha1.TriggerCommand{Value: &pluginv1alpha1.TriggerCommand_Start{Start: &pluginv1alpha1.WatchStart{InstallationUid: triggerUID, Cursor: cursor, ConfigJson: configJSON, Secrets: secrets}}}); err != nil {
+	start := &pluginv1alpha1.WatchStart{InstallationUid: triggerUID, Cursor: cursor, ConfigJson: configJSON, Secrets: secrets}
+	if !activatedAt.IsZero() {
+		start.ActivatedAt = timestamppb.New(activatedAt)
+	}
+	if err := stream.Send(&pluginv1alpha1.TriggerCommand{Value: &pluginv1alpha1.TriggerCommand_Start{Start: start}}); err != nil {
 		return err
 	}
 	for {
@@ -585,7 +589,10 @@ func (m *Manager) consume(ctx context.Context, artifact runArtifact, stream even
 		}
 		if err != nil {
 			if terminal != "" {
-				return nil, errors.New("plugin stream did not end immediately after its terminal event")
+				if strings.HasSuffix(terminal, ".failed") {
+					return nil, fmt.Errorf("plugin reported %s: %w", terminal, err)
+				}
+				return nil, fmt.Errorf("plugin stream did not end immediately after its terminal event: %w", err)
 			}
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
@@ -1038,7 +1045,10 @@ func drainDoctor(stream eventReceiver) error {
 		}
 		if err != nil {
 			if terminal != "" {
-				return errors.New("doctor stream did not end immediately after completion")
+				if strings.HasSuffix(terminal, ".failed") {
+					return fmt.Errorf("doctor command failed: %w", err)
+				}
+				return fmt.Errorf("doctor stream did not end immediately after completion: %w", err)
 			}
 			return err
 		}

@@ -13,6 +13,7 @@ spec:
       repository: orchigram-e2e
       label: orchigram:ready
       pollInterval: 30s
+      replayExisting: false
       tokenSecret: token
       secretRefs:
         token: github-e2e-token

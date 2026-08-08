@@ -54,8 +54,9 @@ type repositoryConfig struct {
 
 type watchConfig struct {
 	repositoryConfig
-	Label        string `json:"label,omitempty"`
-	PollInterval string `json:"pollInterval,omitempty"`
+	Label          string `json:"label,omitempty"`
+	PollInterval   string `json:"pollInterval,omitempty"`
+	ReplayExisting bool   `json:"replayExisting,omitempty"`
 }
 
 type issueConfig struct {
@@ -219,8 +220,18 @@ func (r *Runtime) Watch(stream pluginv1alpha1.TriggerProvider_WatchServer) error
 	if err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
+	activatedAt := time.Time{}
+	if start.GetActivatedAt() != nil {
+		if !start.GetActivatedAt().IsValid() {
+			return status.Error(codes.InvalidArgument, "activated_at must be a valid timestamp")
+		}
+		activatedAt = start.GetActivatedAt().AsTime()
+	}
+	if config.ReplayExisting || cursor > 0 {
+		activatedAt = time.Time{}
+	}
 	for {
-		events, listErr := r.listReadyEvents(stream.Context(), config, token, cursor)
+		events, listErr := r.listReadyEvents(stream.Context(), config, token, cursor, activatedAt)
 		if listErr != nil {
 			return listErr
 		}
@@ -260,7 +271,7 @@ type readyEvent struct {
 	Issue     issue
 }
 
-func (r *Runtime) listReadyEvents(ctx context.Context, config watchConfig, token []byte, cursor int64) ([]readyEvent, error) {
+func (r *Runtime) listReadyEvents(ctx context.Context, config watchConfig, token []byte, cursor int64, activatedAt time.Time) ([]readyEvent, error) {
 	base := apiBase(config.APIBase)
 	next := fmt.Sprintf("%s/repos/%s/%s/issues/events?per_page=100", base, url.PathEscape(config.Owner), url.PathEscape(config.Repository))
 	result := []readyEvent{}
@@ -272,7 +283,7 @@ func (r *Runtime) listReadyEvents(ctx context.Context, config watchConfig, token
 		}
 		next = nextLink(headers.Get("Link"))
 		for _, event := range events {
-			if event.ID <= cursor || event.Event != "labeled" || event.Label.Name != config.Label {
+			if event.ID <= cursor || event.Event != "labeled" || event.Label.Name != config.Label || (!activatedAt.IsZero() && event.CreatedAt.Before(activatedAt)) {
 				continue
 			}
 			var item issue

@@ -11,6 +11,7 @@ spec:
       repository: REPLACE_WITH_REPOSITORY
       label: orchigram:ready
       pollInterval: 30s
+      replayExisting: false
       tokenSecret: token
       secretRefs:
         token: self-sdlc-github-token
