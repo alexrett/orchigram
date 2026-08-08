@@ -98,6 +98,9 @@ func (o *Orchestrator) AcceptTrigger(ctx context.Context, triggerUID, occurrence
 	if err != nil {
 		return store.Receipt{}, err
 	}
+	if err := flow.ValidateRunInput(plan, input); err != nil {
+		return store.Receipt{}, err
+	}
 	return o.store.AcceptTriggerWithPlan(ctx, triggerUID, occurrenceID, flowName, namespace, input, deduplicated, plan)
 }
 
@@ -115,6 +118,9 @@ func (o *Orchestrator) AcceptProviderTrigger(ctx context.Context, triggerUID str
 	}
 	plan, err := o.compileCurrentFlow(ctx, flowName, namespace)
 	if err != nil {
+		return store.Receipt{}, err
+	}
+	if err := flow.ValidateRunInput(plan, input); err != nil {
 		return store.Receipt{}, err
 	}
 	return o.store.AcceptProviderTriggerWithPlan(ctx, triggerUID, triggerGeneration, occurrenceID, flowName, namespace, input, cursor, plan)
@@ -186,8 +192,12 @@ func (o *Orchestrator) compileCurrentFlow(ctx context.Context, flowName, namespa
 		return flow.ExecutionPlan{}, err
 	}
 	plan, diagnostics := o.compiler.Compile(flowResource)
-	if len(diagnostics) > 0 {
-		return flow.ExecutionPlan{}, fmt.Errorf("flow compile failed: %s at %s", diagnostics[0].Message, diagnostics[0].Path)
+	if flow.HasErrors(diagnostics) {
+		for _, diagnostic := range diagnostics {
+			if diagnostic.IsError() {
+				return flow.ExecutionPlan{}, fmt.Errorf("flow compile failed: %s at %s", diagnostic.Message, diagnostic.Path)
+			}
+		}
 	}
 	return plan, nil
 }

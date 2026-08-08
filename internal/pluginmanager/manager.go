@@ -20,6 +20,7 @@ import (
 	"unicode"
 
 	pluginv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/plugin/v1alpha1"
+	"github.com/alexrett/orchigram/internal/actioncontract"
 	"github.com/alexrett/orchigram/internal/engine"
 	"github.com/alexrett/orchigram/internal/flow"
 	"github.com/alexrett/orchigram/internal/health"
@@ -146,11 +147,22 @@ func (m *Manager) Install(ctx context.Context, bundle []byte) (store.PluginRecor
 	if !sameCapabilities(description.GetCapabilities(), installed.Manifest.Capabilities) {
 		return store.PluginRecord{}, errors.New("plugin capabilities do not match manifest")
 	}
+	contract, contractDigest, err := pluginsdk.ValidateDescription(description)
+	if err != nil {
+		return store.PluginRecord{}, fmt.Errorf("validate plugin action contract: %w", err)
+	}
+	contractJSON, err := json.Marshal(contract)
+	if err != nil {
+		return store.PluginRecord{}, err
+	}
 	manifestJSON, err := json.Marshal(installed.Manifest)
 	if err != nil {
 		return store.PluginRecord{}, err
 	}
-	record := store.PluginRecord{Name: installed.Manifest.Name, Version: installed.Manifest.Version, Digest: installed.Digest, ManifestJSON: manifestJSON, State: "installed"}
+	record := store.PluginRecord{
+		Name: installed.Manifest.Name, Version: installed.Manifest.Version, Digest: installed.Digest,
+		ManifestJSON: manifestJSON, ContractJSON: contractJSON, ContractDigest: contractDigest, State: "installed",
+	}
 	installed, err = pluginbundle.Publish(installed)
 	if err != nil {
 		return store.PluginRecord{}, err
@@ -344,6 +356,14 @@ func (m *Manager) BindAction(action string, config map[string]any) (flow.ActionB
 	if err := json.Unmarshal(record.ManifestJSON, &manifest); err != nil {
 		return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config", Code: "plugin_invalid", Message: err.Error()}}
 	}
+	contract, err := pluginsdk.DecodeContract(record.ContractJSON)
+	if err != nil {
+		return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config", Code: "plugin_contract_invalid", Message: err.Error()}}
+	}
+	descriptor, found := actionDescriptor(contract, action)
+	if !found {
+		return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config", Code: "plugin_contract_missing", Message: fmt.Sprintf("plugin action %q has no installed schema descriptor", action)}}
+	}
 	boundConfig, err := cloneConfig(config)
 	if err != nil {
 		return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config", Code: "invalid", Message: err.Error()}}
@@ -388,7 +408,7 @@ func (m *Manager) BindAction(action string, config map[string]any) (flow.ActionB
 				return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config.profile", Code: "not_found", Message: bindErr.Error()}}
 			}
 		}
-		return actionBinding(record, manifest, boundConfig, bindings), nil
+		return actionBinding(record, manifest, descriptor, boundConfig, bindings), nil
 	}
 	if action == "github.workspace.checkout" {
 		repositoryName, _ := boundConfig["repositoryRef"].(string)
@@ -427,41 +447,13 @@ func (m *Manager) BindAction(action string, config map[string]any) (flow.ActionB
 			return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config.secretRefs", Code: "not_found", Message: bindErr.Error()}}
 		}
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	process, _, err := m.processFor(ctx, name, record.Version, record.Digest)
-	if err != nil {
-		return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config", Code: "plugin_unavailable", Message: err.Error()}}
-	}
-	validationConfig := make(map[string]any, len(boundConfig))
-	for key, value := range boundConfig {
-		if key != "secretRefs" && key != "mappings" {
-			validationConfig[key] = value
-		}
-	}
 	if strings.HasPrefix(action, "github.workspace.") {
-		validationConfig["workspaceRoot"] = m.workspaces
+		boundConfig["workspaceRoot"] = m.workspaces
 	}
-	configJSON, err := json.Marshal(validationConfig)
-	if err != nil {
-		return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config", Code: "invalid", Message: err.Error()}}
-	}
-	response, err := process.Clients().Task.ValidateAction(ctx, &pluginv1alpha1.ValidateActionRequest{Action: action, ConfigJson: configJSON})
-	if err != nil {
-		return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config", Code: "validation_failed", Message: err.Error()}}
-	}
-	diagnostics := make([]flow.Diagnostic, 0, len(response.GetIssues()))
-	for _, issue := range response.GetIssues() {
-		diagnostics = append(diagnostics, flow.Diagnostic{Path: issue.GetPath(), Code: issue.GetCode(), Message: issue.GetMessage()})
-	}
-	if len(diagnostics) != 0 {
-		return flow.ActionBinding{}, diagnostics
-	}
-	return actionBinding(record, manifest, boundConfig, bindings), nil
+	return actionBinding(record, manifest, descriptor, boundConfig, bindings), nil
 }
 
-func actionBinding(record store.PluginRecord, manifest pluginbundle.Manifest, config map[string]any, resources map[string]flow.ResourceBinding) flow.ActionBinding {
+func actionBinding(record store.PluginRecord, manifest pluginbundle.Manifest, descriptor pluginsdk.ActionDescriptor, config map[string]any, resources map[string]flow.ResourceBinding) flow.ActionBinding {
 	bindings := make([]flow.ResourceBinding, 0, len(resources))
 	for _, binding := range resources {
 		bindings = append(bindings, binding)
@@ -477,8 +469,21 @@ func actionBinding(record store.PluginRecord, manifest pluginbundle.Manifest, co
 	}
 	return flow.ActionBinding{
 		Plugin: flow.PluginBinding{Name: record.Name, Version: record.Version, Digest: record.Digest, ProtocolVersion: protocol},
+		Contract: flow.ActionContract{
+			Digest: record.ContractDigest, ConfigSchema: append(json.RawMessage(nil), descriptor.ConfigSchema...),
+			InputSchema: append(json.RawMessage(nil), descriptor.InputSchema...), OutputSchema: append(json.RawMessage(nil), descriptor.OutputSchema...),
+		},
 		Config: config, Resources: bindings,
 	}
+}
+
+func actionDescriptor(contract pluginsdk.Contract, action string) (pluginsdk.ActionDescriptor, bool) {
+	for _, descriptor := range contract.Actions {
+		if descriptor.Action == action {
+			return descriptor, true
+		}
+	}
+	return pluginsdk.ActionDescriptor{}, false
 }
 
 func cloneConfig(config map[string]any) (map[string]any, error) {
@@ -762,6 +767,12 @@ func (m *Manager) executeTask(ctx context.Context, process *pluginhost.Process, 
 	if err != nil {
 		return nil, err
 	}
+	if err := validatePinnedValue(node, "config", config); err != nil {
+		return nil, err
+	}
+	if err := validatePinnedJSON(node, "input", input); err != nil {
+		return nil, err
+	}
 	configJSON, err := json.Marshal(config)
 	if err != nil {
 		return nil, err
@@ -770,7 +781,14 @@ func (m *Manager) executeTask(ctx context.Context, process *pluginhost.Process, 
 	if err != nil {
 		return nil, err
 	}
-	return m.consume(ctx, m.runArtifact(ctx, meta, secretValues(secrets)), stream)
+	output, err := m.consume(ctx, m.runArtifact(ctx, meta, secretValues(secrets)), stream)
+	if err != nil {
+		return nil, err
+	}
+	if err := validatePinnedJSON(node, "output", output); err != nil {
+		return nil, err
+	}
+	return output, nil
 }
 
 func (m *Manager) expandRepositoryConfig(ctx context.Context, config map[string]any) error {
@@ -828,9 +846,7 @@ func (m *Manager) executeAgent(ctx context.Context, process *pluginhost.Process,
 	}
 	config := make(map[string]any, len(node.With))
 	for key, value := range node.With {
-		if key != "profile" {
-			config[key] = value
-		}
+		config[key] = value
 	}
 	if err := renderConfigTemplates(config, input, nodes); err != nil {
 		return nil, err
@@ -838,6 +854,14 @@ func (m *Manager) executeAgent(ctx context.Context, process *pluginhost.Process,
 	if err := applyMappings(config, input, nodes); err != nil {
 		return nil, err
 	}
+	delete(config, "secretRefs")
+	if err := validatePinnedValue(node, "config", config); err != nil {
+		return nil, err
+	}
+	if err := validatePinnedJSON(node, "input", input); err != nil {
+		return nil, err
+	}
+	delete(config, "profile")
 	invocation := map[string]any{}
 	var decodedInput any
 	if len(input) > 0 && json.Unmarshal(input, &decodedInput) == nil {
@@ -860,7 +884,55 @@ func (m *Manager) executeAgent(ctx context.Context, process *pluginhost.Process,
 	if err != nil {
 		return nil, err
 	}
-	return m.consume(ctx, m.runArtifact(ctx, meta, secretValues(secrets)), stream)
+	output, err := m.consume(ctx, m.runArtifact(ctx, meta, secretValues(secrets)), stream)
+	if err != nil {
+		return nil, err
+	}
+	if err := validatePinnedJSON(node, "output", output); err != nil {
+		return nil, err
+	}
+	return output, nil
+}
+
+func validatePinnedValue(node flow.PlanNode, part string, value any) error {
+	if node.Contract == nil {
+		return nil
+	}
+	var raw json.RawMessage
+	switch part {
+	case "config":
+		raw = node.Contract.ConfigSchema
+	case "input":
+		raw = node.Contract.InputSchema
+	case "output":
+		raw = node.Contract.OutputSchema
+	default:
+		return fmt.Errorf("unknown action contract part %q", part)
+	}
+	schema, err := actioncontract.Compile(raw)
+	if err != nil {
+		return fmt.Errorf("pinned %s schema is invalid", part)
+	}
+	violations := schema.Validate(value)
+	if len(violations) == 0 {
+		return nil
+	}
+	path := part
+	if len(violations[0].Path) > 0 {
+		path += "." + strings.Join(violations[0].Path, ".")
+	}
+	return fmt.Errorf("%s violates pinned action schema (%s)", path, violations[0].Code)
+}
+
+func validatePinnedJSON(node flow.PlanNode, part string, raw json.RawMessage) error {
+	var value any
+	if len(raw) == 0 {
+		raw = json.RawMessage(`{}`)
+	}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return fmt.Errorf("%s is not valid JSON", part)
+	}
+	return validatePinnedValue(node, part, value)
 }
 
 func sortedMapKeys(values map[string]any) []string {
@@ -1058,6 +1130,15 @@ func (m *Manager) launch(ctx context.Context, record store.PluginRecord) (*plugi
 	if description.GetName() != record.Name || description.GetVersion() != record.Version {
 		process.Close()
 		return nil, errors.New("running plugin identity does not match installation")
+	}
+	_, contractDigest, err := pluginsdk.ValidateDescription(description)
+	if err != nil {
+		process.Close()
+		return nil, fmt.Errorf("validate running plugin action contract: %w", err)
+	}
+	if contractDigest != record.ContractDigest {
+		process.Close()
+		return nil, errors.New("running plugin action contract does not match the immutable installation")
 	}
 	return process, nil
 }

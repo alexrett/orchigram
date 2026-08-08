@@ -203,21 +203,153 @@ func (x *DescribeRequest) GetHostProtocol() *ProtocolRange {
 	return nil
 }
 
-type DescribeResponse struct {
+type ActionDescriptor struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
-	Name             string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Version          string                 `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
-	Protocol         *ProtocolRange         `protobuf:"bytes,3,opt,name=protocol,proto3" json:"protocol,omitempty"`
-	Capabilities     []string               `protobuf:"bytes,4,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
-	InputSchemaJson  []byte                 `protobuf:"bytes,5,opt,name=input_schema_json,json=inputSchemaJson,proto3" json:"input_schema_json,omitempty"`
-	OutputSchemaJson []byte                 `protobuf:"bytes,6,opt,name=output_schema_json,json=outputSchemaJson,proto3" json:"output_schema_json,omitempty"`
+	Action           string                 `protobuf:"bytes,1,opt,name=action,proto3" json:"action,omitempty"`
+	ConfigSchemaJson []byte                 `protobuf:"bytes,2,opt,name=config_schema_json,json=configSchemaJson,proto3" json:"config_schema_json,omitempty"`
+	InputSchemaJson  []byte                 `protobuf:"bytes,3,opt,name=input_schema_json,json=inputSchemaJson,proto3" json:"input_schema_json,omitempty"`
+	OutputSchemaJson []byte                 `protobuf:"bytes,4,opt,name=output_schema_json,json=outputSchemaJson,proto3" json:"output_schema_json,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *ActionDescriptor) Reset() {
+	*x = ActionDescriptor{}
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ActionDescriptor) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ActionDescriptor) ProtoMessage() {}
+
+func (x *ActionDescriptor) ProtoReflect() protoreflect.Message {
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ActionDescriptor.ProtoReflect.Descriptor instead.
+func (*ActionDescriptor) Descriptor() ([]byte, []int) {
+	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *ActionDescriptor) GetAction() string {
+	if x != nil {
+		return x.Action
+	}
+	return ""
+}
+
+func (x *ActionDescriptor) GetConfigSchemaJson() []byte {
+	if x != nil {
+		return x.ConfigSchemaJson
+	}
+	return nil
+}
+
+func (x *ActionDescriptor) GetInputSchemaJson() []byte {
+	if x != nil {
+		return x.InputSchemaJson
+	}
+	return nil
+}
+
+func (x *ActionDescriptor) GetOutputSchemaJson() []byte {
+	if x != nil {
+		return x.OutputSchemaJson
+	}
+	return nil
+}
+
+type TriggerDescriptor struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Source           string                 `protobuf:"bytes,1,opt,name=source,proto3" json:"source,omitempty"`
+	ConfigSchemaJson []byte                 `protobuf:"bytes,2,opt,name=config_schema_json,json=configSchemaJson,proto3" json:"config_schema_json,omitempty"`
+	EventSchemaJson  []byte                 `protobuf:"bytes,3,opt,name=event_schema_json,json=eventSchemaJson,proto3" json:"event_schema_json,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *TriggerDescriptor) Reset() {
+	*x = TriggerDescriptor{}
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TriggerDescriptor) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TriggerDescriptor) ProtoMessage() {}
+
+func (x *TriggerDescriptor) ProtoReflect() protoreflect.Message {
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TriggerDescriptor.ProtoReflect.Descriptor instead.
+func (*TriggerDescriptor) Descriptor() ([]byte, []int) {
+	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *TriggerDescriptor) GetSource() string {
+	if x != nil {
+		return x.Source
+	}
+	return ""
+}
+
+func (x *TriggerDescriptor) GetConfigSchemaJson() []byte {
+	if x != nil {
+		return x.ConfigSchemaJson
+	}
+	return nil
+}
+
+func (x *TriggerDescriptor) GetEventSchemaJson() []byte {
+	if x != nil {
+		return x.EventSchemaJson
+	}
+	return nil
+}
+
+type DescribeResponse struct {
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	Name         string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Version      string                 `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
+	Protocol     *ProtocolRange         `protobuf:"bytes,3,opt,name=protocol,proto3" json:"protocol,omitempty"`
+	Capabilities []string               `protobuf:"bytes,4,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
+	// Deprecated: Marked as deprecated in orchigram/plugin/v1alpha1/plugin.proto.
+	InputSchemaJson []byte `protobuf:"bytes,5,opt,name=input_schema_json,json=inputSchemaJson,proto3" json:"input_schema_json,omitempty"`
+	// Deprecated: Marked as deprecated in orchigram/plugin/v1alpha1/plugin.proto.
+	OutputSchemaJson []byte               `protobuf:"bytes,6,opt,name=output_schema_json,json=outputSchemaJson,proto3" json:"output_schema_json,omitempty"`
+	Actions          []*ActionDescriptor  `protobuf:"bytes,7,rep,name=actions,proto3" json:"actions,omitempty"`
+	Triggers         []*TriggerDescriptor `protobuf:"bytes,8,rep,name=triggers,proto3" json:"triggers,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
 
 func (x *DescribeResponse) Reset() {
 	*x = DescribeResponse{}
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[3]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -229,7 +361,7 @@ func (x *DescribeResponse) String() string {
 func (*DescribeResponse) ProtoMessage() {}
 
 func (x *DescribeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[3]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -242,7 +374,7 @@ func (x *DescribeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DescribeResponse.ProtoReflect.Descriptor instead.
 func (*DescribeResponse) Descriptor() ([]byte, []int) {
-	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{3}
+	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *DescribeResponse) GetName() string {
@@ -273,6 +405,7 @@ func (x *DescribeResponse) GetCapabilities() []string {
 	return nil
 }
 
+// Deprecated: Marked as deprecated in orchigram/plugin/v1alpha1/plugin.proto.
 func (x *DescribeResponse) GetInputSchemaJson() []byte {
 	if x != nil {
 		return x.InputSchemaJson
@@ -280,9 +413,24 @@ func (x *DescribeResponse) GetInputSchemaJson() []byte {
 	return nil
 }
 
+// Deprecated: Marked as deprecated in orchigram/plugin/v1alpha1/plugin.proto.
 func (x *DescribeResponse) GetOutputSchemaJson() []byte {
 	if x != nil {
 		return x.OutputSchemaJson
+	}
+	return nil
+}
+
+func (x *DescribeResponse) GetActions() []*ActionDescriptor {
+	if x != nil {
+		return x.Actions
+	}
+	return nil
+}
+
+func (x *DescribeResponse) GetTriggers() []*TriggerDescriptor {
+	if x != nil {
+		return x.Triggers
 	}
 	return nil
 }
@@ -297,7 +445,7 @@ type HealthResponse struct {
 
 func (x *HealthResponse) Reset() {
 	*x = HealthResponse{}
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[4]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -309,7 +457,7 @@ func (x *HealthResponse) String() string {
 func (*HealthResponse) ProtoMessage() {}
 
 func (x *HealthResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[4]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -322,7 +470,7 @@ func (x *HealthResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthResponse.ProtoReflect.Descriptor instead.
 func (*HealthResponse) Descriptor() ([]byte, []int) {
-	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{4}
+	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *HealthResponse) GetReady() bool {
@@ -348,7 +496,7 @@ type ShutdownRequest struct {
 
 func (x *ShutdownRequest) Reset() {
 	*x = ShutdownRequest{}
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[5]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -360,7 +508,7 @@ func (x *ShutdownRequest) String() string {
 func (*ShutdownRequest) ProtoMessage() {}
 
 func (x *ShutdownRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[5]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -373,7 +521,7 @@ func (x *ShutdownRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShutdownRequest.ProtoReflect.Descriptor instead.
 func (*ShutdownRequest) Descriptor() ([]byte, []int) {
-	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{5}
+	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *ShutdownRequest) GetDeadline() *timestamppb.Timestamp {
@@ -393,7 +541,7 @@ type ValidateActionRequest struct {
 
 func (x *ValidateActionRequest) Reset() {
 	*x = ValidateActionRequest{}
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[6]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -405,7 +553,7 @@ func (x *ValidateActionRequest) String() string {
 func (*ValidateActionRequest) ProtoMessage() {}
 
 func (x *ValidateActionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[6]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -418,7 +566,7 @@ func (x *ValidateActionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ValidateActionRequest.ProtoReflect.Descriptor instead.
 func (*ValidateActionRequest) Descriptor() ([]byte, []int) {
-	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{6}
+	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ValidateActionRequest) GetAction() string {
@@ -446,7 +594,7 @@ type ValidationIssue struct {
 
 func (x *ValidationIssue) Reset() {
 	*x = ValidationIssue{}
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[7]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -458,7 +606,7 @@ func (x *ValidationIssue) String() string {
 func (*ValidationIssue) ProtoMessage() {}
 
 func (x *ValidationIssue) ProtoReflect() protoreflect.Message {
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[7]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -471,7 +619,7 @@ func (x *ValidationIssue) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ValidationIssue.ProtoReflect.Descriptor instead.
 func (*ValidationIssue) Descriptor() ([]byte, []int) {
-	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{7}
+	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ValidationIssue) GetPath() string {
@@ -504,7 +652,7 @@ type ValidateActionResponse struct {
 
 func (x *ValidateActionResponse) Reset() {
 	*x = ValidateActionResponse{}
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[8]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -516,7 +664,7 @@ func (x *ValidateActionResponse) String() string {
 func (*ValidateActionResponse) ProtoMessage() {}
 
 func (x *ValidateActionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[8]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -529,7 +677,7 @@ func (x *ValidateActionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ValidateActionResponse.ProtoReflect.Descriptor instead.
 func (*ValidateActionResponse) Descriptor() ([]byte, []int) {
-	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{8}
+	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ValidateActionResponse) GetIssues() []*ValidationIssue {
@@ -552,7 +700,7 @@ type ExecuteRequest struct {
 
 func (x *ExecuteRequest) Reset() {
 	*x = ExecuteRequest{}
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[9]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -564,7 +712,7 @@ func (x *ExecuteRequest) String() string {
 func (*ExecuteRequest) ProtoMessage() {}
 
 func (x *ExecuteRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[9]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -577,7 +725,7 @@ func (x *ExecuteRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecuteRequest.ProtoReflect.Descriptor instead.
 func (*ExecuteRequest) Descriptor() ([]byte, []int) {
-	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{9}
+	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *ExecuteRequest) GetMeta() *CallMeta {
@@ -628,7 +776,7 @@ type ExecuteEvent struct {
 
 func (x *ExecuteEvent) Reset() {
 	*x = ExecuteEvent{}
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[10]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -640,7 +788,7 @@ func (x *ExecuteEvent) String() string {
 func (*ExecuteEvent) ProtoMessage() {}
 
 func (x *ExecuteEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[10]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -653,7 +801,7 @@ func (x *ExecuteEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecuteEvent.ProtoReflect.Descriptor instead.
 func (*ExecuteEvent) Descriptor() ([]byte, []int) {
-	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{10}
+	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *ExecuteEvent) GetSequence() uint64 {
@@ -701,7 +849,7 @@ type CancelRequest struct {
 
 func (x *CancelRequest) Reset() {
 	*x = CancelRequest{}
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[11]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -713,7 +861,7 @@ func (x *CancelRequest) String() string {
 func (*CancelRequest) ProtoMessage() {}
 
 func (x *CancelRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[11]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -726,7 +874,7 @@ func (x *CancelRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelRequest.ProtoReflect.Descriptor instead.
 func (*CancelRequest) Descriptor() ([]byte, []int) {
-	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{11}
+	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *CancelRequest) GetMeta() *CallMeta {
@@ -753,7 +901,7 @@ type CancelResponse struct {
 
 func (x *CancelResponse) Reset() {
 	*x = CancelResponse{}
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[12]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -765,7 +913,7 @@ func (x *CancelResponse) String() string {
 func (*CancelResponse) ProtoMessage() {}
 
 func (x *CancelResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[12]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -778,7 +926,7 @@ func (x *CancelResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelResponse.ProtoReflect.Descriptor instead.
 func (*CancelResponse) Descriptor() ([]byte, []int) {
-	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{12}
+	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *CancelResponse) GetAccepted() bool {
@@ -808,7 +956,7 @@ type WatchStart struct {
 
 func (x *WatchStart) Reset() {
 	*x = WatchStart{}
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[13]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -820,7 +968,7 @@ func (x *WatchStart) String() string {
 func (*WatchStart) ProtoMessage() {}
 
 func (x *WatchStart) ProtoReflect() protoreflect.Message {
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[13]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -833,7 +981,7 @@ func (x *WatchStart) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WatchStart.ProtoReflect.Descriptor instead.
 func (*WatchStart) Descriptor() ([]byte, []int) {
-	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{13}
+	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *WatchStart) GetInstallationUid() string {
@@ -881,7 +1029,7 @@ type TriggerAck struct {
 
 func (x *TriggerAck) Reset() {
 	*x = TriggerAck{}
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[14]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -893,7 +1041,7 @@ func (x *TriggerAck) String() string {
 func (*TriggerAck) ProtoMessage() {}
 
 func (x *TriggerAck) ProtoReflect() protoreflect.Message {
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[14]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -906,7 +1054,7 @@ func (x *TriggerAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TriggerAck.ProtoReflect.Descriptor instead.
 func (*TriggerAck) Descriptor() ([]byte, []int) {
-	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{14}
+	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *TriggerAck) GetProviderEventId() string {
@@ -936,7 +1084,7 @@ type TriggerCommand struct {
 
 func (x *TriggerCommand) Reset() {
 	*x = TriggerCommand{}
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[15]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -948,7 +1096,7 @@ func (x *TriggerCommand) String() string {
 func (*TriggerCommand) ProtoMessage() {}
 
 func (x *TriggerCommand) ProtoReflect() protoreflect.Message {
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[15]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -961,7 +1109,7 @@ func (x *TriggerCommand) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TriggerCommand.ProtoReflect.Descriptor instead.
 func (*TriggerCommand) Descriptor() ([]byte, []int) {
-	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{15}
+	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *TriggerCommand) GetValue() isTriggerCommand_Value {
@@ -1017,7 +1165,7 @@ type TriggerEvent struct {
 
 func (x *TriggerEvent) Reset() {
 	*x = TriggerEvent{}
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[16]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1029,7 +1177,7 @@ func (x *TriggerEvent) String() string {
 func (*TriggerEvent) ProtoMessage() {}
 
 func (x *TriggerEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[16]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1042,7 +1190,7 @@ func (x *TriggerEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TriggerEvent.ProtoReflect.Descriptor instead.
 func (*TriggerEvent) Descriptor() ([]byte, []int) {
-	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{16}
+	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *TriggerEvent) GetProviderEventId() string {
@@ -1086,7 +1234,7 @@ type AgentRequest struct {
 
 func (x *AgentRequest) Reset() {
 	*x = AgentRequest{}
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[17]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1098,7 +1246,7 @@ func (x *AgentRequest) String() string {
 func (*AgentRequest) ProtoMessage() {}
 
 func (x *AgentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[17]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1111,7 +1259,7 @@ func (x *AgentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AgentRequest.ProtoReflect.Descriptor instead.
 func (*AgentRequest) Descriptor() ([]byte, []int) {
-	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{17}
+	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *AgentRequest) GetMeta() *CallMeta {
@@ -1159,7 +1307,7 @@ type AgentInput struct {
 
 func (x *AgentInput) Reset() {
 	*x = AgentInput{}
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[18]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1171,7 +1319,7 @@ func (x *AgentInput) String() string {
 func (*AgentInput) ProtoMessage() {}
 
 func (x *AgentInput) ProtoReflect() protoreflect.Message {
-	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[18]
+	mi := &file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1184,7 +1332,7 @@ func (x *AgentInput) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AgentInput.ProtoReflect.Descriptor instead.
 func (*AgentInput) Descriptor() ([]byte, []int) {
-	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{18}
+	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *AgentInput) GetMeta() *CallMeta {
@@ -1218,14 +1366,25 @@ const file_orchigram_plugin_v1alpha1_plugin_proto_rawDesc = "" +
 	"\aminimum\x18\x01 \x01(\rR\aminimum\x12\x18\n" +
 	"\amaximum\x18\x02 \x01(\rR\amaximum\"`\n" +
 	"\x0fDescribeRequest\x12M\n" +
-	"\rhost_protocol\x18\x01 \x01(\v2(.orchigram.plugin.v1alpha1.ProtocolRangeR\fhostProtocol\"\x84\x02\n" +
+	"\rhost_protocol\x18\x01 \x01(\v2(.orchigram.plugin.v1alpha1.ProtocolRangeR\fhostProtocol\"\xb2\x01\n" +
+	"\x10ActionDescriptor\x12\x16\n" +
+	"\x06action\x18\x01 \x01(\tR\x06action\x12,\n" +
+	"\x12config_schema_json\x18\x02 \x01(\fR\x10configSchemaJson\x12*\n" +
+	"\x11input_schema_json\x18\x03 \x01(\fR\x0finputSchemaJson\x12,\n" +
+	"\x12output_schema_json\x18\x04 \x01(\fR\x10outputSchemaJson\"\x85\x01\n" +
+	"\x11TriggerDescriptor\x12\x16\n" +
+	"\x06source\x18\x01 \x01(\tR\x06source\x12,\n" +
+	"\x12config_schema_json\x18\x02 \x01(\fR\x10configSchemaJson\x12*\n" +
+	"\x11event_schema_json\x18\x03 \x01(\fR\x0feventSchemaJson\"\x9d\x03\n" +
 	"\x10DescribeResponse\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\tR\aversion\x12D\n" +
 	"\bprotocol\x18\x03 \x01(\v2(.orchigram.plugin.v1alpha1.ProtocolRangeR\bprotocol\x12\"\n" +
-	"\fcapabilities\x18\x04 \x03(\tR\fcapabilities\x12*\n" +
-	"\x11input_schema_json\x18\x05 \x01(\fR\x0finputSchemaJson\x12,\n" +
-	"\x12output_schema_json\x18\x06 \x01(\fR\x10outputSchemaJson\"@\n" +
+	"\fcapabilities\x18\x04 \x03(\tR\fcapabilities\x12.\n" +
+	"\x11input_schema_json\x18\x05 \x01(\fB\x02\x18\x01R\x0finputSchemaJson\x120\n" +
+	"\x12output_schema_json\x18\x06 \x01(\fB\x02\x18\x01R\x10outputSchemaJson\x12E\n" +
+	"\aactions\x18\a \x03(\v2+.orchigram.plugin.v1alpha1.ActionDescriptorR\aactions\x12H\n" +
+	"\btriggers\x18\b \x03(\v2,.orchigram.plugin.v1alpha1.TriggerDescriptorR\btriggers\"@\n" +
 	"\x0eHealthResponse\x12\x14\n" +
 	"\x05ready\x18\x01 \x01(\bR\x05ready\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\"I\n" +
@@ -1331,76 +1490,80 @@ func file_orchigram_plugin_v1alpha1_plugin_proto_rawDescGZIP() []byte {
 	return file_orchigram_plugin_v1alpha1_plugin_proto_rawDescData
 }
 
-var file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
+var file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
 var file_orchigram_plugin_v1alpha1_plugin_proto_goTypes = []any{
 	(*CallMeta)(nil),               // 0: orchigram.plugin.v1alpha1.CallMeta
 	(*ProtocolRange)(nil),          // 1: orchigram.plugin.v1alpha1.ProtocolRange
 	(*DescribeRequest)(nil),        // 2: orchigram.plugin.v1alpha1.DescribeRequest
-	(*DescribeResponse)(nil),       // 3: orchigram.plugin.v1alpha1.DescribeResponse
-	(*HealthResponse)(nil),         // 4: orchigram.plugin.v1alpha1.HealthResponse
-	(*ShutdownRequest)(nil),        // 5: orchigram.plugin.v1alpha1.ShutdownRequest
-	(*ValidateActionRequest)(nil),  // 6: orchigram.plugin.v1alpha1.ValidateActionRequest
-	(*ValidationIssue)(nil),        // 7: orchigram.plugin.v1alpha1.ValidationIssue
-	(*ValidateActionResponse)(nil), // 8: orchigram.plugin.v1alpha1.ValidateActionResponse
-	(*ExecuteRequest)(nil),         // 9: orchigram.plugin.v1alpha1.ExecuteRequest
-	(*ExecuteEvent)(nil),           // 10: orchigram.plugin.v1alpha1.ExecuteEvent
-	(*CancelRequest)(nil),          // 11: orchigram.plugin.v1alpha1.CancelRequest
-	(*CancelResponse)(nil),         // 12: orchigram.plugin.v1alpha1.CancelResponse
-	(*WatchStart)(nil),             // 13: orchigram.plugin.v1alpha1.WatchStart
-	(*TriggerAck)(nil),             // 14: orchigram.plugin.v1alpha1.TriggerAck
-	(*TriggerCommand)(nil),         // 15: orchigram.plugin.v1alpha1.TriggerCommand
-	(*TriggerEvent)(nil),           // 16: orchigram.plugin.v1alpha1.TriggerEvent
-	(*AgentRequest)(nil),           // 17: orchigram.plugin.v1alpha1.AgentRequest
-	(*AgentInput)(nil),             // 18: orchigram.plugin.v1alpha1.AgentInput
-	nil,                            // 19: orchigram.plugin.v1alpha1.ExecuteRequest.SecretsEntry
-	nil,                            // 20: orchigram.plugin.v1alpha1.WatchStart.SecretsEntry
-	nil,                            // 21: orchigram.plugin.v1alpha1.AgentRequest.SecretsEntry
-	(*timestamppb.Timestamp)(nil),  // 22: google.protobuf.Timestamp
-	(*emptypb.Empty)(nil),          // 23: google.protobuf.Empty
+	(*ActionDescriptor)(nil),       // 3: orchigram.plugin.v1alpha1.ActionDescriptor
+	(*TriggerDescriptor)(nil),      // 4: orchigram.plugin.v1alpha1.TriggerDescriptor
+	(*DescribeResponse)(nil),       // 5: orchigram.plugin.v1alpha1.DescribeResponse
+	(*HealthResponse)(nil),         // 6: orchigram.plugin.v1alpha1.HealthResponse
+	(*ShutdownRequest)(nil),        // 7: orchigram.plugin.v1alpha1.ShutdownRequest
+	(*ValidateActionRequest)(nil),  // 8: orchigram.plugin.v1alpha1.ValidateActionRequest
+	(*ValidationIssue)(nil),        // 9: orchigram.plugin.v1alpha1.ValidationIssue
+	(*ValidateActionResponse)(nil), // 10: orchigram.plugin.v1alpha1.ValidateActionResponse
+	(*ExecuteRequest)(nil),         // 11: orchigram.plugin.v1alpha1.ExecuteRequest
+	(*ExecuteEvent)(nil),           // 12: orchigram.plugin.v1alpha1.ExecuteEvent
+	(*CancelRequest)(nil),          // 13: orchigram.plugin.v1alpha1.CancelRequest
+	(*CancelResponse)(nil),         // 14: orchigram.plugin.v1alpha1.CancelResponse
+	(*WatchStart)(nil),             // 15: orchigram.plugin.v1alpha1.WatchStart
+	(*TriggerAck)(nil),             // 16: orchigram.plugin.v1alpha1.TriggerAck
+	(*TriggerCommand)(nil),         // 17: orchigram.plugin.v1alpha1.TriggerCommand
+	(*TriggerEvent)(nil),           // 18: orchigram.plugin.v1alpha1.TriggerEvent
+	(*AgentRequest)(nil),           // 19: orchigram.plugin.v1alpha1.AgentRequest
+	(*AgentInput)(nil),             // 20: orchigram.plugin.v1alpha1.AgentInput
+	nil,                            // 21: orchigram.plugin.v1alpha1.ExecuteRequest.SecretsEntry
+	nil,                            // 22: orchigram.plugin.v1alpha1.WatchStart.SecretsEntry
+	nil,                            // 23: orchigram.plugin.v1alpha1.AgentRequest.SecretsEntry
+	(*timestamppb.Timestamp)(nil),  // 24: google.protobuf.Timestamp
+	(*emptypb.Empty)(nil),          // 25: google.protobuf.Empty
 }
 var file_orchigram_plugin_v1alpha1_plugin_proto_depIdxs = []int32{
-	22, // 0: orchigram.plugin.v1alpha1.CallMeta.deadline:type_name -> google.protobuf.Timestamp
+	24, // 0: orchigram.plugin.v1alpha1.CallMeta.deadline:type_name -> google.protobuf.Timestamp
 	1,  // 1: orchigram.plugin.v1alpha1.DescribeRequest.host_protocol:type_name -> orchigram.plugin.v1alpha1.ProtocolRange
 	1,  // 2: orchigram.plugin.v1alpha1.DescribeResponse.protocol:type_name -> orchigram.plugin.v1alpha1.ProtocolRange
-	22, // 3: orchigram.plugin.v1alpha1.ShutdownRequest.deadline:type_name -> google.protobuf.Timestamp
-	7,  // 4: orchigram.plugin.v1alpha1.ValidateActionResponse.issues:type_name -> orchigram.plugin.v1alpha1.ValidationIssue
-	0,  // 5: orchigram.plugin.v1alpha1.ExecuteRequest.meta:type_name -> orchigram.plugin.v1alpha1.CallMeta
-	19, // 6: orchigram.plugin.v1alpha1.ExecuteRequest.secrets:type_name -> orchigram.plugin.v1alpha1.ExecuteRequest.SecretsEntry
-	22, // 7: orchigram.plugin.v1alpha1.ExecuteEvent.occurred_at:type_name -> google.protobuf.Timestamp
-	0,  // 8: orchigram.plugin.v1alpha1.CancelRequest.meta:type_name -> orchigram.plugin.v1alpha1.CallMeta
-	20, // 9: orchigram.plugin.v1alpha1.WatchStart.secrets:type_name -> orchigram.plugin.v1alpha1.WatchStart.SecretsEntry
-	22, // 10: orchigram.plugin.v1alpha1.WatchStart.activated_at:type_name -> google.protobuf.Timestamp
-	13, // 11: orchigram.plugin.v1alpha1.TriggerCommand.start:type_name -> orchigram.plugin.v1alpha1.WatchStart
-	14, // 12: orchigram.plugin.v1alpha1.TriggerCommand.ack:type_name -> orchigram.plugin.v1alpha1.TriggerAck
-	22, // 13: orchigram.plugin.v1alpha1.TriggerEvent.occurred_at:type_name -> google.protobuf.Timestamp
-	0,  // 14: orchigram.plugin.v1alpha1.AgentRequest.meta:type_name -> orchigram.plugin.v1alpha1.CallMeta
-	21, // 15: orchigram.plugin.v1alpha1.AgentRequest.secrets:type_name -> orchigram.plugin.v1alpha1.AgentRequest.SecretsEntry
-	0,  // 16: orchigram.plugin.v1alpha1.AgentInput.meta:type_name -> orchigram.plugin.v1alpha1.CallMeta
-	2,  // 17: orchigram.plugin.v1alpha1.PluginControl.Describe:input_type -> orchigram.plugin.v1alpha1.DescribeRequest
-	23, // 18: orchigram.plugin.v1alpha1.PluginControl.Health:input_type -> google.protobuf.Empty
-	5,  // 19: orchigram.plugin.v1alpha1.PluginControl.Shutdown:input_type -> orchigram.plugin.v1alpha1.ShutdownRequest
-	6,  // 20: orchigram.plugin.v1alpha1.TaskProvider.ValidateAction:input_type -> orchigram.plugin.v1alpha1.ValidateActionRequest
-	9,  // 21: orchigram.plugin.v1alpha1.TaskProvider.Execute:input_type -> orchigram.plugin.v1alpha1.ExecuteRequest
-	11, // 22: orchigram.plugin.v1alpha1.TaskProvider.Cancel:input_type -> orchigram.plugin.v1alpha1.CancelRequest
-	15, // 23: orchigram.plugin.v1alpha1.TriggerProvider.Watch:input_type -> orchigram.plugin.v1alpha1.TriggerCommand
-	17, // 24: orchigram.plugin.v1alpha1.AgentRuntime.Execute:input_type -> orchigram.plugin.v1alpha1.AgentRequest
-	18, // 25: orchigram.plugin.v1alpha1.AgentRuntime.Input:input_type -> orchigram.plugin.v1alpha1.AgentInput
-	11, // 26: orchigram.plugin.v1alpha1.AgentRuntime.Cancel:input_type -> orchigram.plugin.v1alpha1.CancelRequest
-	3,  // 27: orchigram.plugin.v1alpha1.PluginControl.Describe:output_type -> orchigram.plugin.v1alpha1.DescribeResponse
-	4,  // 28: orchigram.plugin.v1alpha1.PluginControl.Health:output_type -> orchigram.plugin.v1alpha1.HealthResponse
-	23, // 29: orchigram.plugin.v1alpha1.PluginControl.Shutdown:output_type -> google.protobuf.Empty
-	8,  // 30: orchigram.plugin.v1alpha1.TaskProvider.ValidateAction:output_type -> orchigram.plugin.v1alpha1.ValidateActionResponse
-	10, // 31: orchigram.plugin.v1alpha1.TaskProvider.Execute:output_type -> orchigram.plugin.v1alpha1.ExecuteEvent
-	12, // 32: orchigram.plugin.v1alpha1.TaskProvider.Cancel:output_type -> orchigram.plugin.v1alpha1.CancelResponse
-	16, // 33: orchigram.plugin.v1alpha1.TriggerProvider.Watch:output_type -> orchigram.plugin.v1alpha1.TriggerEvent
-	10, // 34: orchigram.plugin.v1alpha1.AgentRuntime.Execute:output_type -> orchigram.plugin.v1alpha1.ExecuteEvent
-	23, // 35: orchigram.plugin.v1alpha1.AgentRuntime.Input:output_type -> google.protobuf.Empty
-	12, // 36: orchigram.plugin.v1alpha1.AgentRuntime.Cancel:output_type -> orchigram.plugin.v1alpha1.CancelResponse
-	27, // [27:37] is the sub-list for method output_type
-	17, // [17:27] is the sub-list for method input_type
-	17, // [17:17] is the sub-list for extension type_name
-	17, // [17:17] is the sub-list for extension extendee
-	0,  // [0:17] is the sub-list for field type_name
+	3,  // 3: orchigram.plugin.v1alpha1.DescribeResponse.actions:type_name -> orchigram.plugin.v1alpha1.ActionDescriptor
+	4,  // 4: orchigram.plugin.v1alpha1.DescribeResponse.triggers:type_name -> orchigram.plugin.v1alpha1.TriggerDescriptor
+	24, // 5: orchigram.plugin.v1alpha1.ShutdownRequest.deadline:type_name -> google.protobuf.Timestamp
+	9,  // 6: orchigram.plugin.v1alpha1.ValidateActionResponse.issues:type_name -> orchigram.plugin.v1alpha1.ValidationIssue
+	0,  // 7: orchigram.plugin.v1alpha1.ExecuteRequest.meta:type_name -> orchigram.plugin.v1alpha1.CallMeta
+	21, // 8: orchigram.plugin.v1alpha1.ExecuteRequest.secrets:type_name -> orchigram.plugin.v1alpha1.ExecuteRequest.SecretsEntry
+	24, // 9: orchigram.plugin.v1alpha1.ExecuteEvent.occurred_at:type_name -> google.protobuf.Timestamp
+	0,  // 10: orchigram.plugin.v1alpha1.CancelRequest.meta:type_name -> orchigram.plugin.v1alpha1.CallMeta
+	22, // 11: orchigram.plugin.v1alpha1.WatchStart.secrets:type_name -> orchigram.plugin.v1alpha1.WatchStart.SecretsEntry
+	24, // 12: orchigram.plugin.v1alpha1.WatchStart.activated_at:type_name -> google.protobuf.Timestamp
+	15, // 13: orchigram.plugin.v1alpha1.TriggerCommand.start:type_name -> orchigram.plugin.v1alpha1.WatchStart
+	16, // 14: orchigram.plugin.v1alpha1.TriggerCommand.ack:type_name -> orchigram.plugin.v1alpha1.TriggerAck
+	24, // 15: orchigram.plugin.v1alpha1.TriggerEvent.occurred_at:type_name -> google.protobuf.Timestamp
+	0,  // 16: orchigram.plugin.v1alpha1.AgentRequest.meta:type_name -> orchigram.plugin.v1alpha1.CallMeta
+	23, // 17: orchigram.plugin.v1alpha1.AgentRequest.secrets:type_name -> orchigram.plugin.v1alpha1.AgentRequest.SecretsEntry
+	0,  // 18: orchigram.plugin.v1alpha1.AgentInput.meta:type_name -> orchigram.plugin.v1alpha1.CallMeta
+	2,  // 19: orchigram.plugin.v1alpha1.PluginControl.Describe:input_type -> orchigram.plugin.v1alpha1.DescribeRequest
+	25, // 20: orchigram.plugin.v1alpha1.PluginControl.Health:input_type -> google.protobuf.Empty
+	7,  // 21: orchigram.plugin.v1alpha1.PluginControl.Shutdown:input_type -> orchigram.plugin.v1alpha1.ShutdownRequest
+	8,  // 22: orchigram.plugin.v1alpha1.TaskProvider.ValidateAction:input_type -> orchigram.plugin.v1alpha1.ValidateActionRequest
+	11, // 23: orchigram.plugin.v1alpha1.TaskProvider.Execute:input_type -> orchigram.plugin.v1alpha1.ExecuteRequest
+	13, // 24: orchigram.plugin.v1alpha1.TaskProvider.Cancel:input_type -> orchigram.plugin.v1alpha1.CancelRequest
+	17, // 25: orchigram.plugin.v1alpha1.TriggerProvider.Watch:input_type -> orchigram.plugin.v1alpha1.TriggerCommand
+	19, // 26: orchigram.plugin.v1alpha1.AgentRuntime.Execute:input_type -> orchigram.plugin.v1alpha1.AgentRequest
+	20, // 27: orchigram.plugin.v1alpha1.AgentRuntime.Input:input_type -> orchigram.plugin.v1alpha1.AgentInput
+	13, // 28: orchigram.plugin.v1alpha1.AgentRuntime.Cancel:input_type -> orchigram.plugin.v1alpha1.CancelRequest
+	5,  // 29: orchigram.plugin.v1alpha1.PluginControl.Describe:output_type -> orchigram.plugin.v1alpha1.DescribeResponse
+	6,  // 30: orchigram.plugin.v1alpha1.PluginControl.Health:output_type -> orchigram.plugin.v1alpha1.HealthResponse
+	25, // 31: orchigram.plugin.v1alpha1.PluginControl.Shutdown:output_type -> google.protobuf.Empty
+	10, // 32: orchigram.plugin.v1alpha1.TaskProvider.ValidateAction:output_type -> orchigram.plugin.v1alpha1.ValidateActionResponse
+	12, // 33: orchigram.plugin.v1alpha1.TaskProvider.Execute:output_type -> orchigram.plugin.v1alpha1.ExecuteEvent
+	14, // 34: orchigram.plugin.v1alpha1.TaskProvider.Cancel:output_type -> orchigram.plugin.v1alpha1.CancelResponse
+	18, // 35: orchigram.plugin.v1alpha1.TriggerProvider.Watch:output_type -> orchigram.plugin.v1alpha1.TriggerEvent
+	12, // 36: orchigram.plugin.v1alpha1.AgentRuntime.Execute:output_type -> orchigram.plugin.v1alpha1.ExecuteEvent
+	25, // 37: orchigram.plugin.v1alpha1.AgentRuntime.Input:output_type -> google.protobuf.Empty
+	14, // 38: orchigram.plugin.v1alpha1.AgentRuntime.Cancel:output_type -> orchigram.plugin.v1alpha1.CancelResponse
+	29, // [29:39] is the sub-list for method output_type
+	19, // [19:29] is the sub-list for method input_type
+	19, // [19:19] is the sub-list for extension type_name
+	19, // [19:19] is the sub-list for extension extendee
+	0,  // [0:19] is the sub-list for field type_name
 }
 
 func init() { file_orchigram_plugin_v1alpha1_plugin_proto_init() }
@@ -1408,7 +1571,7 @@ func file_orchigram_plugin_v1alpha1_plugin_proto_init() {
 	if File_orchigram_plugin_v1alpha1_plugin_proto != nil {
 		return
 	}
-	file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[15].OneofWrappers = []any{
+	file_orchigram_plugin_v1alpha1_plugin_proto_msgTypes[17].OneofWrappers = []any{
 		(*TriggerCommand_Start)(nil),
 		(*TriggerCommand_Ack)(nil),
 	}
@@ -1418,7 +1581,7 @@ func file_orchigram_plugin_v1alpha1_plugin_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_orchigram_plugin_v1alpha1_plugin_proto_rawDesc), len(file_orchigram_plugin_v1alpha1_plugin_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   22,
+			NumMessages:   24,
 			NumExtensions: 0,
 			NumServices:   4,
 		},

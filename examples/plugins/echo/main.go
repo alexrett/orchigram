@@ -53,7 +53,15 @@ func (handler) Execute(_ context.Context, request plugin.TaskRequest, sink plugi
 
 func main() {
 	plugin.Serve(plugin.Config{
-		Metadata: plugin.Metadata{Name: "echo", Version: "0.1.0", Capabilities: []string{"task.echo.echo"}},
-		Task:     handler{},
+		Metadata: plugin.Metadata{
+			Name: "echo", Version: "0.1.0", Capabilities: []string{"task.echo.echo"},
+			Actions: []plugin.ActionDescriptor{{
+				Action:       "echo.echo",
+				ConfigSchema: json.RawMessage(`{"type":"object","properties":{"prefix":{"type":"string"},"emitProgress":{"type":"boolean"}},"additionalProperties":false}`),
+				InputSchema:  json.RawMessage(`{"type":"object","properties":{"message":{"type":"string","minLength":1}},"required":["message"],"additionalProperties":false}`),
+				OutputSchema: json.RawMessage(`{"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false}`),
+			}},
+		},
+		Task: handler{},
 	})
 }

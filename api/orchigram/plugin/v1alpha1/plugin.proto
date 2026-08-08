@@ -17,13 +17,26 @@ message CallMeta {
 }
 message ProtocolRange { uint32 minimum = 1; uint32 maximum = 2; }
 message DescribeRequest { ProtocolRange host_protocol = 1; }
+message ActionDescriptor {
+  string action = 1;
+  bytes config_schema_json = 2;
+  bytes input_schema_json = 3;
+  bytes output_schema_json = 4;
+}
+message TriggerDescriptor {
+  string source = 1;
+  bytes config_schema_json = 2;
+  bytes event_schema_json = 3;
+}
 message DescribeResponse {
   string name = 1;
   string version = 2;
   ProtocolRange protocol = 3;
   repeated string capabilities = 4;
-  bytes input_schema_json = 5;
-  bytes output_schema_json = 6;
+  bytes input_schema_json = 5 [deprecated = true];
+  bytes output_schema_json = 6 [deprecated = true];
+  repeated ActionDescriptor actions = 7;
+  repeated TriggerDescriptor triggers = 8;
 }
 message HealthResponse { bool ready = 1; string message = 2; }
 message ShutdownRequest { google.protobuf.Timestamp deadline = 1; }

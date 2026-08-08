@@ -7,12 +7,16 @@ occurrence identity maps to exactly one local Run UID and dispatch loads the
 accepted plan by hash instead of recompiling the current Flow.
 
 Each non-core plan node pins the installed plugin name, version, bundle digest,
-and negotiated protocol. It also snapshots the UID, generation, resource
+negotiated protocol, canonical action schemas, and installed contract digest.
+It also snapshots the UID, generation, resource
 version, and spec of referenced AgentProfile, Repository, and SecretRef
 resources. A SecretRef spec contains only a backend coordinate; the value is
 resolved when the activity runs and is never written into the plan. Flow edits,
 resource deletion, or plugin activation changes after acknowledgement therefore
-cannot alter or strand the accepted execution.
+cannot alter or strand the accepted execution. Run input is checked against the
+pinned Flow schema before acknowledgement; mapped runtime config and terminal
+output are checked against the pinned action schemas before they can affect a
+downstream node.
 
 External activities are at-least-once. The unavoidable crash window is after a remote side effect succeeds and before its completion is recorded locally. Every plugin call therefore receives a stable idempotency key derived from run, node, logical iteration, and operation. Providers that cannot enforce it must reconcile with deterministic remote identifiers or hidden markers and expose the residual risk to the operator.
 

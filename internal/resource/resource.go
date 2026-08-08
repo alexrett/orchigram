@@ -76,10 +76,11 @@ type FlowEdge struct {
 
 // FlowSpec is the declarative graph source.
 type FlowSpec struct {
-	Inputs   map[string]any `json:"inputs,omitempty" yaml:"inputs,omitempty"`
-	Policies Policies       `json:"policies,omitempty" yaml:"policies,omitempty"`
-	Nodes    []FlowNode     `json:"nodes" yaml:"nodes"`
-	Edges    []FlowEdge     `json:"edges,omitempty" yaml:"edges,omitempty"`
+	Inputs      map[string]any `json:"inputs,omitempty" yaml:"inputs,omitempty"`
+	InputSchema map[string]any `json:"inputSchema,omitempty" yaml:"inputSchema,omitempty"`
+	Policies    Policies       `json:"policies,omitempty" yaml:"policies,omitempty"`
+	Nodes       []FlowNode     `json:"nodes" yaml:"nodes"`
+	Edges       []FlowEdge     `json:"edges,omitempty" yaml:"edges,omitempty"`
 }
 
 // Flow is an editable workflow definition.

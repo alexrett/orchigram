@@ -5,7 +5,7 @@ Current milestone: v0.1.0 First Real Release
 Current phase: 9 of 12
 Progress: 1/5 release phases
 Last activity: 2026-08-08
-Current focus: typed declarative contracts and the complete live operator surface
+Current focus: consistent cross-resource resolution and the complete live operator surface
 
 ## Reality check
 
@@ -31,6 +31,10 @@ Phase 8 passed acceptance mutation and dependency-switch recovery, physical
 attempt/event/artifact evidence, deterministic bounded fork/join with hard-crash
 resume, and secret-safe degraded health with recovery. The implementation was
 delivered through public issues and independently reviewed pull requests.
+
+The first Phase 9 gate now passes strict first-party action contracts, pinned
+plugin schema digests, compile-time mapping and typed CEL diagnostics, and
+runtime validation against the accepted immutable plan.
 
 ## Active phase gate
 

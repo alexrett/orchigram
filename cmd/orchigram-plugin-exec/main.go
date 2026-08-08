@@ -12,7 +12,7 @@ import (
 func main() {
 	plugin, _ := firstparty.Find("exec")
 	pluginsdk.Serve(pluginsdk.Config{
-		Metadata: pluginsdk.Metadata{Name: plugin.Name, Version: version.Semver(), Capabilities: plugin.Capabilities},
+		Metadata: pluginsdk.Metadata{Name: plugin.Name, Version: version.Semver(), Capabilities: plugin.Capabilities, Actions: plugin.Actions},
 		Task:     &pluginruntime.Exec{Runner: process.NewRunner()},
 	})
 }

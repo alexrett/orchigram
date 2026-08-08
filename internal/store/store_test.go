@@ -627,12 +627,21 @@ func TestPluginVersionsActivateAndRollbackWithoutOverwrite(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)
 	for _, version := range []string{"0.1.0", "0.2.0"} {
-		if err := s.PutPlugin(ctx, PluginRecord{Name: "exec", Version: version, Digest: "digest-" + version, ManifestJSON: json.RawMessage(`{"name":"exec"}`)}); err != nil {
+		if err := s.PutPlugin(ctx, PluginRecord{
+			Name: "exec", Version: version, Digest: "digest-" + version, ManifestJSON: json.RawMessage(`{"name":"exec"}`),
+			ContractJSON: json.RawMessage(`{"actions":[]}`), ContractDigest: "contract-" + version,
+		}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := s.PutPlugin(ctx, PluginRecord{Name: "exec", Version: "0.1.0", Digest: "different", ManifestJSON: json.RawMessage(`{}`)}); err == nil {
+	if err := s.PutPlugin(ctx, PluginRecord{Name: "exec", Version: "0.1.0", Digest: "different", ManifestJSON: json.RawMessage(`{}`), ContractJSON: json.RawMessage(`{"actions":[]}`), ContractDigest: "contract-0.1.0"}); err == nil {
 		t.Fatal("immutable plugin version was overwritten")
+	}
+	if err := s.PutPlugin(ctx, PluginRecord{
+		Name: "exec", Version: "0.1.0", Digest: "digest-0.1.0", ManifestJSON: json.RawMessage(`{"name":"exec"}`),
+		ContractJSON: json.RawMessage(`{"actions":[{"action":"changed"}]}`), ContractDigest: "changed-contract",
+	}); err == nil || !strings.Contains(err.Error(), "action contract changed") {
+		t.Fatalf("mutable action contract error=%v", err)
 	}
 	if err := s.ActivatePlugin(ctx, "exec", "0.2.0"); err != nil {
 		t.Fatal(err)

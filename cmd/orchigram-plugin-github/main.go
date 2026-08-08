@@ -13,7 +13,7 @@ func main() {
 	plugin, _ := firstparty.Find("github")
 	runtime := &githubplugin.Runtime{Runner: process.NewRunner()}
 	pluginsdk.Serve(pluginsdk.Config{
-		Metadata: pluginsdk.Metadata{Name: plugin.Name, Version: version.Semver(), Capabilities: plugin.Capabilities},
+		Metadata: pluginsdk.Metadata{Name: plugin.Name, Version: version.Semver(), Capabilities: plugin.Capabilities, Actions: plugin.Actions, Triggers: plugin.Triggers},
 		Task:     runtime,
 		Trigger:  runtime,
 	})
