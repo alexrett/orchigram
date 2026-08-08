@@ -142,7 +142,10 @@ func (a *Adapter) Cancel(ctx context.Context, runUID, reason string) error {
 	}
 	instance, err := a.findInstance(ctx, runUID)
 	if err != nil {
-		return errors.Join(providerErr, err)
+		if providerErr != nil {
+			return fmt.Errorf("cancel provider calls: %w", providerErr)
+		}
+		return err
 	}
 	return errors.Join(providerErr, a.client.CancelWorkflowInstance(ctx, instance))
 }
@@ -159,6 +162,18 @@ func (a *Adapter) Reconcile(ctx context.Context) error {
 			return fmt.Errorf("redeliver approval %s/%s: %w", signal.RunUID, signal.NodeID, err)
 		}
 		if err := a.store.MarkApprovalSignaled(ctx, signal.RunUID, signal.NodeID); err != nil {
+			return err
+		}
+	}
+	cancellations, err := a.store.UndeliveredRunCancellations(ctx, 100)
+	if err != nil {
+		return err
+	}
+	for _, cancellation := range cancellations {
+		if err := a.Cancel(ctx, cancellation.RunUID, cancellation.Reason); err != nil && !errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("redeliver cancellation %s: %w", cancellation.RunUID, err)
+		}
+		if err := a.store.MarkRunCancellationDelivered(ctx, cancellation.RunUID); err != nil {
 			return err
 		}
 	}

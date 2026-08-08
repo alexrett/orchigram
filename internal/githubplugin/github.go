@@ -5,6 +5,7 @@ package githubplugin
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -431,7 +432,7 @@ func (r *Runtime) ensurePullRequest(ctx context.Context, request pluginsdk.TaskR
 		next = nextLink(headers.Get("Link"))
 	}
 	for _, pull := range pulls {
-		if pull.Head.Ref == config.Head || strings.Contains(pull.Body, marker) {
+		if strings.Contains(pull.Body, marker) {
 			return map[string]any{"number": pull.Number, "url": pull.HTMLURL, "reconciled": true, "marker": marker}, nil
 		}
 	}
@@ -634,7 +635,8 @@ func optionalSecret(values map[string][]byte, name string) ([]byte, error) {
 }
 
 func hiddenMarker(request pluginsdk.TaskRequest) string {
-	return fmt.Sprintf("<!-- orchigram:run=%s;node=%s -->", request.RunUID, request.NodeID)
+	digest := sha256.Sum256([]byte(request.IdempotencyKey))
+	return fmt.Sprintf("<!-- orchigram:run=%s;node=%s;idempotency=%x -->", request.RunUID, request.NodeID, digest)
 }
 
 func decodeStrict(data []byte, target any) error {

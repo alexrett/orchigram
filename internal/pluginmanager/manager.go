@@ -40,6 +40,7 @@ type Manager struct {
 	root       string
 	artifacts  string
 	workspaces string
+	installMu  sync.Mutex
 	mu         sync.Mutex
 	processes  map[string]*pluginhost.Process
 	active     map[string]*activeProviderCall
@@ -64,6 +65,8 @@ func New(state *store.Store, stateRoot string) *Manager {
 
 // Install validates an archive, executes protocol negotiation, then records it.
 func (m *Manager) Install(ctx context.Context, bundle []byte) (store.PluginRecord, error) {
+	m.installMu.Lock()
+	defer m.installMu.Unlock()
 	manifest, _, _, err := pluginbundle.Parse(bundle)
 	if err != nil {
 		return store.PluginRecord{}, err
@@ -71,10 +74,12 @@ func (m *Manager) Install(ctx context.Context, bundle []byte) (store.PluginRecor
 	if manifest.Protocol.Minimum > 1 || manifest.Protocol.Maximum < 1 {
 		return store.PluginRecord{}, fmt.Errorf("plugin protocol range %d-%d is incompatible with host protocol 1", manifest.Protocol.Minimum, manifest.Protocol.Maximum)
 	}
-	installed, err := pluginbundle.Install(m.root, bundle)
+	installed, err := pluginbundle.Stage(m.root, bundle)
 	if err != nil {
 		return store.PluginRecord{}, err
 	}
+	stagingDirectory := installed.Directory
+	defer func() { _ = os.RemoveAll(stagingDirectory) }()
 	platform, err := installed.Manifest.CurrentPlatform()
 	if err != nil {
 		return store.PluginRecord{}, err
@@ -95,7 +100,14 @@ func (m *Manager) Install(ctx context.Context, bundle []byte) (store.PluginRecor
 		return store.PluginRecord{}, err
 	}
 	record := store.PluginRecord{Name: installed.Manifest.Name, Version: installed.Manifest.Version, Digest: installed.Digest, ManifestJSON: manifestJSON, State: "installed"}
+	installed, err = pluginbundle.Publish(installed)
+	if err != nil {
+		return store.PluginRecord{}, err
+	}
 	if err := m.store.PutPlugin(ctx, record); err != nil {
+		if installed.Published {
+			_ = os.RemoveAll(installed.Directory)
+		}
 		return store.PluginRecord{}, err
 	}
 	return m.store.Plugin(ctx, record.Name, record.Version)

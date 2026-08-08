@@ -180,14 +180,14 @@ func (m *Manager) gitResult(ctx context.Context, requestID, directory string, to
 	safeEmit := emit
 	if emit != nil && len(token) > 0 {
 		safeEmit = func(output process.Output) error {
-			output.Data = bytesReplace(output.Data, token, []byte("[REDACTED]"))
+			output.Data = redactGitOutput(output.Data, token)
 			return emit(output)
 		}
 	}
 	result, err := m.Runner.Run(ctx, requestID, process.Spec{Executable: "git", Args: args, Directory: directory, Environment: process.MinimalEnvironment(base, nil)}, safeEmit)
 	if len(token) > 0 {
-		result.Stdout = bytesReplace(result.Stdout, token, []byte("[REDACTED]"))
-		result.Stderr = bytesReplace(result.Stderr, token, []byte("[REDACTED]"))
+		result.Stdout = redactGitOutput(result.Stdout, token)
+		result.Stderr = redactGitOutput(result.Stderr, token)
 	}
 	if err != nil {
 		return result, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
@@ -197,6 +197,14 @@ func (m *Manager) gitResult(ctx context.Context, requestID, directory string, to
 
 func githubBasicCredential(token []byte) string {
 	return "Basic " + base64.StdEncoding.EncodeToString(append([]byte("x-access-token:"), token...))
+}
+
+func redactGitOutput(value, token []byte) []byte {
+	redacted := bytesReplace(value, token, []byte("[REDACTED]"))
+	if len(token) == 0 {
+		return redacted
+	}
+	return bytesReplace(redacted, []byte(githubBasicCredential(token)), []byte("[REDACTED]"))
 }
 
 func bytesReplace(value, old, replacement []byte) []byte {

@@ -18,11 +18,13 @@ func TestNewRejectsInvalidMetadata(t *testing.T) {
 	t.Parallel()
 	valid := Config{Metadata: Metadata{Name: "echo", Version: "0.1.0", Capabilities: []string{"task.echo.echo"}}, Task: TaskHandlerFuncs{}}
 	for name, mutate := range map[string]func(*Config){
-		"name":       func(c *Config) { c.Metadata.Name = "Echo!" },
-		"version":    func(c *Config) { c.Metadata.Version = "latest" },
-		"capability": func(c *Config) { c.Metadata.Capabilities = []string{"echo"} },
-		"schema":     func(c *Config) { c.Metadata.InputSchema = json.RawMessage(`{`) },
-		"service":    func(c *Config) { c.Task = nil },
+		"name":        func(c *Config) { c.Metadata.Name = "Echo!" },
+		"version":     func(c *Config) { c.Metadata.Version = "latest" },
+		"capability":  func(c *Config) { c.Metadata.Capabilities = []string{"echo"} },
+		"schema":      func(c *Config) { c.Metadata.InputSchema = json.RawMessage(`{`) },
+		"service":     func(c *Config) { c.Task = nil },
+		"namespace":   func(c *Config) { c.Metadata.Capabilities = []string{"storage.echo.read"} },
+		"task prefix": func(c *Config) { c.Metadata.Capabilities = []string{"task.other.run"} },
 	} {
 		t.Run(name, func(t *testing.T) {
 			config := valid
@@ -31,6 +33,38 @@ func TestNewRejectsInvalidMetadata(t *testing.T) {
 				t.Fatal("invalid metadata was accepted")
 			}
 		})
+	}
+}
+
+func TestShutdownCancelsAndDrainsActiveTriggerWatch(t *testing.T) {
+	t.Parallel()
+	started := make(chan struct{})
+	provider := &blockingTriggerProvider{started: started}
+	runtime, servers, err := New(Config{
+		Metadata: Metadata{Name: "echo", Version: "0.1.0", Capabilities: []string{"trigger.events.watch"}},
+		Trigger:  provider,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := &triggerTestStream{ctx: context.Background()}
+	done := make(chan error, 1)
+	go func() { done <- servers.Trigger.Watch(stream) }()
+	<-started
+	deadline := time.Now().Add(time.Second)
+	if _, err := runtime.Shutdown(context.Background(), &pluginv1alpha1.ShutdownRequest{Deadline: timestamppb.New(deadline)}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("watch error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not drain trigger watch")
+	}
+	if err := servers.Trigger.Watch(&triggerTestStream{ctx: context.Background()}); err == nil {
+		t.Fatal("trigger watch started after shutdown")
 	}
 }
 
@@ -155,6 +189,32 @@ type captureStream struct {
 	mu     sync.Mutex
 	events []*pluginv1alpha1.ExecuteEvent
 }
+
+type blockingTriggerProvider struct {
+	pluginv1alpha1.UnimplementedTriggerProviderServer
+	started chan struct{}
+}
+
+func (p *blockingTriggerProvider) Watch(stream pluginv1alpha1.TriggerProvider_WatchServer) error {
+	close(p.started)
+	<-stream.Context().Done()
+	return stream.Context().Err()
+}
+
+type triggerTestStream struct {
+	ctx context.Context
+}
+
+func (*triggerTestStream) Send(*pluginv1alpha1.TriggerEvent) error { return nil }
+func (*triggerTestStream) Recv() (*pluginv1alpha1.TriggerCommand, error) {
+	return nil, context.Canceled
+}
+func (*triggerTestStream) SetHeader(metadata.MD) error  { return nil }
+func (*triggerTestStream) SendHeader(metadata.MD) error { return nil }
+func (*triggerTestStream) SetTrailer(metadata.MD)       {}
+func (s *triggerTestStream) Context() context.Context   { return s.ctx }
+func (*triggerTestStream) SendMsg(any) error            { return nil }
+func (*triggerTestStream) RecvMsg(any) error            { return nil }
 
 func (s *captureStream) Send(event *pluginv1alpha1.ExecuteEvent) error {
 	s.mu.Lock()

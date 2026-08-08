@@ -159,6 +159,76 @@ func TestCancellationRemainsTerminalAfterLateActivityCompletion(t *testing.T) {
 	}
 }
 
+func TestCancellationDeliveryReconcilesAfterEngineRestart(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	state, err := store.Open(filepath.Join(root, "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	workflowPath := filepath.Join(root, "workflows.sqlite")
+	first, err := Open(ctx, workflowPath, state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := flow.ExecutionPlan{
+		FlowUID: "flow-cancel-restart", FlowGeneration: 1, InterpreterVersion: flow.InterpreterVersion, PlanHash: "cancel-restart-plan",
+		Nodes: []flow.PlanNode{{ID: "approval", Uses: "core.approval", Timeout: "30s", RetryBackoff: "10ms"}},
+	}
+	payload := store.StartPayload{RunUID: "run-cancel-restart", Input: json.RawMessage(`{}`)}
+	if _, err := state.EnsureRun(ctx, payload, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Start(ctx, payload.RunUID, plan, payload.Input); err != nil {
+		t.Fatal(err)
+	}
+	waitForPhase(ctx, t, state, payload.RunUID, "waiting")
+	if err := state.RequestRunCancellation(ctx, payload.RunUID, "crash boundary"); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate process loss after the state transaction commits but before
+	// Adapter.Cancel is called. The replacement adapter owns delivery.
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recorder := &cancellationRecorder{}
+	second, err := Open(ctx, workflowPath, state, recorder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = second.Close() }()
+	if err := second.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if recorder.runUID != payload.RunUID || recorder.reason != "crash boundary" {
+		t.Fatalf("provider cancellation=%q reason=%q", recorder.runUID, recorder.reason)
+	}
+	pending, err := state.UndeliveredRunCancellations(ctx, 100)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("pending cancellations=%+v err=%v", pending, err)
+	}
+	run, err := state.GetRun(ctx, payload.RunUID)
+	if err != nil || run.Phase != "cancelled" {
+		t.Fatalf("run=%+v err=%v", run, err)
+	}
+}
+
+type cancellationRecorder struct {
+	runUID string
+	reason string
+}
+
+func (*cancellationRecorder) Execute(context.Context, string, flow.PlanNode, json.RawMessage, map[string]any, string) (json.RawMessage, error) {
+	return json.RawMessage(`{}`), nil
+}
+
+func (r *cancellationRecorder) CancelRun(_ context.Context, runUID, reason string) error {
+	r.runUID = runUID
+	r.reason = reason
+	return nil
+}
+
 type slowExecutor struct {
 	mu              sync.Mutex
 	active, maximum int

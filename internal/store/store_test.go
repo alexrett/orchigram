@@ -57,6 +57,46 @@ func TestTerminalRunTransitionsAreImmutable(t *testing.T) {
 	}
 }
 
+func TestRunCancellationIntentAndDeliveryAreDurableAndIdempotent(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openTestStore(t)
+	plan := flow.ExecutionPlan{FlowUID: "flow-cancel", FlowGeneration: 1, PlanHash: "plan-cancel", InterpreterVersion: flow.InterpreterVersion}
+	if _, err := s.EnsureRun(ctx, StartPayload{RunUID: "run-cancel", Input: json.RawMessage(`{}`)}, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RequestRunCancellation(ctx, "run-cancel", "first reason"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RequestRunCancellation(ctx, "run-cancel", "later reason"); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := s.UndeliveredRunCancellations(ctx, 100)
+	if err != nil || len(pending) != 1 || pending[0].Reason != "first reason" {
+		t.Fatalf("pending=%+v err=%v", pending, err)
+	}
+	events, err := s.RunEventsAfter(ctx, "run-cancel", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancellations := 0
+	for _, event := range events {
+		if event.Type == "run.cancelled" {
+			cancellations++
+		}
+	}
+	if cancellations != 1 {
+		t.Fatalf("cancellation events=%d", cancellations)
+	}
+	if err := s.MarkRunCancellationDelivered(ctx, "run-cancel"); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = s.UndeliveredRunCancellations(ctx, 100)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("delivered cancellation remained pending: %+v err=%v", pending, err)
+	}
+}
+
 func testFlowDocument(t *testing.T) resource.Document {
 	t.Helper()
 	doc, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1

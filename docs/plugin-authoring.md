@@ -45,7 +45,9 @@ func main() {
 ```
 
 Metadata names, strict semantic versions, capabilities, and optional JSON input
-and output schemas are validated before serving. Every request includes action,
+and output schemas are validated before serving. Capability namespaces are
+limited to `task`, `trigger`, and `agent`; task capabilities must use
+`task.<plugin-name>.<action>`. Every request includes action,
 input/config JSON, operation-scoped secrets, request/run/node/attempt identity,
 a stable idempotency key, and a deadline. Honor `ctx.Done()` promptly. External
 effects are at-least-once, so reconcile repeated idempotency keys instead of
@@ -57,8 +59,9 @@ rejects author terminal events, emits exactly one `task.completed` or
 work only until the shutdown deadline. Advanced trigger or agent providers may
 implement the public generated `gen/orchigram/plugin/v1alpha1`
 `TriggerProviderServer` or `AgentRuntimeServer` and pass it in `Config.Trigger`
-or `Config.Agent`. Daemon, resource, bundle, and workflow-engine internals are
-not public APIs.
+or `Config.Agent`. Trigger watches participate in the same shutdown admission,
+cancellation, and drain accounting. Daemon, resource, bundle, and
+workflow-engine internals are not public APIs.
 
 ## Build and pack
 

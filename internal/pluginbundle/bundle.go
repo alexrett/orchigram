@@ -31,8 +31,9 @@ const (
 )
 
 var (
-	pluginName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
-	targetName = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+	pluginName     = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+	targetName     = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+	capabilityName = regexp.MustCompile(`^[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*)+$`)
 )
 
 // ProtocolRange declares compatible business protocol versions.
@@ -61,10 +62,12 @@ type Manifest struct {
 
 // Installed is the verified local projection returned by Install.
 type Installed struct {
-	Manifest   Manifest
-	Digest     string
-	Directory  string
-	Executable string
+	Manifest       Manifest
+	Digest         string
+	Directory      string
+	Executable     string
+	FinalDirectory string
+	Published      bool
 }
 
 // Parse validates the archive and returns the current platform payload.
@@ -167,8 +170,15 @@ func (m Manifest) Validate() error {
 	}
 	seenCapabilities := map[string]bool{}
 	for _, capability := range m.Capabilities {
-		if strings.TrimSpace(capability) == "" || seenCapabilities[capability] {
+		if !capabilityName.MatchString(capability) || seenCapabilities[capability] {
 			return fmt.Errorf("invalid or duplicate plugin capability %q", capability)
+		}
+		namespace := strings.SplitN(capability, ".", 2)[0]
+		if namespace != "task" && namespace != "trigger" && namespace != "agent" {
+			return fmt.Errorf("unsupported plugin capability namespace %q", namespace)
+		}
+		if namespace == "task" && !strings.HasPrefix(capability, "task."+m.Name+".") {
+			return fmt.Errorf("task capability %q must be rooted at plugin name %q", capability, m.Name)
 		}
 		seenCapabilities[capability] = true
 	}
@@ -219,18 +229,22 @@ func (m Manifest) Platform(targetOS, targetArch string) (Platform, error) {
 
 // Install atomically writes an immutable verified version directory.
 func Install(root string, bundle []byte) (Installed, error) {
+	staged, err := Stage(root, bundle)
+	if err != nil {
+		return Installed{}, err
+	}
+	defer func() { _ = os.RemoveAll(staged.Directory) }()
+	return Publish(staged)
+}
+
+// Stage writes a verified bundle to a private temporary directory. Callers may
+// launch the staged executable for negotiation without publishing the version.
+func Stage(root string, bundle []byte) (Installed, error) {
 	manifest, binary, digest, err := Parse(bundle)
 	if err != nil {
 		return Installed{}, err
 	}
 	finalDirectory := filepath.Join(root, manifest.Name, manifest.Version)
-	if existing, statErr := os.Stat(finalDirectory); statErr == nil && existing.IsDir() {
-		digestData, readErr := os.ReadFile(filepath.Join(finalDirectory, "bundle.sha256")) //nolint:gosec // Path is derived from validated manifest components.
-		if readErr == nil && strings.TrimSpace(string(digestData)) == digest {
-			return Installed{Manifest: manifest, Digest: digest, Directory: finalDirectory, Executable: filepath.Join(finalDirectory, "plugin")}, nil
-		}
-		return Installed{}, fmt.Errorf("plugin %s version %s is already installed with a different digest", manifest.Name, manifest.Version)
-	}
 	if err := os.MkdirAll(filepath.Dir(finalDirectory), 0o750); err != nil {
 		return Installed{}, err
 	}
@@ -238,7 +252,12 @@ func Install(root string, bundle []byte) (Installed, error) {
 	if err != nil {
 		return Installed{}, err
 	}
-	defer func() { _ = os.RemoveAll(temporary) }()
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			_ = os.RemoveAll(temporary)
+		}
+	}()
 	manifestData, err := yaml.Marshal(manifest)
 	if err != nil {
 		return Installed{}, err
@@ -252,10 +271,34 @@ func Install(root string, bundle []byte) (Installed, error) {
 	if err := os.WriteFile(filepath.Join(temporary, "plugin"), binary, 0o500); err != nil { //nolint:gosec // The verified payload must be owner-executable and not writable.
 		return Installed{}, err
 	}
-	if err := os.Rename(temporary, finalDirectory); err != nil {
+	succeeded = true
+	return Installed{Manifest: manifest, Digest: digest, Directory: temporary, Executable: filepath.Join(temporary, "plugin"), FinalDirectory: finalDirectory}, nil
+}
+
+// Publish atomically moves a negotiated staged installation into its immutable
+// version directory. Publishing the same digest is idempotent.
+func Publish(staged Installed) (Installed, error) {
+	if staged.FinalDirectory == "" || staged.Directory == "" {
+		return Installed{}, errors.New("staged plugin installation is incomplete")
+	}
+	if existing, statErr := os.Stat(staged.FinalDirectory); statErr == nil && existing.IsDir() {
+		digestData, readErr := os.ReadFile(filepath.Join(staged.FinalDirectory, "bundle.sha256")) //nolint:gosec // Path is derived from validated manifest components.
+		if readErr == nil && strings.TrimSpace(string(digestData)) == staged.Digest {
+			staged.Directory = staged.FinalDirectory
+			staged.Executable = filepath.Join(staged.FinalDirectory, "plugin")
+			return staged, nil
+		}
+		return Installed{}, fmt.Errorf("plugin %s version %s is already installed with a different digest", staged.Manifest.Name, staged.Manifest.Version)
+	} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return Installed{}, statErr
+	}
+	if err := os.Rename(staged.Directory, staged.FinalDirectory); err != nil {
 		return Installed{}, err
 	}
-	return Installed{Manifest: manifest, Digest: digest, Directory: finalDirectory, Executable: filepath.Join(finalDirectory, "plugin")}, nil
+	staged.Directory = staged.FinalDirectory
+	staged.Executable = filepath.Join(staged.FinalDirectory, "plugin")
+	staged.Published = true
+	return staged, nil
 }
 
 // Build creates a deterministic tar.gz bundle for release and tests.

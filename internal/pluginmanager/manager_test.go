@@ -304,6 +304,47 @@ spec: {backend: env, key: ORCHIGRAM_TEST_GITHUB_PROVIDER_TOKEN}
 	}
 }
 
+func TestSelfSDLCCExampleRendersFetchedIssueRequirementsForPlanner(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "examples", "self-sdlc", "issue-to-pr-flow.yaml")) //nolint:gosec // Repository-owned fixture.
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err := resource.DecodeStrict(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flowResource, err := resource.DecodeFlow(document.JSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, diagnostics := flow.NewCompiler(nil).Compile(flowResource)
+	if len(diagnostics) != 0 {
+		t.Fatalf("compile diagnostics: %+v", diagnostics)
+	}
+	var planner map[string]any
+	for _, node := range plan.Nodes {
+		if node.ID == "plan" {
+			planner = node.With
+			break
+		}
+	}
+	if planner == nil {
+		t.Fatal("planner node is missing")
+	}
+	issueFixture := map[string]any{"issue": map[string]any{
+		"number": float64(42), "title": "Preserve durable requirements", "body": "Acceptance: work without GitHub or network access.",
+	}}
+	if err := renderConfigTemplates(planner, json.RawMessage(`{}`), map[string]any{"fetch_issue": issueFixture}); err != nil {
+		t.Fatal(err)
+	}
+	prompt, _ := planner["prompt"].(string)
+	for _, requirement := range []string{"Issue #42: Preserve durable requirements", "Acceptance: work without GitHub or network access."} {
+		if !strings.Contains(prompt, requirement) {
+			t.Fatalf("rendered planner prompt omitted %q: %s", requirement, prompt)
+		}
+	}
+}
+
 func TestRejectsIncompatibleProtocolBeforeInstallation(t *testing.T) {
 	state, err := store.Open(filepath.Join(t.TempDir(), "state.sqlite"))
 	if err != nil {
@@ -317,6 +358,72 @@ func TestRejectsIncompatibleProtocolBeforeInstallation(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "plugins", "exec", conformanceVersion)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("incompatible bundle wrote an installation: %v", err)
+	}
+}
+
+func TestInstallFailuresDoNotPublishImmutableVersion(t *testing.T) {
+	t.Run("launch failure permits corrected same version", func(t *testing.T) {
+		stateRoot := t.TempDir()
+		state, err := store.Open(filepath.Join(stateRoot, "state.sqlite"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = state.Close() }()
+		manager := New(state, stateRoot)
+		broken := bundleWithBinary(t, "exec", conformanceVersion, []string{"task.exec.run"}, []byte("not an executable"))
+		if _, err := manager.Install(context.Background(), broken); err == nil {
+			t.Fatal("invalid executable installed")
+		}
+		assertVersionAbsent(t, stateRoot, "exec", conformanceVersion)
+		if _, err := manager.Install(context.Background(), conformanceBundle(t, "exec", 1, 1)); err != nil {
+			t.Fatalf("corrected bundle was poisoned by failed install: %v", err)
+		}
+	})
+
+	for name, test := range map[string]struct {
+		version      string
+		capabilities []string
+	}{
+		"identity mismatch":   {version: "0.2.0", capabilities: []string{"task.exec.run"}},
+		"capability mismatch": {version: conformanceVersion, capabilities: []string{"task.exec.other"}},
+	} {
+		name, test := name, test
+		t.Run(name, func(t *testing.T) {
+			stateRoot := t.TempDir()
+			state, err := store.Open(filepath.Join(stateRoot, "state.sqlite"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = state.Close() }()
+			manager := New(state, stateRoot)
+			if _, err := manager.Install(context.Background(), bundleWithMetadata(t, "exec", test.version, test.capabilities)); err == nil {
+				t.Fatal("negotiation mismatch installed")
+			}
+			assertVersionAbsent(t, stateRoot, "exec", test.version)
+		})
+	}
+
+	t.Run("database failure rolls back publication", func(t *testing.T) {
+		stateRoot := t.TempDir()
+		state, err := store.Open(filepath.Join(stateRoot, "state.sqlite"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		manager := New(state, stateRoot)
+		if err := state.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := manager.Install(context.Background(), conformanceBundle(t, "exec", 1, 1)); err == nil {
+			t.Fatal("install unexpectedly survived closed database")
+		}
+		assertVersionAbsent(t, stateRoot, "exec", conformanceVersion)
+	})
+}
+
+func assertVersionAbsent(t *testing.T, stateRoot, name, version string) {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join(stateRoot, "plugins", name, version)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed installation published version directory: %v", err)
 	}
 }
 
@@ -381,6 +488,34 @@ func conformanceBundle(t *testing.T, name string, minimum, maximum uint32) []byt
 	manifest := pluginbundle.Manifest{
 		APIVersion: pluginbundle.APIVersion, Name: name, Version: conformanceVersion,
 		Protocol: pluginbundle.ProtocolRange{Minimum: minimum, Maximum: maximum}, Capabilities: capabilities,
+		Platforms: []pluginbundle.Platform{{OS: runtime.GOOS, Arch: runtime.GOARCH, Path: "bin/plugin", SHA256: hex.EncodeToString(digest[:])}},
+	}
+	bundle, err := pluginbundle.Build(manifest, map[string][]byte{"bin/plugin": binary})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bundle
+}
+
+func bundleWithMetadata(t *testing.T, name, version string, capabilities []string) []byte {
+	t.Helper()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary, err := os.ReadFile(executable) //nolint:gosec // Test intentionally bundles its executable.
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bundleWithBinary(t, name, version, capabilities, binary)
+}
+
+func bundleWithBinary(t *testing.T, name, version string, capabilities []string, binary []byte) []byte {
+	t.Helper()
+	digest := sha256.Sum256(binary)
+	manifest := pluginbundle.Manifest{
+		APIVersion: pluginbundle.APIVersion, Name: name, Version: version,
+		Protocol: pluginbundle.ProtocolRange{Minimum: 1, Maximum: 1}, Capabilities: capabilities,
 		Platforms: []pluginbundle.Platform{{OS: runtime.GOOS, Arch: runtime.GOARCH, Path: "bin/plugin", SHA256: hex.EncodeToString(digest[:])}},
 	}
 	bundle, err := pluginbundle.Build(manifest, map[string][]byte{"bin/plugin": binary})

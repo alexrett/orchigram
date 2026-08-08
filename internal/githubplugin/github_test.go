@@ -87,7 +87,7 @@ func TestPollingFixturesCoverPaginationRateLimitAndStableOrder(t *testing.T) {
 	}
 }
 
-func TestCommentAndPullRequestReconcileByMarkerAndBranch(t *testing.T) {
+func TestCommentAndPullRequestReconcileByIdempotencyMarker(t *testing.T) {
 	t.Parallel()
 	var mu sync.Mutex
 	comments := []map[string]any{}
@@ -141,8 +141,17 @@ func TestCommentAndPullRequestReconcileByMarkerAndBranch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(comments) != 1 || firstComment.(map[string]any)["reconciled"] != false || secondComment.(map[string]any)["reconciled"] != true || !strings.Contains(comments[0]["body"].(string), "orchigram:run=run-123") {
+	if len(comments) != 1 || firstComment.(map[string]any)["reconciled"] != false || secondComment.(map[string]any)["reconciled"] != true || !strings.Contains(comments[0]["body"].(string), "idempotency=") {
 		t.Fatalf("comments=%+v first=%+v second=%+v", comments, firstComment, secondComment)
+	}
+	distinctComment := commentRequest
+	distinctComment.IdempotencyKey = "stable/iteration-2"
+	thirdComment, err := runtime.issueComment(context.Background(), distinctComment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(comments) != 2 || thirdComment.(map[string]any)["reconciled"] != false {
+		t.Fatalf("distinct-key comments=%+v third=%+v", comments, thirdComment)
 	}
 
 	pullRequest := executeRequest(t, "run-123", "create-pr", "github.pr.ensure", map[string]any{"owner": "acme", "repository": "widget", "apiBase": server.URL, "tokenSecret": "token", "head": "orchigram/issue-42-run123", "base": "main", "title": "Implement #42", "body": "Automated change"})
@@ -156,6 +165,28 @@ func TestCommentAndPullRequestReconcileByMarkerAndBranch(t *testing.T) {
 	}
 	if len(pulls) != 1 || firstPull.(map[string]any)["reconciled"] != false || secondPull.(map[string]any)["reconciled"] != true {
 		t.Fatalf("pulls=%+v first=%+v second=%+v", pulls, firstPull, secondPull)
+	}
+	distinctPull := pullRequest
+	distinctPull.IdempotencyKey = "stable/iteration-2"
+	thirdPull, err := runtime.ensurePullRequest(context.Background(), distinctPull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pulls) != 2 || thirdPull.(map[string]any)["reconciled"] != false {
+		t.Fatalf("distinct-key pulls=%+v third=%+v", pulls, thirdPull)
+	}
+}
+
+func TestHiddenMarkerUsesLogicalIdempotencyKey(t *testing.T) {
+	t.Parallel()
+	request := pluginsdk.TaskRequest{RunUID: "run", NodeID: "repeat", IdempotencyKey: "run/repeat/iteration-1"}
+	first := hiddenMarker(request)
+	if retry := hiddenMarker(request); retry != first {
+		t.Fatalf("equal-key retry marker changed: %q != %q", retry, first)
+	}
+	request.IdempotencyKey = "run/repeat/iteration-2"
+	if next := hiddenMarker(request); next == first {
+		t.Fatalf("distinct iteration keys shared marker %q", next)
 	}
 }
 

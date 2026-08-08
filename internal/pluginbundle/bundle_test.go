@@ -16,7 +16,7 @@ func TestBuildParseAndImmutableInstall(t *testing.T) {
 	digest := sha256.Sum256(binary)
 	manifest := Manifest{
 		APIVersion: APIVersion, Name: "conformance", Version: "0.1.0",
-		Protocol: ProtocolRange{Minimum: 1, Maximum: 1}, Capabilities: []string{"task.conformance"},
+		Protocol: ProtocolRange{Minimum: 1, Maximum: 1}, Capabilities: []string{"task.conformance.run"},
 		Platforms: []Platform{{OS: runtime.GOOS, Arch: runtime.GOARCH, Path: "bin/plugin", SHA256: hex.EncodeToString(digest[:])}},
 	}
 	first, err := Build(manifest, map[string][]byte{"bin/plugin": binary})
@@ -31,8 +31,8 @@ func TestBuildParseAndImmutableInstall(t *testing.T) {
 		t.Fatal("bundle build is not deterministic")
 	}
 	shuffled := manifest
-	shuffled.Capabilities = []string{"task.zeta", "task.conformance"}
-	manifest.Capabilities = []string{"task.conformance", "task.zeta"}
+	shuffled.Capabilities = []string{"task.conformance.zeta", "task.conformance.run"}
+	manifest.Capabilities = []string{"task.conformance.run", "task.conformance.zeta"}
 	first, err = Build(manifest, map[string][]byte{"bin/plugin": binary})
 	if err != nil {
 		t.Fatal(err)
@@ -52,7 +52,17 @@ func TestBuildParseAndImmutableInstall(t *testing.T) {
 		t.Fatalf("unexpected parse result: %+v %q %q", parsed, payload, bundleDigest)
 	}
 	root := t.TempDir()
-	installed, err := Install(root, first)
+	staged, err := Stage(root, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(staged.FinalDirectory); !os.IsNotExist(err) {
+		t.Fatalf("staged plugin was published before negotiation: %v", err)
+	}
+	if _, err := os.Stat(staged.Executable); err != nil {
+		t.Fatalf("staged executable is unavailable: %v", err)
+	}
+	installed, err := Publish(staged)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +89,7 @@ func TestManifestRejectsTraversalAndIncompatiblePlatform(t *testing.T) {
 	digest := sha256.Sum256([]byte("x"))
 	manifest := Manifest{
 		APIVersion: APIVersion, Name: "unsafe", Version: "0.1.0",
-		Protocol: ProtocolRange{Minimum: 1, Maximum: 1}, Capabilities: []string{"task.test"},
+		Protocol: ProtocolRange{Minimum: 1, Maximum: 1}, Capabilities: []string{"task.unsafe.run"},
 		Platforms: []Platform{{OS: runtime.GOOS, Arch: runtime.GOARCH, Path: "../plugin", SHA256: hex.EncodeToString(digest[:])}},
 	}
 	if err := manifest.Validate(); err == nil {
@@ -98,7 +108,7 @@ func TestParseForForeignPlatform(t *testing.T) {
 	digest := sha256.Sum256(binary)
 	manifest := Manifest{
 		APIVersion: APIVersion, Name: "foreign", Version: "1.2.3",
-		Protocol: ProtocolRange{Minimum: 1, Maximum: 1}, Capabilities: []string{"task.foreign"},
+		Protocol: ProtocolRange{Minimum: 1, Maximum: 1}, Capabilities: []string{"task.foreign.run"},
 		Platforms: []Platform{{OS: "plan9", Arch: "amd64", Path: "bin/plugin", SHA256: hex.EncodeToString(digest[:])}},
 	}
 	bundle, err := Build(manifest, map[string][]byte{"bin/plugin": binary})
@@ -111,5 +121,22 @@ func TestParseForForeignPlatform(t *testing.T) {
 	}
 	if parsed.Name != manifest.Name || !bytes.Equal(payload, binary) {
 		t.Fatalf("unexpected parsed bundle: %#v %q", parsed, payload)
+	}
+}
+
+func TestManifestRejectsUnsupportedAndUnroutableCapabilities(t *testing.T) {
+	t.Parallel()
+	digest := sha256.Sum256([]byte("x"))
+	base := Manifest{
+		APIVersion: APIVersion, Name: "echo", Version: "1.0.0",
+		Protocol:  ProtocolRange{Minimum: 1, Maximum: 1},
+		Platforms: []Platform{{OS: runtime.GOOS, Arch: runtime.GOARCH, Path: "bin/plugin", SHA256: hex.EncodeToString(digest[:])}},
+	}
+	for _, capability := range []string{"storage.echo.read", "task.other.run"} {
+		manifest := base
+		manifest.Capabilities = []string{capability}
+		if err := manifest.Validate(); err == nil {
+			t.Fatalf("capability %q was accepted", capability)
+		}
 	}
 }

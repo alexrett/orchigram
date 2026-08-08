@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"runtime"
@@ -349,10 +348,14 @@ func (a *API) decide(ctx context.Context, request *controlv1alpha1.ApprovalReque
 
 // Cancel records cancellation before asking the framework to cancel.
 func (a *API) Cancel(ctx context.Context, request *controlv1alpha1.CancelRunRequest) (*emptypb.Empty, error) {
-	if err := a.store.AppendRunEvent(ctx, request.GetRunUid(), "", "run.cancelled", "cancelled", 0, []byte(fmt.Sprintf(`{"reason":%q}`, request.GetReason()))); err != nil {
+	if err := a.store.RequestRunCancellation(ctx, request.GetRunUid(), request.GetReason()); err != nil {
 		return nil, rpcError(err)
 	}
 	if err := a.engine.Cancel(ctx, request.GetRunUid(), request.GetReason()); err != nil && !errors.Is(err, store.ErrNotFound) {
+		// Intent remains durable and engine reconciliation redelivers it.
+		return &emptypb.Empty{}, nil
+	}
+	if err := a.store.MarkRunCancellationDelivered(ctx, request.GetRunUid()); err != nil {
 		return nil, rpcError(err)
 	}
 	return &emptypb.Empty{}, nil

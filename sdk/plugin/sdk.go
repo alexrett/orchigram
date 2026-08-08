@@ -109,10 +109,11 @@ type Runtime struct {
 	handler  TaskHandler
 	actions  map[string]struct{}
 
-	mu        sync.Mutex
-	accepting bool
-	active    map[string]activeCall
-	wg        sync.WaitGroup
+	mu         sync.Mutex
+	accepting  bool
+	active     map[string]activeCall
+	wg         sync.WaitGroup
+	nextStream uint64
 }
 
 type activeCall struct {
@@ -142,7 +143,10 @@ func New(config Config) (*Runtime, Servers, error) {
 		}
 	}
 	runtime := &Runtime{metadata: metadata, handler: config.Task, actions: actions, accepting: true, active: map[string]activeCall{}}
-	servers := Servers{Control: runtime, Trigger: config.Trigger}
+	servers := Servers{Control: runtime}
+	if config.Trigger != nil {
+		servers.Trigger = &triggerAdapter{runtime: runtime, server: config.Trigger}
+	}
 	if config.Agent != nil {
 		servers.Agent = &agentAdapter{runtime: runtime, server: config.Agent}
 	}
@@ -318,6 +322,19 @@ func (r *Runtime) unregister(requestID string) {
 	r.wg.Done()
 }
 
+func (r *Runtime) registerStream(cancel context.CancelFunc) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.accepting {
+		return "", status.Error(codes.Unavailable, "plugin is draining")
+	}
+	r.nextStream++
+	requestID := fmt.Sprintf("trigger-watch-%d", r.nextStream)
+	r.active[requestID] = activeCall{cancel: cancel}
+	r.wg.Add(1)
+	return requestID, nil
+}
+
 func (r *Runtime) canAccept() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -401,7 +418,15 @@ func validateMetadata(metadata Metadata, hasTask bool) (Metadata, map[string]str
 			return Metadata{}, nil, fmt.Errorf("duplicate plugin capability %q", capability)
 		}
 		seen[capability] = struct{}{}
+		namespace := strings.SplitN(capability, ".", 2)[0]
+		if namespace != "task" && namespace != "trigger" && namespace != "agent" {
+			return Metadata{}, nil, fmt.Errorf("unsupported plugin capability namespace %q", namespace)
+		}
 		if strings.HasPrefix(capability, "task.") {
+			prefix := "task." + metadata.Name + "."
+			if !strings.HasPrefix(capability, prefix) {
+				return Metadata{}, nil, fmt.Errorf("task capability %q must be rooted at plugin name %q", capability, metadata.Name)
+			}
 			actions[strings.TrimPrefix(capability, "task.")] = struct{}{}
 		}
 	}
@@ -419,6 +444,33 @@ func validateMetadata(metadata Metadata, hasTask bool) (Metadata, map[string]str
 	metadata.OutputSchema = append(json.RawMessage(nil), metadata.OutputSchema...)
 	return metadata, actions, nil
 }
+
+type triggerAdapter struct {
+	pluginv1alpha1.UnimplementedTriggerProviderServer
+	runtime *Runtime
+	server  pluginv1alpha1.TriggerProviderServer
+}
+
+func (a *triggerAdapter) Watch(stream pluginv1alpha1.TriggerProvider_WatchServer) error {
+	ctx, cancel := context.WithCancel(stream.Context())
+	requestID, err := a.runtime.registerStream(cancel)
+	if err != nil {
+		cancel()
+		return err
+	}
+	defer func() {
+		cancel()
+		a.runtime.unregister(requestID)
+	}()
+	return a.server.Watch(&triggerWatchStream{TriggerProvider_WatchServer: stream, ctx: ctx})
+}
+
+type triggerWatchStream struct {
+	pluginv1alpha1.TriggerProvider_WatchServer
+	ctx context.Context
+}
+
+func (s *triggerWatchStream) Context() context.Context { return s.ctx }
 
 func validateCallMeta(meta *pluginv1alpha1.CallMeta, requireFuture bool) (callIdentity, error) {
 	if meta == nil || strings.TrimSpace(meta.GetRequestId()) == "" || strings.TrimSpace(meta.GetRunUid()) == "" || strings.TrimSpace(meta.GetNodeId()) == "" || meta.GetAttempt() == 0 || strings.TrimSpace(meta.GetIdempotencyKey()) == "" {

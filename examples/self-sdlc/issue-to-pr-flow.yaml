@@ -32,7 +32,12 @@ spec:
         profile: self-sdlc-planner
         workspace: .
         prompt: |-
-          Read the repository and GitHub issue #${nodes.fetch_issue.issue.number}.
+          Read the repository and plan the following fetched GitHub issue.
+
+          Issue #${nodes.fetch_issue.issue.number}: ${nodes.fetch_issue.issue.title}
+
+          ${nodes.fetch_issue.issue.body}
+
           Produce an implementation plan in English. Do not modify files.
         mappings:
           - {from: nodes.checkout.workspace, to: /workspace}

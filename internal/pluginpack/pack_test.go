@@ -136,6 +136,51 @@ func TestPackRejectsUnsafePathsAndDigestMismatch(t *testing.T) {
 	}
 }
 
+func TestPackRejectsIntermediateSymlink(t *testing.T) {
+	root, outside := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "echo"), []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "bin")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "plugin.yaml"), []byte(manifestFixture("bin/echo", "")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Pack(filepath.Join(root, "plugin.yaml"), filepath.Join(root, "out.tar.gz"), false); err == nil {
+		t.Fatal("intermediate symlink was accepted")
+	}
+}
+
+func TestSecureReadRejectsDirectorySwapToSymlink(t *testing.T) {
+	root, outside := t.TempDir(), t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "bin"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "bin", "echo"), []byte("inside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "echo"), []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	swapped := false
+	_, err := secureReadRegularAt(root, "bin/echo", maxBinary, func(component string) {
+		if component != "bin" || swapped {
+			return
+		}
+		swapped = true
+		if renameErr := os.Rename(filepath.Join(root, "bin"), filepath.Join(root, "original-bin")); renameErr != nil {
+			t.Fatal(renameErr)
+		}
+		if linkErr := os.Symlink(outside, filepath.Join(root, "bin")); linkErr != nil {
+			t.Fatal(linkErr)
+		}
+	})
+	if err == nil {
+		t.Fatal("directory swap to symlink was accepted")
+	}
+}
+
 func writeFixture(t *testing.T, root string, binary []byte, digest string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Join(root, "bin"), 0o750); err != nil {

@@ -65,11 +65,7 @@ func Pack(manifestPath, outputPath string, force bool) (Result, error) {
 			return Result{}, fmt.Errorf("duplicate platform target %q", platform.Path)
 		}
 		seenTargets[platform.Path] = true
-		source := filepath.Join(base, filepath.FromSlash(platform.Path))
-		if err := ensureWithin(base, source); err != nil {
-			return Result{}, err
-		}
-		binary, readErr := readRegular(source, maxBinary)
+		binary, readErr := secureReadRegularAt(base, platform.Path, maxBinary, nil)
 		if readErr != nil {
 			return Result{}, fmt.Errorf("read platform binary %q: %w", platform.Path, readErr)
 		}
@@ -134,14 +130,6 @@ func cleanRelative(value string) (string, error) {
 		return "", fmt.Errorf("unsafe platform path %q", value)
 	}
 	return cleaned, nil
-}
-
-func ensureWithin(root, target string) error {
-	relative, err := filepath.Rel(root, target)
-	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return errors.New("platform path escapes the manifest directory")
-	}
-	return nil
 }
 
 func writeAtomic(destination string, data []byte, force bool) error {

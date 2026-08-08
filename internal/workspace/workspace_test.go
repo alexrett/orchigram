@@ -100,6 +100,15 @@ func TestGitHubSmartHTTPUsesOperationScopedBasicCredential(t *testing.T) {
 	}
 }
 
+func TestGitOutputRedactsRawAndDerivedBasicCredentials(t *testing.T) {
+	token := []byte("fixture-token")
+	credential := githubBasicCredential(token)
+	redacted := redactGitOutput([]byte("raw=fixture-token header="+credential), token)
+	if strings.Contains(string(redacted), string(token)) || strings.Contains(string(redacted), credential) {
+		t.Fatalf("git credential remained in redacted output: %q", redacted)
+	}
+}
+
 func TestCheckoutRejectsHTTPUserinfo(t *testing.T) {
 	t.Parallel()
 	manager := &Manager{Root: t.TempDir(), Runner: process.NewRunner()}
