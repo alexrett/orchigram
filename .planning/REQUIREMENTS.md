@@ -34,9 +34,9 @@
 
 ## Operator surface
 
-- [ ] OPS-01: English keyboard-first TUI with graph definition/live/replay modes.
-- [ ] OPS-02: Local Unix and OpenSSH StreamLocal contexts share the same API.
-- [ ] OPS-03: Non-root hardened systemd install with no network listener by default.
+- [x] OPS-01: English keyboard-first TUI with graph definition/live/replay modes.
+- [x] OPS-02: Local Unix and OpenSSH StreamLocal contexts share the same API.
+- [x] OPS-03: Non-root hardened systemd install with no network listener by default.
 
 ## Publication
 

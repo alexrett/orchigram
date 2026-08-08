@@ -1,11 +1,11 @@
 # Project state
 
 Status: executing
-Current phase: 6 of 7
-Current plan: 06-01
-Progress: 5/7 plans
+Current phase: 7 of 7
+Current plan: 07-01
+Progress: 6/7 plans
 Last activity: 2026-08-08
-Current focus: k9s-level TUI, SSH contexts, and hardened remote installation
+Current focus: v0.1 publication and reproducibility gates
 
 ## Decisions
 
@@ -17,6 +17,7 @@ Current focus: k9s-level TUI, SSH contexts, and hardened remote installation
 - Phase 3 fixed immutable bundle, AutoMTLS plugin process, redaction, and process-tree cancellation boundaries.
 - Phase 4 fixed native schedule identities, durable webhook/provider acknowledgements, and declarative output mappings.
 - Phase 5 fixed GitHub issue-event cursors, run-isolated git workspaces, deterministic branches, and mutation reconciliation.
+- Phase 6 fixed pinned-plan graph replay, reconnecting OpenSSH StreamLocal contexts, CAS resource forms, and the hardened single-node install/upgrade path.
 
 ## Blockers
 

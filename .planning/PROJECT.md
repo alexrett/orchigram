@@ -30,6 +30,6 @@ Install one Go distribution on a server, connect through a Unix socket or an SSH
 
 ## Current state
 
-Phases 1-3 complete: the foundation, restart-safe walking skeleton, and isolated production plugin lifecycle are verified. Phase 4 is implementing native triggers and the scheduled Teams tracer.
+Phases 1-6 are complete: protocol, durable execution, plugins, triggers, GitHub tracer, TUI, SSH contexts, and hardened remote installation are verified. Phase 7 is executing the publication and reproducibility gates.
 
 Last updated: 2026-08-08
