@@ -1,6 +1,18 @@
 # Durability contract
 
-Orchigram guarantees that an acknowledged trigger has a durable `TriggerReceipt` and outbox command in the same SQLite transaction. Reconciliation may repeat dispatch, but the receipt's occurrence identity maps to exactly one local Run UID.
+Orchigram compiles work before acknowledging it. The immutable
+`ExecutionPlan`, `TriggerReceipt`, and outbox command are committed in the same
+SQLite transaction. Reconciliation may repeat dispatch, but the receipt's
+occurrence identity maps to exactly one local Run UID and dispatch loads the
+accepted plan by hash instead of recompiling the current Flow.
+
+Each non-core plan node pins the installed plugin name, version, bundle digest,
+and negotiated protocol. It also snapshots the UID, generation, resource
+version, and spec of referenced AgentProfile, Repository, and SecretRef
+resources. A SecretRef spec contains only a backend coordinate; the value is
+resolved when the activity runs and is never written into the plan. Flow edits,
+resource deletion, or plugin activation changes after acknowledgement therefore
+cannot alter or strand the accepted execution.
 
 External activities are at-least-once. The unavoidable crash window is after a remote side effect succeeds and before its completion is recorded locally. Every plugin call therefore receives a stable idempotency key derived from run, node, logical iteration, and operation. Providers that cannot enforce it must reconcile with deterministic remote identifiers or hidden markers and expose the residual risk to the operator.
 
@@ -34,8 +46,9 @@ The compiler collapses strongly connected components and rejects every cycle
 without a finite `loop.maxIterations` policy. The durable interpreter executes
 the resulting component DAG deterministically. Each loop iteration receives a
 different stable activity identity, while activated edges leaving the component
-are accumulated across iterations. Editing the source Flow never changes the
-compiled plan already pinned to an active Run.
+are accumulated across iterations. Editing or deleting the source Flow never
+changes a compiled plan after trigger acceptance, including before the local
+Run projection and durable workflow instance have been created.
 
 Online backups contain consistent snapshots of the resource/event database,
 the workflow engine database, and immutable plugin installations. Restore is an

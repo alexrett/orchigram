@@ -33,6 +33,13 @@ type ActionValidator interface {
 	ValidateAction(action string, config map[string]any) []Diagnostic
 }
 
+// ActionBinder resolves the exact executable and resource projections used by
+// a non-core node. Bindings are private execution-plan data, never public Flow
+// schema fields.
+type ActionBinder interface {
+	BindAction(action string, config map[string]any) (ActionBinding, []Diagnostic)
+}
+
 // Diagnostic is a stable compiler diagnostic.
 type Diagnostic struct {
 	Path    string `json:"path"`
@@ -40,16 +47,45 @@ type Diagnostic struct {
 	Message string `json:"message"`
 }
 
+// PluginBinding pins one immutable installed plugin binary.
+type PluginBinding struct {
+	Name            string `json:"name"`
+	Version         string `json:"version"`
+	Digest          string `json:"digest"`
+	ProtocolVersion uint32 `json:"protocolVersion"`
+}
+
+// ResourceBinding pins one referenced configuration projection. SecretRef
+// specs contain only backend coordinates; secret values are never compiled.
+type ResourceBinding struct {
+	Kind            string          `json:"kind"`
+	Namespace       string          `json:"namespace"`
+	Name            string          `json:"name"`
+	UID             string          `json:"uid"`
+	ResourceVersion uint64          `json:"resourceVersion"`
+	Generation      uint64          `json:"generation"`
+	Spec            json.RawMessage `json:"spec"`
+}
+
+// ActionBinding is the compiler-facing resolved action contract.
+type ActionBinding struct {
+	Plugin    PluginBinding
+	Config    map[string]any
+	Resources []ResourceBinding
+}
+
 // PlanNode is a fully defaulted immutable execution node.
 type PlanNode struct {
-	ID                string         `json:"id"`
-	Name              string         `json:"name"`
-	Uses              string         `json:"uses"`
-	With              map[string]any `json:"with,omitempty"`
-	RetryLimit        int            `json:"retryLimit"`
-	RetryBackoff      string         `json:"retryBackoff"`
-	Timeout           string         `json:"timeout"`
-	LoopMaxIterations int            `json:"loopMaxIterations,omitempty"`
+	ID                string            `json:"id"`
+	Name              string            `json:"name"`
+	Uses              string            `json:"uses"`
+	With              map[string]any    `json:"with,omitempty"`
+	RetryLimit        int               `json:"retryLimit"`
+	RetryBackoff      string            `json:"retryBackoff"`
+	Timeout           string            `json:"timeout"`
+	LoopMaxIterations int               `json:"loopMaxIterations,omitempty"`
+	Plugin            *PluginBinding    `json:"plugin,omitempty"`
+	Resources         []ResourceBinding `json:"resources,omitempty"`
 }
 
 // PlanEdge is a validated plan transition.
@@ -144,14 +180,24 @@ func (c *Compiler) Compile(input resource.Flow) (ExecutionPlan, []Diagnostic) {
 			continue
 		}
 		nodes[node.ID] = node
+		var binding *ActionBinding
 		if !validAction(node.Uses) { //nolint:gocritic // Ordered diagnostics are clearer than a tagged switch here.
 			diagnostics = append(diagnostics, Diagnostic{Path: path + ".uses", Code: "invalid_action", Message: "action must be core.<name> or <plugin>.<action>"})
 		} else if !strings.HasPrefix(node.Uses, "core.") && c.capabilities != nil && !c.capabilities.HasAction(node.Uses) {
 			diagnostics = append(diagnostics, Diagnostic{Path: path + ".uses", Code: "unknown_action", Message: fmt.Sprintf("no enabled plugin provides %q", node.Uses)})
 		} else if !strings.HasPrefix(node.Uses, "core.") {
-			if validator, ok := c.capabilities.(ActionValidator); ok {
+			if binder, ok := c.capabilities.(ActionBinder); ok {
+				resolved, bindingDiagnostics := binder.BindAction(node.Uses, node.With)
+				for _, diagnostic := range bindingDiagnostics {
+					diagnostic.Path = nodeConfigDiagnosticPath(path, diagnostic.Path)
+					diagnostics = append(diagnostics, diagnostic)
+				}
+				if len(bindingDiagnostics) == 0 {
+					binding = &resolved
+				}
+			} else if validator, ok := c.capabilities.(ActionValidator); ok {
 				for _, diagnostic := range validator.ValidateAction(node.Uses, node.With) {
-					diagnostic.Path = path + ".with." + strings.TrimPrefix(diagnostic.Path, "config.")
+					diagnostic.Path = nodeConfigDiagnosticPath(path, diagnostic.Path)
 					diagnostics = append(diagnostics, diagnostic)
 				}
 			}
@@ -187,7 +233,13 @@ func (c *Compiler) Compile(input resource.Flow) (ExecutionPlan, []Diagnostic) {
 		if name == "" {
 			name = node.ID
 		}
-		planNodes = append(planNodes, PlanNode{ID: node.ID, Name: name, Uses: node.Uses, With: node.With, RetryLimit: retryLimit, RetryBackoff: retryBackoff, Timeout: nodeTimeout.String(), LoopMaxIterations: loopMax})
+		planNode := PlanNode{ID: node.ID, Name: name, Uses: node.Uses, With: node.With, RetryLimit: retryLimit, RetryBackoff: retryBackoff, Timeout: nodeTimeout.String(), LoopMaxIterations: loopMax}
+		if binding != nil {
+			planNode.With = binding.Config
+			planNode.Plugin = &binding.Plugin
+			planNode.Resources = binding.Resources
+		}
+		planNodes = append(planNodes, planNode)
 	}
 
 	celEnv, celErr := cel.NewEnv(cel.Variable("input", cel.DynType), cel.Variable("result", cel.DynType), cel.Variable("nodes", cel.DynType))
@@ -268,6 +320,13 @@ func (c *Compiler) Compile(input resource.Flow) (ExecutionPlan, []Diagnostic) {
 		plan.PlanHash = hex.EncodeToString(digest[:])
 	}
 	return plan, diagnostics
+}
+
+func nodeConfigDiagnosticPath(nodePath, pluginPath string) string {
+	if pluginPath == "" || pluginPath == "config" {
+		return nodePath + ".with"
+	}
+	return nodePath + ".with." + strings.TrimPrefix(pluginPath, "config.")
 }
 
 func validateMappings(nodeIndex int, node resource.FlowNode, nodes map[string]resource.FlowNode) []Diagnostic {

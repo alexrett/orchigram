@@ -83,6 +83,12 @@ func (testCapabilities) ValidateAction(_ string, _ map[string]any) []Diagnostic 
 	return []Diagnostic{{Path: "config.argv", Code: "required", Message: "argv is required"}}
 }
 
+type rootDiagnosticBinder struct{ testCapabilities }
+
+func (rootDiagnosticBinder) BindAction(_ string, _ map[string]any) (ActionBinding, []Diagnostic) {
+	return ActionBinding{}, []Diagnostic{{Path: "config", Code: "invalid", Message: "configuration is invalid"}}
+}
+
 func TestCompilerResolvesPluginCapabilityAndValidation(t *testing.T) {
 	t.Parallel()
 	flowResource, err := resource.DecodeFlow([]byte(`apiVersion: orchigram.dev/v1alpha1
@@ -97,6 +103,24 @@ spec:
 	}
 	_, diagnostics := NewCompiler(testCapabilities{}).Compile(flowResource)
 	if len(diagnostics) != 1 || diagnostics[0].Path != "spec.nodes[0].with.argv" || diagnostics[0].Code != "required" {
+		t.Fatalf("diagnostics: %+v", diagnostics)
+	}
+}
+
+func TestCompilerMapsRootPluginDiagnosticToNodeWith(t *testing.T) {
+	t.Parallel()
+	flowResource, err := resource.DecodeFlow([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: root-diagnostic}
+spec:
+  nodes:
+    - {id: execute, uses: exec.run}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, diagnostics := NewCompiler(rootDiagnosticBinder{}).Compile(flowResource)
+	if len(diagnostics) != 1 || diagnostics[0].Path != "spec.nodes[0].with" {
 		t.Fatalf("diagnostics: %+v", diagnostics)
 	}
 }

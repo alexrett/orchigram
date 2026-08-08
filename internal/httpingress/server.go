@@ -25,9 +25,15 @@ type SecretResolver interface {
 	ResolveSecret(context.Context, string) ([]byte, error)
 }
 
+// Acceptor owns compilation and the durable receipt/plan/outbox boundary.
+type Acceptor interface {
+	AcceptTrigger(context.Context, string, string, string, string, json.RawMessage, bool) (store.Receipt, error)
+}
+
 // Server owns the one explicitly configured HTTP listener.
 type Server struct {
 	state    *store.Store
+	acceptor Acceptor
 	secrets  SecretResolver
 	server   *http.Server
 	listener net.Listener
@@ -35,11 +41,15 @@ type Server struct {
 }
 
 // Listen binds the operator-selected address. It is never called for an empty address.
-func Listen(ctx context.Context, address string, state *store.Store, secrets SecretResolver) (*Server, error) {
+func Listen(ctx context.Context, address string, state *store.Store, secrets SecretResolver, acceptors ...Acceptor) (*Server, error) {
 	if strings.TrimSpace(address) == "" {
 		return nil, nil
 	}
-	handler := &Server{state: state, secrets: secrets, errors: make(chan error, 1)}
+	var acceptor Acceptor = state
+	if len(acceptors) > 0 && acceptors[0] != nil {
+		acceptor = acceptors[0]
+	}
+	handler := &Server{state: state, acceptor: acceptor, secrets: secrets, errors: make(chan error, 1)}
 	handler.server = &http.Server{
 		Addr: address, Handler: handler, ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second,
@@ -142,7 +152,7 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	if idempotencyKey == "" {
 		idempotencyKey = uuid.NewString()
 	}
-	receipt, err := s.state.AcceptTrigger(request.Context(), trigger.Metadata.UID, "webhook:"+idempotencyKey, trigger.Spec.Flow, trigger.Metadata.Namespace, body, deduplicated)
+	receipt, err := s.acceptor.AcceptTrigger(request.Context(), trigger.Metadata.UID, "webhook:"+idempotencyKey, trigger.Spec.Flow, trigger.Metadata.Namespace, body, deduplicated)
 	if err != nil {
 		writeError(writer, http.StatusInternalServerError, "persistence_failed")
 		return

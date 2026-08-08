@@ -108,6 +108,114 @@ func TestCrashBoundariesRecoverOnePinnedRun(t *testing.T) {
 	}
 }
 
+func TestAcceptedPlanSurvivesFlowMutationBeforeFirstDispatch(t *testing.T) {
+	t.Parallel()
+	for _, mutation := range []string{"update", "delete"} {
+		mutation := mutation
+		t.Run(mutation, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			state, err := store.Open(filepath.Join(t.TempDir(), "state.sqlite"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = state.Close() }()
+
+			original := applyFlow(ctx, t, state, `
+    - {id: accepted, uses: core.noop}
+`, "", 0)
+			expectedPlan, diagnostics := flow.NewCompiler(nil).Compile(mustFlow(t, original.JSON))
+			if len(diagnostics) != 0 {
+				t.Fatalf("compile original: %+v", diagnostics)
+			}
+			fake := &fakeEngine{}
+			control := New(state, flow.NewCompiler(nil), fake)
+			receipt, err := control.StartManual(ctx, "demo", "default", json.RawMessage(`{"accepted":true}`), "mutate-before-dispatch-"+mutation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := state.GetPlan(ctx, expectedPlan.PlanHash); err != nil {
+				t.Fatalf("accepted plan was not stored before acknowledgement: %v", err)
+			}
+
+			switch mutation {
+			case "update":
+				applyFlow(ctx, t, state, `
+    - {id: replacement, uses: core.noop}
+`, "", original.Metadata.ResourceVersion)
+			case "delete":
+				if err := state.Delete(ctx, "Flow", original.Metadata.Namespace, original.Metadata.Name, original.Metadata.ResourceVersion, "delete-before-dispatch"); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if err := control.ReconcileOne(ctx); err != nil {
+				t.Fatalf("dispatch accepted plan after Flow %s: %v", mutation, err)
+			}
+			run, err := state.GetRun(ctx, receipt.RunUID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if run.PlanHash != expectedPlan.PlanHash || fake.unique[receipt.RunUID] != expectedPlan.PlanHash {
+				t.Fatalf("run=%+v engine=%+v expected plan=%s", run, fake.unique, expectedPlan.PlanHash)
+			}
+		})
+	}
+}
+
+func TestProviderReplayAdvancesCursorWithoutRecompilingDeletedFlow(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	state, err := store.Open(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	acceptedFlow := applyFlow(ctx, t, state, `
+    - {id: accepted, uses: core.noop}
+`, "", 0)
+	triggerDocument, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata: {name: provider-replay}
+spec:
+  flow: demo
+  provider: {plugin: fixture}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedTrigger, err := state.Apply(ctx, triggerDocument, store.ApplyOptions{RequestID: "provider-replay-trigger"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	trigger, err := resource.DecodeTrigger(storedTrigger.JSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.EnsureTriggerState(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	control := New(state, flow.NewCompiler(nil), &fakeEngine{})
+	first, err := control.AcceptProviderTrigger(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, "provider-event-1", "demo", resource.DefaultNamespace, json.RawMessage(`{"event":1}`), "cursor-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Delete(ctx, "Flow", acceptedFlow.Metadata.Namespace, acceptedFlow.Metadata.Name, acceptedFlow.Metadata.ResourceVersion, "delete-after-provider-accept"); err != nil {
+		t.Fatal(err)
+	}
+	replay, err := control.AcceptProviderTrigger(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, "provider-event-1", "demo", resource.DefaultNamespace, json.RawMessage(`{"event":1}`), "cursor-2")
+	if err != nil {
+		t.Fatalf("replay after Flow deletion: %v", err)
+	}
+	if !replay.Existing || replay.UID != first.UID || replay.RunUID != first.RunUID {
+		t.Fatalf("first=%+v replay=%+v", first, replay)
+	}
+	cursor, eventID, err := state.ProviderCursor(ctx, trigger.Metadata.UID)
+	if err != nil || cursor != "cursor-2" || eventID != "provider-event-1" {
+		t.Fatalf("cursor=%q event=%q err=%v", cursor, eventID, err)
+	}
+}
+
 func TestCancelBeforeStartSuppressesOutboxAndReconcilesTerminalRun(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

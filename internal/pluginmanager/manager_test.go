@@ -321,6 +321,88 @@ spec: {backend: env, key: ORCHIGRAM_TEST_GITHUB_PROVIDER_TOKEN}
 	}
 }
 
+func TestCompiledNodePinsInactivePluginAndDeletedResourceProjections(t *testing.T) {
+	ctx := context.Background()
+	stateRoot := t.TempDir()
+	state, err := store.Open(filepath.Join(stateRoot, "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	manager := New(state, stateRoot)
+	defer manager.Close()
+	record, err := manager.Install(ctx, conformanceBundle(t, "agent-command", 1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Enable(ctx, record.Name, record.Version); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ORCHIGRAM_PINNED_AGENT_TOKEN", "runtime-only-test-value")
+	applyResource(t, state, `apiVersion: orchigram.dev/v1alpha1
+kind: SecretRef
+metadata: {name: pinned-token}
+spec: {backend: env, key: ORCHIGRAM_PINNED_AGENT_TOKEN}
+`)
+	applyResource(t, state, `apiVersion: orchigram.dev/v1alpha1
+kind: AgentProfile
+metadata: {name: pinned-profile}
+spec:
+  type: command
+  executable: /bin/sh
+  args: ["-c", "printf '{\"type\":\"result\",\"pinned\":true}\\n'"]
+  secretRefs: ["API_TOKEN=pinned-token"]
+`)
+	document, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: pinned-flow}
+spec:
+  nodes:
+    - id: agent
+      uses: agent-command.run
+      with: {profile: pinned-profile}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	flowResource, err := resource.DecodeFlow(document.JSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, diagnostics := flow.NewCompiler(manager).Compile(flowResource)
+	if len(diagnostics) != 0 || len(plan.Nodes) != 1 {
+		t.Fatalf("plan=%+v diagnostics=%+v", plan, diagnostics)
+	}
+	node := plan.Nodes[0]
+	if node.Plugin == nil || node.Plugin.Version != record.Version || node.Plugin.Digest != record.Digest || len(node.Resources) != 2 {
+		t.Fatalf("compiled binding=%+v resources=%+v", node.Plugin, node.Resources)
+	}
+	if encoded, marshalErr := json.Marshal(plan); marshalErr != nil || strings.Contains(string(encoded), "runtime-only-test-value") {
+		t.Fatalf("compiled plan leaked a secret value: %s err=%v", encoded, marshalErr)
+	}
+
+	if err := manager.Disable(ctx, "agent-command"); err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []struct{ kind, name string }{{"AgentProfile", "pinned-profile"}, {"SecretRef", "pinned-token"}} {
+		stored, getErr := state.Get(ctx, target.kind, resource.DefaultNamespace, target.name)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if deleteErr := state.Delete(ctx, target.kind, resource.DefaultNamespace, target.name, stored.Metadata.ResourceVersion, "delete-after-compile"); deleteErr != nil {
+			t.Fatal(deleteErr)
+		}
+	}
+	output, err := manager.Execute(ctx, "run-pinned-bindings", node, json.RawMessage(`{}`), nil, "pinned-bindings-attempt")
+	var result struct {
+		Stdout string `json:"stdout"`
+	}
+	decodeErr := json.Unmarshal(output, &result)
+	if err != nil || decodeErr != nil || !strings.Contains(result.Stdout, `"pinned":true`) {
+		t.Fatalf("pinned execution output=%s err=%v", output, err)
+	}
+}
+
 func TestSelfSDLCCExampleRendersFetchedIssueRequirementsForPlanner(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("..", "..", "examples", "self-sdlc", "issue-to-pr-flow.yaml")) //nolint:gosec // Repository-owned fixture.
 	if err != nil {
