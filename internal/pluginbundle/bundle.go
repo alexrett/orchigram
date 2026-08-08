@@ -30,7 +30,10 @@ const (
 	maxFile    = 96 << 20
 )
 
-var pluginName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+var (
+	pluginName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+	targetName = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+)
 
 // ProtocolRange declares compatible business protocol versions.
 type ProtocolRange struct {
@@ -159,16 +162,38 @@ func (m Manifest) Validate() error {
 	if len(m.Capabilities) == 0 {
 		return errors.New("plugin capabilities must not be empty")
 	}
+	if len(m.Platforms) == 0 {
+		return errors.New("plugin platforms must not be empty")
+	}
+	seenCapabilities := map[string]bool{}
+	for _, capability := range m.Capabilities {
+		if strings.TrimSpace(capability) == "" || seenCapabilities[capability] {
+			return fmt.Errorf("invalid or duplicate plugin capability %q", capability)
+		}
+		seenCapabilities[capability] = true
+	}
 	seen := map[string]bool{}
+	seenPaths := map[string]bool{}
 	for _, platform := range m.Platforms {
 		key := platform.OS + "/" + platform.Arch
+		if !targetName.MatchString(platform.OS) || !targetName.MatchString(platform.Arch) {
+			return fmt.Errorf("invalid plugin platform %q", key)
+		}
 		if seen[key] {
 			return fmt.Errorf("duplicate plugin platform %s", key)
 		}
 		seen[key] = true
-		if _, err := cleanArchivePath(platform.Path); err != nil {
+		cleaned, err := cleanArchivePath(platform.Path)
+		if err != nil {
 			return err
 		}
+		if cleaned != platform.Path {
+			return fmt.Errorf("platform %s path must be normalized", key)
+		}
+		if seenPaths[platform.Path] {
+			return fmt.Errorf("duplicate platform target %q", platform.Path)
+		}
+		seenPaths[platform.Path] = true
 		decoded, err := hex.DecodeString(platform.SHA256)
 		if err != nil || len(decoded) != sha256.Size {
 			return fmt.Errorf("platform %s has invalid sha256", key)
@@ -235,6 +260,7 @@ func Install(root string, bundle []byte) (Installed, error) {
 
 // Build creates a deterministic tar.gz bundle for release and tests.
 func Build(manifest Manifest, binaries map[string][]byte) ([]byte, error) {
+	manifest = normalizeManifest(manifest)
 	if err := manifest.Validate(); err != nil {
 		return nil, err
 	}
@@ -266,8 +292,7 @@ func Build(manifest Manifest, binaries map[string][]byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	gzipWriter.ModTime = unixEpoch
-	gzipWriter.OS = 255
+	gzipWriter.Header = gzip.Header{ModTime: unixEpoch, OS: 255}
 	tarWriter := tar.NewWriter(gzipWriter)
 	for _, name := range names {
 		mode := int64(0o640)
@@ -275,7 +300,10 @@ func Build(manifest Manifest, binaries map[string][]byte) ([]byte, error) {
 			mode = 0o550
 		}
 		data := files[name]
-		header := &tar.Header{Name: name, Mode: mode, Size: int64(len(data)), ModTime: unixEpoch, Typeflag: tar.TypeReg}
+		header := &tar.Header{
+			Name: name, Mode: mode, Size: int64(len(data)), ModTime: unixEpoch,
+			Typeflag: tar.TypeReg, Uid: 0, Gid: 0, Uname: "", Gname: "", Format: tar.FormatUSTAR,
+		}
 		if err := tarWriter.WriteHeader(header); err != nil {
 			return nil, err
 		}
@@ -289,10 +317,30 @@ func Build(manifest Manifest, binaries map[string][]byte) ([]byte, error) {
 	if err := gzipWriter.Close(); err != nil {
 		return nil, err
 	}
+	if output.Len() > maxBundle {
+		return nil, errors.New("plugin bundle exceeds 128 MiB")
+	}
 	return output.Bytes(), nil
 }
 
 var unixEpoch = time.Unix(0, 0).UTC()
+
+func normalizeManifest(manifest Manifest) Manifest {
+	manifest.Capabilities = append([]string(nil), manifest.Capabilities...)
+	sort.Strings(manifest.Capabilities)
+	manifest.Platforms = append([]Platform(nil), manifest.Platforms...)
+	sort.Slice(manifest.Platforms, func(i, j int) bool {
+		left, right := manifest.Platforms[i], manifest.Platforms[j]
+		if left.OS != right.OS {
+			return left.OS < right.OS
+		}
+		if left.Arch != right.Arch {
+			return left.Arch < right.Arch
+		}
+		return left.Path < right.Path
+	})
+	return manifest
+}
 
 func cleanArchivePath(value string) (string, error) {
 	cleaned := path.Clean(strings.ReplaceAll(value, "\\", "/"))

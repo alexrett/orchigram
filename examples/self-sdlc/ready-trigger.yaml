@@ -1,0 +1,16 @@
+apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata:
+  name: self-sdlc-ready-issues
+spec:
+  flow: self-sdlc-issue-to-pr
+  provider:
+    plugin: github
+    config:
+      owner: REPLACE_WITH_GITHUB_OWNER
+      repository: REPLACE_WITH_REPOSITORY
+      label: orchigram:ready
+      pollInterval: 30s
+      tokenSecret: token
+      secretRefs:
+        token: self-sdlc-github-token

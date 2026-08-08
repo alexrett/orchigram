@@ -47,6 +47,10 @@ type TaskExecutor interface {
 	Execute(context.Context, string, flow.PlanNode, json.RawMessage, map[string]any, string) (json.RawMessage, error)
 }
 
+type runCanceler interface {
+	CancelRun(context.Context, string, string) error
+}
+
 // ApprovalSignal is the framework-independent durable decision payload.
 type ApprovalSignal struct {
 	State  string `json:"state"`
@@ -61,6 +65,7 @@ type Adapter struct {
 	store   *store.Store
 	cancel  context.CancelFunc
 	done    chan error
+	runs    runCanceler
 	once    sync.Once
 }
 
@@ -71,7 +76,10 @@ func Open(ctx context.Context, workflowDBPath string, state *store.Store, execut
 		backend.WithActivityLockTimeout(2*time.Second),
 		backend.WithStickyTimeout(0),
 	))
-	w := worker.New(b, nil)
+	workerOptions := worker.DefaultOptions
+	workerOptions.WorkflowHeartbeatInterval = 500 * time.Millisecond
+	workerOptions.ActivityHeartbeatInterval = 500 * time.Millisecond
+	w := worker.New(b, &workerOptions)
 	if err := w.RegisterWorkflow(InterpreterWorkflow, registry.WithName(workflowName)); err != nil {
 		return nil, fmt.Errorf("register interpreter: %w", err)
 	}
@@ -98,6 +106,7 @@ func Open(ctx context.Context, workflowDBPath string, state *store.Store, execut
 		return nil, err
 	}
 	adapter := &Adapter{backend: b, client: workflowClient.New(b), worker: w, store: state, cancel: cancel, done: make(chan error, 1)}
+	adapter.runs, _ = executor.(runCanceler)
 	go func() { adapter.done <- w.WaitForCompletion() }()
 	return adapter, nil
 }
@@ -126,12 +135,16 @@ func (a *Adapter) Signal(ctx context.Context, runUID, nodeID string, signal Appr
 }
 
 // Cancel cancels a workflow instance after the daemon records operator intent.
-func (a *Adapter) Cancel(ctx context.Context, runUID, _ string) error {
+func (a *Adapter) Cancel(ctx context.Context, runUID, reason string) error {
+	var providerErr error
+	if a.runs != nil {
+		providerErr = a.runs.CancelRun(ctx, runUID, reason)
+	}
 	instance, err := a.findInstance(ctx, runUID)
 	if err != nil {
-		return err
+		return errors.Join(providerErr, err)
 	}
-	return a.client.CancelWorkflowInstance(ctx, instance)
+	return errors.Join(providerErr, a.client.CancelWorkflowInstance(ctx, instance))
 }
 
 // Reconcile redelivers durable decisions not yet acknowledged by the engine boundary.

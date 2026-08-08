@@ -24,6 +24,7 @@ import (
 	"github.com/alexrett/orchigram/internal/contexttransport"
 	"github.com/alexrett/orchigram/internal/daemon"
 	installer "github.com/alexrett/orchigram/internal/install"
+	"github.com/alexrett/orchigram/internal/pluginpack"
 	"github.com/alexrett/orchigram/internal/tui"
 	"github.com/alexrett/orchigram/internal/version"
 	"github.com/google/uuid"
@@ -403,6 +404,22 @@ func triggerMutationCommand(opts *options, enabled bool) *cobra.Command {
 
 func newPluginCommand(opts *options) *cobra.Command {
 	command := &cobra.Command{Use: "plugin", Short: "Install and inspect plugins", RunE: func(cmd *cobra.Command, _ []string) error { return cmd.Help() }}
+	var packManifest, packOutput string
+	var packForce bool
+	pack := &cobra.Command{Use: "pack", Short: "Build a deterministic community plugin bundle", RunE: func(cmd *cobra.Command, _ []string) error {
+		if packManifest == "" || packOutput == "" {
+			return errors.New("--manifest and --output are required")
+		}
+		result, err := pluginpack.Pack(packManifest, packOutput, packForce)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\n", result.SHA256, result.Path)
+		return err
+	}}
+	pack.Flags().StringVar(&packManifest, "manifest", "", "authoring plugin.yaml path")
+	pack.Flags().StringVar(&packOutput, "output", "", "output .tar.gz path")
+	pack.Flags().BoolVar(&packForce, "force", false, "replace an existing output atomically")
 	install := &cobra.Command{Use: "install BUNDLE", Short: "Upload and verify an immutable plugin bundle", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		bundle, err := os.ReadFile(filepath.Clean(args[0])) //nolint:gosec // The operator explicitly supplies the bundle path.
 		if err != nil {
@@ -442,7 +459,7 @@ func newPluginCommand(opts *options) *cobra.Command {
 			return nil
 		})
 	}}
-	command.AddCommand(install, list, pluginMutationCommand(opts, "enable"), pluginMutationCommand(opts, "disable"), pluginDoctorCommand(opts))
+	command.AddCommand(pack, install, list, pluginMutationCommand(opts, "enable"), pluginMutationCommand(opts, "disable"), pluginDoctorCommand(opts))
 	return command
 }
 

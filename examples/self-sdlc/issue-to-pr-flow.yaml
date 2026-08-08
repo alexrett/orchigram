@@ -1,0 +1,114 @@
+apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata:
+  name: self-sdlc-issue-to-pr
+spec:
+  policies:
+    timeout: 3h
+    maxParallel: 1
+  nodes:
+    - id: fetch_issue
+      uses: github.issue.get
+      with:
+        owner: REPLACE_WITH_GITHUB_OWNER
+        repository: REPLACE_WITH_REPOSITORY
+        tokenSecret: token
+        secretRefs: {token: self-sdlc-github-token}
+        number: 1
+        mappings:
+          - {from: input.issue.number, to: /number}
+    - id: checkout
+      uses: github.workspace.checkout
+      timeout: 5m
+      with:
+        repositoryRef: self-sdlc-repository
+        issueNumber: 1
+        mappings:
+          - {from: nodes.fetch_issue.issue.number, to: /issueNumber}
+    - id: plan
+      uses: agent-command.run
+      timeout: 30m
+      with:
+        profile: self-sdlc-planner
+        workspace: .
+        prompt: |-
+          Read the repository and GitHub issue #${nodes.fetch_issue.issue.number}.
+          Produce an implementation plan in English. Do not modify files.
+        mappings:
+          - {from: nodes.checkout.workspace, to: /workspace}
+    - id: publish_plan
+      uses: github.issue.comment
+      with:
+        owner: REPLACE_WITH_GITHUB_OWNER
+        repository: REPLACE_WITH_REPOSITORY
+        tokenSecret: token
+        secretRefs: {token: self-sdlc-github-token}
+        number: 1
+        body: |-
+          ## Proposed implementation plan
+
+          ${nodes.plan.text}
+        mappings:
+          - {from: nodes.fetch_issue.issue.number, to: /number}
+    - id: approval
+      uses: core.approval
+      timeout: 24h
+    - id: implement
+      uses: agent-command.run
+      timeout: 60m
+      with:
+        profile: self-sdlc-implementer
+        workspace: .
+        prompt: |-
+          Implement issue #${nodes.fetch_issue.issue.number} using the approved plan:
+
+          ${nodes.plan.text}
+
+          Work only in the supplied checkout. Do not commit, push, open a pull
+          request, merge, or change credentials.
+        mappings:
+          - {from: nodes.checkout.workspace, to: /workspace}
+    - id: verify
+      uses: exec.run
+      timeout: 30m
+      with:
+        argv: [make, check]
+        directory: .
+        mappings:
+          - {from: nodes.checkout.workspace, to: /directory}
+    - id: push
+      uses: github.workspace.commit-push
+      timeout: 5m
+      with:
+        workspace: .
+        branch: orchigram/issue-placeholder
+        message: "Implement issue #${nodes.fetch_issue.issue.number}"
+        tokenSecret: token
+        secretRefs: {token: self-sdlc-github-token}
+        mappings:
+          - {from: nodes.checkout.workspace, to: /workspace}
+          - {from: nodes.checkout.branch, to: /branch}
+    - id: create_pr
+      uses: github.pr.ensure
+      with:
+        owner: REPLACE_WITH_GITHUB_OWNER
+        repository: REPLACE_WITH_REPOSITORY
+        tokenSecret: token
+        secretRefs: {token: self-sdlc-github-token}
+        head: orchigram/issue-placeholder
+        base: main
+        title: "Implement issue #${nodes.fetch_issue.issue.number}"
+        body: |-
+          Implements #${nodes.fetch_issue.issue.number} after an approved plan
+          and `make check`. Human review is required; this flow never merges.
+        mappings:
+          - {from: nodes.checkout.branch, to: /head}
+  edges:
+    - {from: fetch_issue, to: checkout}
+    - {from: checkout, to: plan}
+    - {from: plan, to: publish_plan}
+    - {from: publish_plan, to: approval}
+    - {from: approval, to: implement, when: result.approved}
+    - {from: implement, to: verify}
+    - {from: verify, to: push}
+    - {from: push, to: create_pr}

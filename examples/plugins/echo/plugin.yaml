@@ -1,0 +1,21 @@
+apiVersion: orchigram.dev/plugin/v1alpha1
+name: echo
+version: 0.1.0
+protocol:
+  minimum: 1
+  maximum: 1
+capabilities:
+  - task.echo.echo
+platforms:
+  - os: linux
+    arch: amd64
+    path: bin/echo-linux-amd64
+  - os: linux
+    arch: arm64
+    path: bin/echo-linux-arm64
+  - os: darwin
+    arch: amd64
+    path: bin/echo-darwin-amd64
+  - os: darwin
+    arch: arm64
+    path: bin/echo-darwin-arm64

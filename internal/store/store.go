@@ -648,6 +648,16 @@ func (s *Store) AppendRunEvent(ctx context.Context, runUID, nodeID, eventType, p
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	var currentPhase string
+	if err := tx.QueryRowContext(ctx, `SELECT phase FROM runs WHERE uid=?`, runUID).Scan(&currentPhase); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if terminalRunPhase(currentPhase) {
+		return tx.Commit()
+	}
 	var sequence uint64
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM run_events WHERE run_uid=?`, runUID).Scan(&sequence); err != nil {
 		return err
@@ -664,6 +674,10 @@ func (s *Store) AppendRunEvent(ctx context.Context, runUID, nodeID, eventType, p
 		return err
 	}
 	return tx.Commit()
+}
+
+func terminalRunPhase(phase string) bool {
+	return phase == "succeeded" || phase == "failed" || phase == "rejected" || phase == "cancelled"
 }
 
 // RunEvent is an operator-visible durable transition.

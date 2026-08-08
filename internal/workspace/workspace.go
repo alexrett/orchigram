@@ -3,8 +3,10 @@ package workspace
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -66,6 +68,13 @@ func (m *Manager) Checkout(ctx context.Context, request CheckoutRequest, emit Ev
 	}
 	if !safeIdentity.MatchString(request.DefaultBranch) {
 		return CheckoutResult{}, errors.New("default branch contains unsupported characters")
+	}
+	cloneURL, err := url.Parse(request.CloneURL)
+	if err != nil {
+		return CheckoutResult{}, errors.New("clone URL is invalid")
+	}
+	if (cloneURL.Scheme == "http" || cloneURL.Scheme == "https") && cloneURL.User != nil {
+		return CheckoutResult{}, errors.New("HTTP(S) clone URL must not contain userinfo")
 	}
 	root, err := filepath.Abs(m.Root)
 	if err != nil || root == "." || root == string(filepath.Separator) {
@@ -165,14 +174,36 @@ func (m *Manager) gitResult(ctx context.Context, requestID, directory string, to
 	if len(token) > 0 {
 		base["GIT_CONFIG_COUNT"] = "1"
 		base["GIT_CONFIG_KEY_0"] = "http.extraHeader"
-		base["GIT_CONFIG_VALUE_0"] = "Authorization: Bearer " + string(token)
+		base["GIT_CONFIG_VALUE_0"] = "Authorization: " + githubBasicCredential(token)
 		base["GIT_TERMINAL_PROMPT"] = "0"
 	}
-	result, err := m.Runner.Run(ctx, requestID, process.Spec{Executable: "git", Args: args, Directory: directory, Environment: process.MinimalEnvironment(base, nil)}, emit)
+	safeEmit := emit
+	if emit != nil && len(token) > 0 {
+		safeEmit = func(output process.Output) error {
+			output.Data = bytesReplace(output.Data, token, []byte("[REDACTED]"))
+			return emit(output)
+		}
+	}
+	result, err := m.Runner.Run(ctx, requestID, process.Spec{Executable: "git", Args: args, Directory: directory, Environment: process.MinimalEnvironment(base, nil)}, safeEmit)
+	if len(token) > 0 {
+		result.Stdout = bytesReplace(result.Stdout, token, []byte("[REDACTED]"))
+		result.Stderr = bytesReplace(result.Stderr, token, []byte("[REDACTED]"))
+	}
 	if err != nil {
 		return result, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
 	return result, nil
+}
+
+func githubBasicCredential(token []byte) string {
+	return "Basic " + base64.StdEncoding.EncodeToString(append([]byte("x-access-token:"), token...))
+}
+
+func bytesReplace(value, old, replacement []byte) []byte {
+	if len(old) == 0 {
+		return append([]byte(nil), value...)
+	}
+	return []byte(strings.ReplaceAll(string(value), string(old), string(replacement)))
 }
 
 func ensureWithin(root, target string) error {

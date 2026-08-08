@@ -29,6 +29,13 @@ Plugin tar/gzip headers are normalized to the Unix epoch. GoReleaser runs with
 one packaging worker so archive member ordering is stable; the release packager
 also has a byte-for-byte reproducibility test.
 
+First-party release packaging and `orchigram plugin pack` share the canonical
+bundle builder: sorted capabilities/platforms and archive members, fixed modes,
+IDs, names, timestamps, tar format, and gzip headers. Community outputs are
+created exclusively and atomically unless the operator supplies `--force`.
+Cross-build validation covers the first-party SDK bootstraps and external echo
+module conformance test.
+
 ## External tracer checkpoints
 
 CI exercises the Teams flow only against an `httptest` receiver. Sending a

@@ -4,20 +4,39 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 
-	pluginv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/plugin/v1alpha1"
+	pluginsdk "github.com/alexrett/orchigram/sdk/plugin"
 )
+
+func TestIssueEventWithoutEmbeddedIssueOrURLIsRejected(t *testing.T) {
+	t.Parallel()
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body := `[{"id":15,"event":"labeled","created_at":"2026-08-08T10:00:00Z","label":{"name":"orchigram:ready"}}]`
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
+	})}
+	runtime := &Runtime{Client: client}
+	_, err := runtime.listReadyEvents(context.Background(), watchConfig{repositoryConfig: repositoryConfig{Owner: "acme", Repository: "widget", APIBase: "https://api.example.invalid", TokenSecret: "token"}, Label: "orchigram:ready"}, []byte("fixture-token"), 0)
+	if err == nil || !strings.Contains(err.Error(), "neither an embedded issue nor issue_url") {
+		t.Fatalf("provider error=%v", err)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
 
 func TestPollingFixturesCoverPaginationRateLimitAndStableOrder(t *testing.T) {
 	t.Parallel()
 	var server *httptest.Server
 	var mu sync.Mutex
 	eventRequests := 0
+	issueRequests := 0
 	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Header.Get("Authorization") != "Bearer fixture-token" {
 			http.Error(writer, `{"message":"unauthorized"}`, http.StatusUnauthorized)
@@ -41,11 +60,12 @@ func TestPollingFixturesCoverPaginationRateLimitAndStableOrder(t *testing.T) {
 				return
 			}
 			writer.Header().Set("Link", "<"+server.URL+"/repos/acme/widget/issues/events?page=2>; rel=\"next\"")
-			_, _ = fmt.Fprintf(writer, `[{"id":12,"event":"labeled","issue_url":%q,"created_at":"2026-08-08T11:00:00Z","label":{"name":"orchigram:ready"}},{"id":9,"event":"labeled","issue_url":%q,"created_at":"2026-08-08T09:00:00Z","label":{"name":"orchigram:ready"}}]`, server.URL+"/repos/acme/widget/issues/43", server.URL+"/repos/acme/widget/issues/40")
+			_, _ = fmt.Fprintf(writer, `[{"id":12,"event":"labeled","issue":{"number":43,"title":"second","body":"body","html_url":"https://example.invalid/43","state":"open"},"issue_url":%q,"created_at":"2026-08-08T11:00:00Z","label":{"name":"orchigram:ready"}},{"id":9,"event":"labeled","issue_url":%q,"created_at":"2026-08-08T09:00:00Z","label":{"name":"orchigram:ready"}}]`, server.URL+"/repos/acme/widget/issues/43", server.URL+"/repos/acme/widget/issues/40")
 		case "/repos/acme/widget/issues/42":
+			mu.Lock()
+			issueRequests++
+			mu.Unlock()
 			_, _ = writer.Write([]byte(`{"number":42,"title":"first","body":"body","html_url":"https://example.invalid/42","state":"open"}`))
-		case "/repos/acme/widget/issues/43":
-			_, _ = writer.Write([]byte(`{"number":43,"title":"second","body":"body","html_url":"https://example.invalid/43","state":"open"}`))
 		default:
 			http.NotFound(writer, request)
 		}
@@ -61,6 +81,9 @@ func TestPollingFixturesCoverPaginationRateLimitAndStableOrder(t *testing.T) {
 	}
 	if eventRequests != 3 {
 		t.Fatalf("event requests=%d, expected rate-limit retry plus two pages", eventRequests)
+	}
+	if issueRequests != 1 {
+		t.Fatalf("issue detail requests=%d, expected only issue_url fallback", issueRequests)
 	}
 }
 
@@ -109,8 +132,7 @@ func TestCommentAndPullRequestReconcileByMarkerAndBranch(t *testing.T) {
 	}))
 	defer server.Close()
 	runtime := &Runtime{Client: server.Client()}
-	meta := &pluginv1alpha1.CallMeta{RequestId: "request", RunUid: "run-123", NodeId: "publish-plan", IdempotencyKey: "stable"}
-	commentRequest := executeRequest(t, meta, "github.issue.comment", map[string]any{"owner": "acme", "repository": "widget", "apiBase": server.URL, "tokenSecret": "token", "number": 42, "body": "Plan"})
+	commentRequest := executeRequest(t, "run-123", "publish-plan", "github.issue.comment", map[string]any{"owner": "acme", "repository": "widget", "apiBase": server.URL, "tokenSecret": "token", "number": 42, "body": "Plan"})
 	firstComment, err := runtime.issueComment(context.Background(), commentRequest)
 	if err != nil {
 		t.Fatal(err)
@@ -123,8 +145,7 @@ func TestCommentAndPullRequestReconcileByMarkerAndBranch(t *testing.T) {
 		t.Fatalf("comments=%+v first=%+v second=%+v", comments, firstComment, secondComment)
 	}
 
-	meta.NodeId = "create-pr"
-	pullRequest := executeRequest(t, meta, "github.pr.ensure", map[string]any{"owner": "acme", "repository": "widget", "apiBase": server.URL, "tokenSecret": "token", "head": "orchigram/issue-42-run123", "base": "main", "title": "Implement #42", "body": "Automated change"})
+	pullRequest := executeRequest(t, "run-123", "create-pr", "github.pr.ensure", map[string]any{"owner": "acme", "repository": "widget", "apiBase": server.URL, "tokenSecret": "token", "head": "orchigram/issue-42-run123", "base": "main", "title": "Implement #42", "body": "Automated change"})
 	firstPull, err := runtime.ensurePullRequest(context.Background(), pullRequest)
 	if err != nil {
 		t.Fatal(err)
@@ -138,11 +159,11 @@ func TestCommentAndPullRequestReconcileByMarkerAndBranch(t *testing.T) {
 	}
 }
 
-func executeRequest(t *testing.T, meta *pluginv1alpha1.CallMeta, action string, config map[string]any) *pluginv1alpha1.ExecuteRequest {
+func executeRequest(t *testing.T, runUID, nodeID, action string, config map[string]any) pluginsdk.TaskRequest {
 	t.Helper()
 	encoded, err := json.Marshal(config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &pluginv1alpha1.ExecuteRequest{Meta: meta, Action: action, ConfigJson: encoded, Secrets: map[string][]byte{"token": []byte("fixture-token")}}
+	return pluginsdk.TaskRequest{RequestID: "request", RunUID: runUID, NodeID: nodeID, IdempotencyKey: "stable", Action: action, Config: encoded, Secrets: map[string][]byte{"token": []byte("fixture-token")}}
 }

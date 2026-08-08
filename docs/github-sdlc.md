@@ -7,10 +7,17 @@ sorted by ID; a rate-limited GET is retried with bounded delay. The daemon
 persists the event receipt, outbox command, and cursor before acknowledging the
 plugin stream.
 
+Current issue events are decoded from their embedded `issue` object without a
+second request. `issue_url` remains a compatibility fallback for older recorded
+shapes; an event with neither source is rejected with a provider error.
+
 The plugin talks to the GitHub REST API directly. It does not execute `gh` and
 accepts a fine-grained PAT only as an operation-scoped SecretRef binding. The
 same secret is provided to system `git` through an ephemeral `http.extraHeader`
 environment configuration, not embedded in a clone URL or command argument.
+GitHub smart HTTP receives a Basic credential for `x-access-token:<token>`.
+HTTP(S) clone URLs containing userinfo are rejected, and the token is redacted
+from child output and returned results.
 
 ## Reference run
 
@@ -36,6 +43,12 @@ workspace and reconciles the same branch head. The branch is always
 Approval rejection terminates interpretation before implementation, tests,
 commit, push, and PR creation. Orchigram never merges a PR and never pushes the
 default branch.
+
+[`examples/self-sdlc`](../examples/self-sdlc/README.md) is the portable version
+used to operate a repository through its own Unix-socket-only daemon. Its owner,
+repository, and profile values are explicitly replaceable; it contains only
+SecretRef names and portable executable defaults, never credentials or
+machine-specific addresses.
 
 ## Verification boundary
 

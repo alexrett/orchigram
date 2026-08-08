@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -71,6 +72,125 @@ func TestApprovalSignalCompletesWithoutPendingTimer(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+func TestActivityHeartbeatsPreventConcurrentRedispatch(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	state, err := store.Open(filepath.Join(root, "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	executor := &slowExecutor{delay: 3 * time.Second}
+	adapter, err := Open(ctx, filepath.Join(root, "workflows.sqlite"), state, executor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = adapter.Close() }()
+	plan := flow.ExecutionPlan{FlowUID: "flow-heartbeat", FlowGeneration: 1, InterpreterVersion: flow.InterpreterVersion, PlanHash: "heartbeat-plan", Nodes: []flow.PlanNode{{ID: "slow", Uses: "slow.execute", Timeout: "10s", RetryBackoff: "10ms"}}}
+	payload := store.StartPayload{RunUID: "run-heartbeat", Input: json.RawMessage(`{}`)}
+	if _, err := state.EnsureRun(ctx, payload, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Start(ctx, payload.RunUID, plan, payload.Input); err != nil {
+		t.Fatal(err)
+	}
+	waitForPhase(ctx, t, state, payload.RunUID, "succeeded")
+	executor.mu.Lock()
+	calls, maximum := executor.calls, executor.maximum
+	executor.mu.Unlock()
+	if calls != 1 || maximum != 1 {
+		t.Fatalf("long activity calls=%d maximum concurrency=%d", calls, maximum)
+	}
+}
+
+func TestCancellationRemainsTerminalAfterLateActivityCompletion(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	state, err := store.Open(filepath.Join(root, "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	executor := &blockingExecutor{started: make(chan struct{}), release: make(chan struct{})}
+	adapter, err := Open(ctx, filepath.Join(root, "workflows.sqlite"), state, executor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = adapter.Close() }()
+	plan := flow.ExecutionPlan{FlowUID: "flow-cancel-race", FlowGeneration: 1, InterpreterVersion: flow.InterpreterVersion, PlanHash: "cancel-race-plan", Nodes: []flow.PlanNode{{ID: "slow", Uses: "slow.execute", Timeout: "10s", RetryBackoff: "10ms"}}}
+	payload := store.StartPayload{RunUID: "run-cancel-race", Input: json.RawMessage(`{}`)}
+	if _, err := state.EnsureRun(ctx, payload, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Start(ctx, payload.RunUID, plan, payload.Input); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-executor.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("activity did not start")
+	}
+	if err := state.AppendRunEvent(ctx, payload.RunUID, "", "run.cancelled", "cancelled", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Cancel(ctx, payload.RunUID, "test cancellation"); err != nil {
+		t.Fatal(err)
+	}
+	close(executor.release)
+	time.Sleep(300 * time.Millisecond)
+	run, err := state.GetRun(ctx, payload.RunUID)
+	if err != nil || run.Phase != "cancelled" {
+		t.Fatalf("run=%+v err=%v", run, err)
+	}
+	events, err := state.RunEventsAfter(ctx, payload.RunUID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Type == "node.completed" || event.Type == "run.succeeded" || event.Type == "run.failed" || event.Type == "approval.waiting" {
+			t.Fatalf("late event %q appended after cancellation", event.Type)
+		}
+	}
+}
+
+type slowExecutor struct {
+	mu              sync.Mutex
+	active, maximum int
+	calls           int
+	delay           time.Duration
+}
+
+type blockingExecutor struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (e *blockingExecutor) Execute(context.Context, string, flow.PlanNode, json.RawMessage, map[string]any, string) (json.RawMessage, error) {
+	e.once.Do(func() { close(e.started) })
+	<-e.release
+	return json.RawMessage(`{"late":true}`), nil
+}
+
+func (e *slowExecutor) Execute(context.Context, string, flow.PlanNode, json.RawMessage, map[string]any, string) (json.RawMessage, error) {
+	e.mu.Lock()
+	e.calls++
+	e.active++
+	if e.active > e.maximum {
+		e.maximum = e.active
+	}
+	e.mu.Unlock()
+	time.Sleep(e.delay)
+	e.mu.Lock()
+	e.active--
+	e.mu.Unlock()
+	return json.RawMessage(`{"ok":true}`), nil
 }
 
 func TestFiniteCycleExecutesDeclaredIterationsAndExits(t *testing.T) {

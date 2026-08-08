@@ -42,13 +42,23 @@ type Manager struct {
 	workspaces string
 	mu         sync.Mutex
 	processes  map[string]*pluginhost.Process
+	active     map[string]*activeProviderCall
+}
+
+type activeProviderCall struct {
+	process *pluginhost.Process
+	meta    *pluginv1alpha1.CallMeta
+	kind    string
+	cancel  context.CancelFunc
+	stop    func() bool
+	once    sync.Once
 }
 
 // New creates a manager rooted under the daemon's private state directory.
 func New(state *store.Store, stateRoot string) *Manager {
 	return &Manager{
 		store: state, root: filepath.Join(stateRoot, "plugins"),
-		artifacts: filepath.Join(stateRoot, "artifacts"), workspaces: filepath.Join(stateRoot, "workspaces"), processes: map[string]*pluginhost.Process{},
+		artifacts: filepath.Join(stateRoot, "artifacts"), workspaces: filepath.Join(stateRoot, "workspaces"), processes: map[string]*pluginhost.Process{}, active: map[string]*activeProviderCall{},
 	}
 }
 
@@ -321,6 +331,12 @@ func (m *Manager) Execute(ctx context.Context, runUID string, node flow.PlanNode
 	}
 	callContext, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
+	kind := "task"
+	if pluginName == "agent-command" {
+		kind = "agent"
+	}
+	call := m.registerActiveCall(callContext, process, callMeta, kind, cancel)
+	defer m.releaseActiveCall(callMeta.GetRequestId(), call)
 	if pluginName == "agent-command" {
 		output, executeErr := m.executeAgent(callContext, process, callMeta, node, input, nodes)
 		if executeErr != nil && process.Exited() {
@@ -423,8 +439,6 @@ func (m *Manager) executeTask(ctx context.Context, process *pluginhost.Process, 
 	if err != nil {
 		return nil, err
 	}
-	stopCancel := m.cancelTaskOnContext(ctx, process, meta)
-	defer stopCancel()
 	return m.consume(ctx, runArtifact{runUID: meta.GetRunUid(), nodeID: meta.GetNodeId(), attempt: meta.GetAttempt(), redactions: secretValues(secrets)}, stream)
 }
 
@@ -519,8 +533,6 @@ func (m *Manager) executeAgent(ctx context.Context, process *pluginhost.Process,
 	if err != nil {
 		return nil, err
 	}
-	stopCancel := m.cancelAgentOnContext(ctx, process, meta)
-	defer stopCancel()
 	return m.consume(ctx, runArtifact{runUID: meta.GetRunUid(), nodeID: meta.GetNodeId(), attempt: meta.GetAttempt(), redactions: secretValues(secrets)}, stream)
 }
 
@@ -547,22 +559,31 @@ type runArtifact struct {
 func (m *Manager) consume(ctx context.Context, artifact runArtifact, stream eventReceiver) (json.RawMessage, error) {
 	var expected uint64 = 1
 	var output json.RawMessage
-	completed := false
+	terminal := ""
 	for {
 		event, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
-			if !completed {
+			if terminal == "" {
 				return nil, errors.New("plugin stream ended without a completion event")
+			}
+			if strings.HasSuffix(terminal, ".failed") {
+				return nil, fmt.Errorf("plugin reported %s", terminal)
 			}
 			return output, nil
 		}
 		if err != nil {
+			if terminal != "" {
+				return nil, errors.New("plugin stream did not end immediately after its terminal event")
+			}
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
 			return nil, err
 		}
-		if event.GetSequence() != expected || event.GetType() == "" || event.GetOccurredAt() == nil || !event.GetOccurredAt().IsValid() {
+		if terminal != "" {
+			return nil, errors.New("plugin emitted an event after its terminal event")
+		}
+		if event.GetSequence() != expected || strings.TrimSpace(event.GetType()) == "" || event.GetOccurredAt() == nil || !event.GetOccurredAt().IsValid() {
 			return nil, fmt.Errorf("malformed plugin stream at sequence %d", expected)
 		}
 		expected++
@@ -571,18 +592,13 @@ func (m *Manager) consume(ctx context.Context, artifact runArtifact, stream even
 				return nil, err
 			}
 		}
-		if len(event.GetPayloadJson()) > 0 {
-			payload := redact(event.GetPayloadJson(), artifact.redactions)
-			if !json.Valid(payload) {
-				return nil, fmt.Errorf("plugin event %d contains invalid JSON", event.GetSequence())
-			}
+		payload := redact(event.GetPayloadJson(), artifact.redactions)
+		if !json.Valid(payload) {
+			return nil, fmt.Errorf("plugin event %d contains invalid JSON", event.GetSequence())
+		}
+		if strings.HasSuffix(event.GetType(), ".failed") || strings.HasSuffix(event.GetType(), ".completed") {
+			terminal = event.GetType()
 			output = append(output[:0], payload...)
-		}
-		if strings.HasSuffix(event.GetType(), ".failed") {
-			return nil, fmt.Errorf("plugin reported %s", event.GetType())
-		}
-		if strings.HasSuffix(event.GetType(), ".completed") {
-			completed = true
 		}
 	}
 }
@@ -907,32 +923,73 @@ func (m *Manager) appendArtifact(artifact runArtifact, data []byte) error {
 	return err
 }
 
-func (m *Manager) cancelTaskOnContext(ctx context.Context, process *pluginhost.Process, meta *pluginv1alpha1.CallMeta) func() {
-	stopped := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			cancelContext, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			_, _ = process.Clients().Task.Cancel(cancelContext, &pluginv1alpha1.CancelRequest{Meta: meta, Reason: ctx.Err().Error()})
-			cancel()
-		case <-stopped:
-		}
-	}()
-	return func() { close(stopped) }
+func (m *Manager) registerActiveCall(ctx context.Context, process *pluginhost.Process, meta *pluginv1alpha1.CallMeta, kind string, cancel context.CancelFunc) *activeProviderCall {
+	call := &activeProviderCall{process: process, meta: meta, kind: kind, cancel: cancel}
+	m.mu.Lock()
+	m.active[meta.GetRequestId()] = call
+	m.mu.Unlock()
+	call.stop = context.AfterFunc(ctx, func() { m.cancelProviderCall(call, contextCause(ctx)) })
+	return call
 }
 
-func (m *Manager) cancelAgentOnContext(ctx context.Context, process *pluginhost.Process, meta *pluginv1alpha1.CallMeta) func() {
-	stopped := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			cancelContext, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			_, _ = process.Clients().Agent.Cancel(cancelContext, &pluginv1alpha1.CancelRequest{Meta: meta, Reason: ctx.Err().Error()})
-			cancel()
-		case <-stopped:
+func (m *Manager) releaseActiveCall(requestID string, call *activeProviderCall) {
+	if call.stop != nil {
+		call.stop()
+	}
+	m.mu.Lock()
+	if m.active[requestID] == call {
+		delete(m.active, requestID)
+	}
+	m.mu.Unlock()
+}
+
+func contextCause(ctx context.Context) string {
+	if err := context.Cause(ctx); err != nil {
+		return err.Error()
+	}
+	return "cancelled"
+}
+
+func (m *Manager) cancelProviderCall(call *activeProviderCall, reason string) {
+	call.once.Do(func() {
+		cancelContext, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		request := &pluginv1alpha1.CancelRequest{Meta: call.meta, Reason: reason}
+		if call.kind == "agent" {
+			_, _ = call.process.Clients().Agent.Cancel(cancelContext, request)
+		} else {
+			_, _ = call.process.Clients().Task.Cancel(cancelContext, request)
 		}
-	}()
-	return func() { close(stopped) }
+		cancel()
+		call.cancel()
+	})
+}
+
+// CancelRun propagates durable Run cancellation to every active task or agent call.
+func (m *Manager) CancelRun(ctx context.Context, runUID, reason string) error {
+	m.mu.Lock()
+	calls := make([]*activeProviderCall, 0)
+	for _, call := range m.active {
+		if call.meta.GetRunUid() == runUID {
+			calls = append(calls, call)
+		}
+	}
+	m.mu.Unlock()
+	var wg sync.WaitGroup
+	for _, call := range calls {
+		wg.Add(1)
+		go func(call *activeProviderCall) {
+			defer wg.Done()
+			m.cancelProviderCall(call, reason)
+		}(call)
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (m *Manager) evict(key string) {
@@ -955,23 +1012,33 @@ func sameCapabilities(actual, expected []string) bool {
 
 func drainDoctor(stream eventReceiver) error {
 	var expected uint64 = 1
+	terminal := ""
 	for {
 		event, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
-			return errors.New("doctor stream ended without completion")
+			if terminal == "" {
+				return errors.New("doctor stream ended without completion")
+			}
+			if strings.HasSuffix(terminal, ".failed") {
+				return errors.New("doctor command failed")
+			}
+			return nil
 		}
 		if err != nil {
+			if terminal != "" {
+				return errors.New("doctor stream did not end immediately after completion")
+			}
 			return err
 		}
-		if event.GetSequence() != expected {
+		if terminal != "" {
+			return errors.New("doctor stream emitted an event after completion")
+		}
+		if event.GetSequence() != expected || strings.TrimSpace(event.GetType()) == "" || event.GetOccurredAt() == nil || !event.GetOccurredAt().IsValid() || !json.Valid(event.GetPayloadJson()) {
 			return errors.New("doctor stream sequence is malformed")
 		}
 		expected++
-		if strings.HasSuffix(event.GetType(), ".failed") {
-			return errors.New("doctor command failed")
-		}
-		if strings.HasSuffix(event.GetType(), ".completed") {
-			return nil
+		if strings.HasSuffix(event.GetType(), ".failed") || strings.HasSuffix(event.GetType(), ".completed") {
+			terminal = event.GetType()
 		}
 	}
 }

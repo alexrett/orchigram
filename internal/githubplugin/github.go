@@ -14,13 +14,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	pluginv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/plugin/v1alpha1"
 	"github.com/alexrett/orchigram/internal/firstparty"
 	"github.com/alexrett/orchigram/internal/process"
 	"github.com/alexrett/orchigram/internal/workspace"
+	pluginsdk "github.com/alexrett/orchigram/sdk/plugin"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -39,7 +39,6 @@ var Capabilities = func() []string {
 
 // Runtime serves both task actions and issue-label subscriptions.
 type Runtime struct {
-	pluginv1alpha1.UnimplementedTaskProviderServer
 	pluginv1alpha1.UnimplementedTriggerProviderServer
 	Client *http.Client
 	Runner *process.Runner
@@ -104,6 +103,7 @@ type issueEvent struct {
 	ID        int64     `json:"id"`
 	Event     string    `json:"event"`
 	IssueURL  string    `json:"issue_url"`
+	Issue     *issue    `json:"issue"`
 	CreatedAt time.Time `json:"created_at"`
 	Label     struct {
 		Name string `json:"name"`
@@ -111,18 +111,18 @@ type issueEvent struct {
 }
 
 // ValidateAction validates action-specific JSON without network access.
-func (*Runtime) ValidateAction(_ context.Context, request *pluginv1alpha1.ValidateActionRequest) (*pluginv1alpha1.ValidateActionResponse, error) {
+func (*Runtime) ValidateAction(_ context.Context, action string, configJSON json.RawMessage) []pluginsdk.ValidationIssue {
 	var err error
-	switch request.GetAction() {
+	switch action {
 	case "github.issue.get":
 		var config issueConfig
-		err = decodeStrict(request.GetConfigJson(), &config)
+		err = decodeStrict(configJSON, &config)
 		if err == nil {
 			err = validateIssue(config)
 		}
 	case "github.issue.comment":
 		var config commentConfig
-		err = decodeStrict(request.GetConfigJson(), &config)
+		err = decodeStrict(configJSON, &config)
 		if err == nil {
 			err = validateIssue(config.issueConfig)
 		}
@@ -131,19 +131,19 @@ func (*Runtime) ValidateAction(_ context.Context, request *pluginv1alpha1.Valida
 		}
 	case "github.workspace.checkout":
 		var config checkoutConfig
-		err = decodeStrict(request.GetConfigJson(), &config)
+		err = decodeStrict(configJSON, &config)
 		if err == nil && (config.CloneURL == "" || config.IssueNumber <= 0 || config.WorkspaceRoot == "") {
 			err = errors.New("cloneURL, issueNumber, and workspaceRoot are required")
 		}
 	case "github.workspace.commit-push":
 		var config commitConfig
-		err = decodeStrict(request.GetConfigJson(), &config)
+		err = decodeStrict(configJSON, &config)
 		if err == nil && (config.Workspace == "" || config.WorkspaceRoot == "" || config.Branch == "" || config.Message == "") {
 			err = errors.New("workspace, workspaceRoot, branch, and message are required")
 		}
 	case "github.pr.ensure":
 		var config pullRequestConfig
-		err = decodeStrict(request.GetConfigJson(), &config)
+		err = decodeStrict(configJSON, &config)
 		if err == nil {
 			err = validateRepository(config.repositoryConfig)
 		}
@@ -151,54 +151,36 @@ func (*Runtime) ValidateAction(_ context.Context, request *pluginv1alpha1.Valida
 			err = errors.New("head, base, and title are required")
 		}
 	default:
-		err = fmt.Errorf("unsupported action %q", request.GetAction())
+		err = fmt.Errorf("unsupported action %q", action)
 	}
-	response := &pluginv1alpha1.ValidateActionResponse{}
 	if err != nil {
-		response.Issues = append(response.Issues, &pluginv1alpha1.ValidationIssue{Path: "config", Code: "invalid", Message: err.Error()})
+		return []pluginsdk.ValidationIssue{{Path: "config", Code: "invalid", Message: err.Error()}}
 	}
-	return response, nil
+	return nil
 }
 
 // Execute invokes one reconciled GitHub or workspace action.
-func (r *Runtime) Execute(request *pluginv1alpha1.ExecuteRequest, stream pluginv1alpha1.TaskProvider_ExecuteServer) error {
-	if err := validateMeta(request.GetMeta()); err != nil {
-		return err
-	}
-	writer := &eventWriter{stream: stream}
-	if err := writer.send("github.started", map[string]any{"action": request.GetAction()}, nil); err != nil {
-		return err
+func (r *Runtime) Execute(ctx context.Context, request pluginsdk.TaskRequest, sink pluginsdk.EventSink) (any, error) {
+	if err := sink.Emit("github.started", map[string]any{"action": request.Action}); err != nil {
+		return nil, err
 	}
 	var output any
 	var err error
-	switch request.GetAction() {
+	switch request.Action {
 	case "github.issue.get":
-		output, err = r.issueGet(stream.Context(), request)
+		output, err = r.issueGet(ctx, request)
 	case "github.issue.comment":
-		output, err = r.issueComment(stream.Context(), request)
+		output, err = r.issueComment(ctx, request)
 	case "github.workspace.checkout":
-		output, err = r.checkout(stream.Context(), request, writer)
+		output, err = r.checkout(ctx, request, sink)
 	case "github.workspace.commit-push":
-		output, err = r.commitPush(stream.Context(), request, writer)
+		output, err = r.commitPush(ctx, request, sink)
 	case "github.pr.ensure":
-		output, err = r.ensurePullRequest(stream.Context(), request)
+		output, err = r.ensurePullRequest(ctx, request)
 	default:
-		err = status.Errorf(codes.InvalidArgument, "unsupported action %q", request.GetAction())
+		err = fmt.Errorf("unsupported action %q", request.Action)
 	}
-	if err != nil {
-		_ = writer.send("github.failed", map[string]any{"action": request.GetAction(), "error": err.Error()}, nil)
-		return err
-	}
-	return writer.send("github.completed", output, nil)
-}
-
-// Cancel terminates an active git process; HTTP calls observe stream context cancellation.
-func (r *Runtime) Cancel(_ context.Context, request *pluginv1alpha1.CancelRequest) (*pluginv1alpha1.CancelResponse, error) {
-	if r.Runner == nil {
-		return &pluginv1alpha1.CancelResponse{Outcome: "context-cancel"}, nil
-	}
-	outcome, accepted := r.Runner.Cancel(request.GetMeta().GetRequestId())
-	return &pluginv1alpha1.CancelResponse{Accepted: accepted, Outcome: outcome}, nil
+	return output, err
 }
 
 // Watch polls stable repository issue events and waits for each durable daemon ack.
@@ -293,8 +275,15 @@ func (r *Runtime) listReadyEvents(ctx context.Context, config watchConfig, token
 				continue
 			}
 			var item issue
-			if _, err := r.getJSON(ctx, event.IssueURL, token, &item); err != nil {
-				return nil, err
+			switch {
+			case event.Issue != nil && event.Issue.Number > 0:
+				item = *event.Issue
+			case strings.TrimSpace(event.IssueURL) != "":
+				if _, err := r.getJSON(ctx, event.IssueURL, token, &item); err != nil {
+					return nil, err
+				}
+			default:
+				return nil, status.Errorf(codes.FailedPrecondition, "GitHub issue event %d has neither an embedded issue nor issue_url", event.ID)
 			}
 			result = append(result, readyEvent{ID: event.ID, CreatedAt: event.CreatedAt, Issue: item})
 		}
@@ -303,15 +292,15 @@ func (r *Runtime) listReadyEvents(ctx context.Context, config watchConfig, token
 	return result, nil
 }
 
-func (r *Runtime) issueGet(ctx context.Context, request *pluginv1alpha1.ExecuteRequest) (any, error) {
+func (r *Runtime) issueGet(ctx context.Context, request pluginsdk.TaskRequest) (any, error) {
 	var config issueConfig
-	if err := decodeStrict(request.GetConfigJson(), &config); err != nil {
+	if err := decodeStrict(request.Config, &config); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	if err := validateIssue(config); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	token, err := secret(request.GetSecrets(), config.TokenSecret)
+	token, err := secret(request.Secrets, config.TokenSecret)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -323,19 +312,19 @@ func (r *Runtime) issueGet(ctx context.Context, request *pluginv1alpha1.ExecuteR
 	return map[string]any{"issue": item}, nil
 }
 
-func (r *Runtime) issueComment(ctx context.Context, request *pluginv1alpha1.ExecuteRequest) (any, error) {
+func (r *Runtime) issueComment(ctx context.Context, request pluginsdk.TaskRequest) (any, error) {
 	var config commentConfig
-	if err := decodeStrict(request.GetConfigJson(), &config); err != nil {
+	if err := decodeStrict(request.Config, &config); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	if err := validateIssue(config.issueConfig); err != nil || strings.TrimSpace(config.Body) == "" {
 		return nil, status.Error(codes.InvalidArgument, "valid repository, issue number, and body are required")
 	}
-	token, err := secret(request.GetSecrets(), config.TokenSecret)
+	token, err := secret(request.Secrets, config.TokenSecret)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	marker := hiddenMarker(request.GetMeta())
+	marker := hiddenMarker(request)
 	endpoint := fmt.Sprintf("%s/repos/%s/%s/issues/%d/comments", apiBase(config.APIBase), url.PathEscape(config.Owner), url.PathEscape(config.Repository), config.Number)
 	type commentRecord struct {
 		ID      int64  `json:"id"`
@@ -369,12 +358,12 @@ func (r *Runtime) issueComment(ctx context.Context, request *pluginv1alpha1.Exec
 	return map[string]any{"id": created.ID, "url": created.HTMLURL, "reconciled": false, "marker": marker}, nil
 }
 
-func (r *Runtime) checkout(ctx context.Context, request *pluginv1alpha1.ExecuteRequest, writer *eventWriter) (any, error) {
+func (r *Runtime) checkout(ctx context.Context, request pluginsdk.TaskRequest, sink pluginsdk.EventSink) (any, error) {
 	var config checkoutConfig
-	if err := decodeStrict(request.GetConfigJson(), &config); err != nil {
+	if err := decodeStrict(request.Config, &config); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	token, err := optionalSecret(request.GetSecrets(), config.TokenSecret)
+	token, err := optionalSecret(request.Secrets, config.TokenSecret)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -382,18 +371,18 @@ func (r *Runtime) checkout(ctx context.Context, request *pluginv1alpha1.ExecuteR
 		r.Runner = process.NewRunner()
 	}
 	manager := workspace.Manager{Root: config.WorkspaceRoot, Runner: r.Runner}
-	result, err := manager.Checkout(ctx, workspace.CheckoutRequest{RequestID: request.GetMeta().GetRequestId(), RunUID: request.GetMeta().GetRunUid(), CloneURL: config.CloneURL, DefaultBranch: config.DefaultBranch, IssueNumber: config.IssueNumber, Token: token}, func(output process.Output) error {
-		return writer.send("github.git", map[string]string{"stream": output.Stream}, output.Data)
+	result, err := manager.Checkout(ctx, workspace.CheckoutRequest{RequestID: request.RequestID, RunUID: request.RunUID, CloneURL: config.CloneURL, DefaultBranch: config.DefaultBranch, IssueNumber: config.IssueNumber, Token: token}, func(output process.Output) error {
+		return sink.Log("github.git."+output.Stream, output.Data)
 	})
 	return result, err
 }
 
-func (r *Runtime) commitPush(ctx context.Context, request *pluginv1alpha1.ExecuteRequest, writer *eventWriter) (any, error) {
+func (r *Runtime) commitPush(ctx context.Context, request pluginsdk.TaskRequest, sink pluginsdk.EventSink) (any, error) {
 	var config commitConfig
-	if err := decodeStrict(request.GetConfigJson(), &config); err != nil {
+	if err := decodeStrict(request.Config, &config); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	token, err := optionalSecret(request.GetSecrets(), config.TokenSecret)
+	token, err := optionalSecret(request.Secrets, config.TokenSecret)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -401,25 +390,25 @@ func (r *Runtime) commitPush(ctx context.Context, request *pluginv1alpha1.Execut
 		r.Runner = process.NewRunner()
 	}
 	manager := workspace.Manager{Root: config.WorkspaceRoot, Runner: r.Runner}
-	result, err := manager.CommitPush(ctx, workspace.CommitRequest{RequestID: request.GetMeta().GetRequestId(), Path: config.Workspace, Branch: config.Branch, Message: config.Message, Token: token}, func(output process.Output) error {
-		return writer.send("github.git", map[string]string{"stream": output.Stream}, output.Data)
+	result, err := manager.CommitPush(ctx, workspace.CommitRequest{RequestID: request.RequestID, Path: config.Workspace, Branch: config.Branch, Message: config.Message, Token: token}, func(output process.Output) error {
+		return sink.Log("github.git."+output.Stream, output.Data)
 	})
 	return result, err
 }
 
-func (r *Runtime) ensurePullRequest(ctx context.Context, request *pluginv1alpha1.ExecuteRequest) (any, error) {
+func (r *Runtime) ensurePullRequest(ctx context.Context, request pluginsdk.TaskRequest) (any, error) {
 	var config pullRequestConfig
-	if err := decodeStrict(request.GetConfigJson(), &config); err != nil {
+	if err := decodeStrict(request.Config, &config); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	if err := validateRepository(config.repositoryConfig); err != nil || config.Head == "" || config.Base == "" || config.Title == "" {
 		return nil, status.Error(codes.InvalidArgument, "valid repository, head, base, and title are required")
 	}
-	token, err := secret(request.GetSecrets(), config.TokenSecret)
+	token, err := secret(request.Secrets, config.TokenSecret)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	marker := hiddenMarker(request.GetMeta())
+	marker := hiddenMarker(request)
 	query := url.Values{"state": {"all"}, "head": {config.Owner + ":" + config.Head}, "per_page": {"100"}}
 	endpoint := fmt.Sprintf("%s/repos/%s/%s/pulls", apiBase(config.APIBase), url.PathEscape(config.Owner), url.PathEscape(config.Repository))
 	type pullRecord struct {
@@ -644,15 +633,8 @@ func optionalSecret(values map[string][]byte, name string) ([]byte, error) {
 	return secret(values, name)
 }
 
-func hiddenMarker(meta *pluginv1alpha1.CallMeta) string {
-	return fmt.Sprintf("<!-- orchigram:run=%s;node=%s -->", meta.GetRunUid(), meta.GetNodeId())
-}
-
-func validateMeta(meta *pluginv1alpha1.CallMeta) error {
-	if meta == nil || meta.GetRequestId() == "" || meta.GetRunUid() == "" || meta.GetNodeId() == "" || meta.GetIdempotencyKey() == "" {
-		return status.Error(codes.InvalidArgument, "complete call metadata is required")
-	}
-	return nil
+func hiddenMarker(request pluginsdk.TaskRequest) string {
+	return fmt.Sprintf("<!-- orchigram:run=%s;node=%s -->", request.RunUID, request.NodeID)
 }
 
 func decodeStrict(data []byte, target any) error {
@@ -662,25 +644,4 @@ func decodeStrict(data []byte, target any) error {
 		return fmt.Errorf("decode configuration: %w", err)
 	}
 	return nil
-}
-
-type executeStream interface {
-	Send(*pluginv1alpha1.ExecuteEvent) error
-}
-
-type eventWriter struct {
-	mu       sync.Mutex
-	sequence uint64
-	stream   executeStream
-}
-
-func (w *eventWriter) send(eventType string, payload any, raw []byte) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.sequence++
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	return w.stream.Send(&pluginv1alpha1.ExecuteEvent{Sequence: w.sequence, Type: eventType, PayloadJson: data, RawLog: append([]byte(nil), raw...), OccurredAt: timestamppb.Now()})
 }

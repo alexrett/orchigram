@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alexrett/orchigram/internal/flow"
 	"github.com/alexrett/orchigram/internal/resource"
 )
 
@@ -19,6 +20,41 @@ func openTestStore(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	return s
+}
+
+func TestTerminalRunTransitionsAreImmutable(t *testing.T) {
+	t.Parallel()
+	for _, terminal := range []string{"succeeded", "failed", "rejected", "cancelled"} {
+		t.Run(terminal, func(t *testing.T) {
+			ctx := context.Background()
+			s := openTestStore(t)
+			plan := flow.ExecutionPlan{FlowUID: "flow-" + terminal, FlowGeneration: 1, PlanHash: "plan-" + terminal, InterpreterVersion: flow.InterpreterVersion}
+			runUID := "run-" + terminal
+			if _, err := s.EnsureRun(ctx, StartPayload{RunUID: runUID, Input: json.RawMessage(`{}`)}, plan); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.AppendRunEvent(ctx, runUID, "", "run."+terminal, terminal, 0, nil); err != nil {
+				t.Fatal(err)
+			}
+			before, err := s.RunEventsAfter(ctx, runUID, 0, 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, late := range []struct{ event, phase string }{{"node.completed", "running"}, {"run.failed", "failed"}, {"approval.waiting", "waiting"}, {"run.succeeded", "succeeded"}} {
+				if err := s.AppendRunEvent(ctx, runUID, "node", late.event, late.phase, 1, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			run, err := s.GetRun(ctx, runUID)
+			if err != nil || run.Phase != terminal {
+				t.Fatalf("run=%+v err=%v", run, err)
+			}
+			after, err := s.RunEventsAfter(ctx, runUID, 0, 100)
+			if err != nil || len(after) != len(before) {
+				t.Fatalf("late events were appended: before=%d after=%d err=%v", len(before), len(after), err)
+			}
+		})
+	}
 }
 
 func testFlowDocument(t *testing.T) resource.Document {

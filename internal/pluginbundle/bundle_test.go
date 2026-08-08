@@ -30,6 +30,20 @@ func TestBuildParseAndImmutableInstall(t *testing.T) {
 	if string(first) != string(second) {
 		t.Fatal("bundle build is not deterministic")
 	}
+	shuffled := manifest
+	shuffled.Capabilities = []string{"task.zeta", "task.conformance"}
+	manifest.Capabilities = []string{"task.conformance", "task.zeta"}
+	first, err = Build(manifest, map[string][]byte{"bin/plugin": binary})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err = Build(shuffled, map[string][]byte{"bin/plugin": binary})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatal("manifest capability ordering changed bundle bytes")
+	}
 	parsed, payload, bundleDigest, err := Parse(first)
 	if err != nil {
 		t.Fatal(err)
