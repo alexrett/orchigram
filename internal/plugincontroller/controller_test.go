@@ -134,6 +134,22 @@ func TestDesiredStateRequestIDDistinguishesResourceRevisionAndAction(t *testing.
 	}
 }
 
+func TestNilRuntimeFailsReconciliationWithoutPanicking(t *testing.T) {
+	t.Parallel()
+	controller := New(openControllerStore(t), nil)
+	if err := controller.Reconcile(context.Background()); err == nil || !strings.Contains(err.Error(), "plugin runtime is unavailable") {
+		t.Fatalf("reconcile error=%v", err)
+	}
+	diagnostics := controller.HealthDiagnostics()
+	found := false
+	for _, diagnostic := range diagnostics {
+		found = found || diagnostic.Code == "reconcile_failed"
+	}
+	if !found {
+		t.Fatalf("health diagnostics=%+v", diagnostics)
+	}
+}
+
 func TestConflictingEnabledVersionsDoNotSwitchActivation(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

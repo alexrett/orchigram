@@ -38,6 +38,24 @@ type Runtime interface {
 	HealthDiagnostics(context.Context) []health.Diagnostic
 }
 
+type unavailableRuntime struct{}
+
+func (unavailableRuntime) List(context.Context) ([]store.PluginRecord, error) {
+	return nil, errors.New("plugin runtime is unavailable")
+}
+
+func (unavailableRuntime) Enable(context.Context, string, string) error {
+	return errors.New("plugin runtime is unavailable")
+}
+
+func (unavailableRuntime) Disable(context.Context, string) error {
+	return errors.New("plugin runtime is unavailable")
+}
+
+func (unavailableRuntime) HealthDiagnostics(context.Context) []health.Diagnostic {
+	return []health.Diagnostic{{Path: "plugins", Code: "runtime_unavailable", Message: "plugin runtime is unavailable"}}
+}
+
 // Controller makes PluginInstallation desired state authoritative.
 type Controller struct {
 	store     ResourceStore
@@ -50,6 +68,9 @@ type Controller struct {
 
 // New constructs a controller. Start performs the first reconciliation.
 func New(state ResourceStore, runtime Runtime) *Controller {
+	if runtime == nil {
+		runtime = unavailableRuntime{}
+	}
 	tracker := health.NewTracker()
 	tracker.Set("starting", health.Diagnostic{Path: "controllers/plugins", Code: "starting", Message: "plugin installation reconciliation has not completed"})
 	return &Controller{store: state, runtime: runtime, interval: time.Second, health: tracker, issueKeys: map[string]struct{}{}}
@@ -76,8 +97,8 @@ func (c *Controller) Start(ctx context.Context) {
 func (c *Controller) HealthDiagnostics() []health.Diagnostic { return c.health.Snapshot() }
 
 func (c *Controller) observe(err error) {
+	c.health.Clear("starting")
 	if err == nil {
-		c.health.Clear("starting")
 		c.health.Clear("reconcile")
 		return
 	}

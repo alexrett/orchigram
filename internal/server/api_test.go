@@ -14,6 +14,7 @@ import (
 	"github.com/alexrett/orchigram/internal/engine"
 	"github.com/alexrett/orchigram/internal/flow"
 	"github.com/alexrett/orchigram/internal/plugincontroller"
+	"github.com/alexrett/orchigram/internal/pluginmanager"
 	"github.com/alexrett/orchigram/internal/resource"
 	"github.com/alexrett/orchigram/internal/store"
 	"google.golang.org/grpc/metadata"
@@ -34,7 +35,9 @@ func TestInfoAdvertisesDeclarativePluginsOnlyWithController(t *testing.T) {
 	if slices.Contains(info.GetCapabilities(), "plugins.declarative.v1") {
 		t.Fatalf("capabilities without controller=%v", info.GetCapabilities())
 	}
-	with := NewAPI(state, flow.NewCompiler(nil), nil, missingWorkflowEngine{}, nil, nil, t.TempDir(), plugincontroller.New(state, nil))
+	manager := pluginmanager.New(state, t.TempDir())
+	defer manager.Close()
+	with := NewAPI(state, flow.NewCompiler(nil), nil, missingWorkflowEngine{}, manager, nil, t.TempDir(), plugincontroller.New(state, manager))
 	info, err = with.Info(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
