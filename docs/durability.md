@@ -78,11 +78,25 @@ incompatible code.
 
 The compiler collapses strongly connected components and rejects every cycle
 without a finite `loop.maxIterations` policy. The durable interpreter executes
-the resulting component DAG deterministically. Each loop iteration receives a
-different stable activity identity, while activated edges leaving the component
-are accumulated across iterations. Editing or deleting the source Flow never
-changes a compiled plan after trigger acceptance, including before the local
-Run projection and durable workflow instance have been created.
+the resulting component DAG with a deterministic, bounded scheduler. A Flow's
+`spec.policies.maxParallel` is the maximum number of active DAG components and
+defaults to one. Ready components are admitted in compiled topological order;
+an SCC occupies one slot and executes its nodes serially. A join is not ready
+until every predecessor component is terminal, including predecessors whose
+conditions caused them to be recorded as skipped. Each loop iteration receives
+a different stable activity identity, while activated edges leaving the
+component are accumulated across iterations.
+
+The first component failure or approval rejection stops new admission. The
+interpreter durably requests cancellation of already-running provider calls,
+drains the admitted components, and only then records the terminal Run event.
+Activity retries stay within the component's existing slot and retain their
+logical idempotency key while allocating new physical attempts. If the daemon
+is killed with parallel calls in flight, expired deliveries are marked
+`delivery-lost` and the durable workflow resumes the same compiled schedule
+without duplicating terminal Run transitions. Editing or deleting the source
+Flow never changes a compiled plan after trigger acceptance, including before
+the local Run projection and durable workflow instance have been created.
 
 Online backups contain consistent snapshots of the resource/event database,
 the workflow engine database, and immutable plugin installations. Restore is an
