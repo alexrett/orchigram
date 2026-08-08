@@ -6,6 +6,13 @@ SQLite transaction. Reconciliation may repeat dispatch, but the receipt's
 occurrence identity maps to exactly one local Run UID and dispatch loads the
 accepted plan by hash instead of recompiling the current Flow.
 
+That transaction also validates the current Trigger generation and enabled
+state, the Trigger-to-Flow reference, and the compiled Flow UID/generation.
+An update or delete racing acceptance either orders after the accepted snapshot
+or rejects the stale occurrence without persisting a receipt, provider cursor,
+plan, or outbox row. Duplicate provider delivery keeps its existing receipt and
+advances its cursor only while the current Trigger generation remains valid.
+
 Each non-core plan node pins the installed plugin name, version, bundle digest,
 negotiated protocol, canonical action schemas, and installed contract digest.
 It also snapshots the UID, generation, resource

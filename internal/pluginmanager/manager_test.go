@@ -202,6 +202,21 @@ kind: SecretRef
 metadata: {name: github-provider-token}
 spec: {backend: env, key: ORCHIGRAM_TEST_GITHUB_PROVIDER_TOKEN}
 `)
+	providerConfig := map[string]any{
+		"owner": "acme", "repository": "widget", "tokenSecret": "token",
+		"secretRefs": map[string]any{"token": "github-provider-token"},
+	}
+	if diagnostics := manager.ValidateTriggerProvider(context.Background(), resource.DefaultNamespace, "github", providerConfig); len(diagnostics) != 0 {
+		t.Fatalf("valid provider diagnostics=%+v", diagnostics)
+	}
+	invalidProviderConfig := map[string]any{"repository": "widget", "tokenSecret": "token", "secretRefs": map[string]any{"token": "github-provider-token"}}
+	if diagnostics := manager.ValidateTriggerProvider(context.Background(), resource.DefaultNamespace, "github", invalidProviderConfig); len(diagnostics) != 1 || diagnostics[0].Code != "required" {
+		t.Fatalf("invalid provider diagnostics=%+v", diagnostics)
+	}
+	missingSecretConfig := map[string]any{"owner": "acme", "repository": "widget", "tokenSecret": "token", "secretRefs": map[string]any{"token": "missing-token"}}
+	if diagnostics := manager.ValidateTriggerProvider(context.Background(), resource.DefaultNamespace, "github", missingSecretConfig); len(diagnostics) != 1 || diagnostics[0].Code != "reference_not_found" {
+		t.Fatalf("missing provider SecretRef diagnostics=%+v", diagnostics)
+	}
 	var providerServer *httptest.Server
 	var providerMu sync.Mutex
 	providerComments := []map[string]any{}
@@ -239,7 +254,7 @@ spec: {backend: env, key: ORCHIGRAM_TEST_GITHUB_PROVIDER_TOKEN}
 	providerDone := make(chan error, 1)
 	providerActivation := time.Date(2026, 8, 8, 10, 0, 30, 0, time.UTC)
 	go func() {
-		providerDone <- manager.WatchTrigger(providerContext, "github", "trigger-fixture", map[string]any{
+		providerDone <- manager.WatchTrigger(providerContext, "github", "trigger-fixture", resource.DefaultNamespace, map[string]any{
 			"owner": "acme", "repository": "widget", "apiBase": providerServer.URL, "label": "orchigram:ready", "pollInterval": "1h", "tokenSecret": "token",
 			"secretRefs": map[string]any{"token": "github-provider-token"},
 		}, "", providerActivation, func(event *pluginv1alpha1.TriggerEvent) error {

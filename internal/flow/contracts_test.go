@@ -10,7 +10,7 @@ import (
 type contractBinder map[string]ActionContract
 
 func (b contractBinder) HasAction(action string) bool { _, exists := b[action]; return exists }
-func (b contractBinder) BindAction(action string, config map[string]any) (ActionBinding, []Diagnostic) {
+func (b contractBinder) BindAction(_, action string, config map[string]any) (ActionBinding, []Diagnostic) {
 	contract, exists := b[action]
 	if !exists {
 		return ActionBinding{}, []Diagnostic{{Path: "config", Code: "unknown", Message: "unknown action"}}

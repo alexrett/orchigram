@@ -85,7 +85,7 @@ func (testCapabilities) ValidateAction(_ string, _ map[string]any) []Diagnostic 
 
 type rootDiagnosticBinder struct{ testCapabilities }
 
-func (rootDiagnosticBinder) BindAction(_ string, _ map[string]any) (ActionBinding, []Diagnostic) {
+func (rootDiagnosticBinder) BindAction(_, _ string, _ map[string]any) (ActionBinding, []Diagnostic) {
 	return ActionBinding{}, []Diagnostic{{Path: "config", Code: "invalid", Message: "configuration is invalid"}}
 }
 

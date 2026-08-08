@@ -159,7 +159,7 @@ type recoveringProvider struct {
 	secondCall chan struct{}
 }
 
-func (p *recoveringProvider) WatchTrigger(ctx context.Context, _, _ string, _ map[string]any, _ string, _ time.Time, _ func(*pluginv1alpha1.TriggerEvent) error) error {
+func (p *recoveringProvider) WatchTrigger(ctx context.Context, _, _, _ string, _ map[string]any, _ string, _ time.Time, _ func(*pluginv1alpha1.TriggerEvent) error) error {
 	p.mu.Lock()
 	p.calls++
 	call := p.calls
@@ -212,7 +212,7 @@ spec:
 	}
 }
 
-func (f *fakeProvider) WatchTrigger(ctx context.Context, _, _ string, _ map[string]any, cursor string, activatedAt time.Time, accept func(*pluginv1alpha1.TriggerEvent) error) error {
+func (f *fakeProvider) WatchTrigger(ctx context.Context, _, _, _ string, _ map[string]any, cursor string, activatedAt time.Time, accept func(*pluginv1alpha1.TriggerEvent) error) error {
 	if cursor != "" {
 		return ctx.Err()
 	}

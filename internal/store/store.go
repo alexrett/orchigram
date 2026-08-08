@@ -36,6 +36,27 @@ type StaleTriggerGenerationError struct {
 	Current  uint64
 }
 
+// StaleFlowPlanError rejects a receipt when the Flow changed after compilation
+// but before the receipt/plan/outbox transaction acquired its snapshot.
+type StaleFlowPlanError struct {
+	ExpectedUID        string
+	ExpectedGeneration uint64
+	CurrentUID         string
+	CurrentGeneration  uint64
+}
+
+func (e *StaleFlowPlanError) Error() string {
+	return fmt.Sprintf("compiled Flow is stale: expected uid=%s generation=%d, current uid=%s generation=%d", e.ExpectedUID, e.ExpectedGeneration, e.CurrentUID, e.CurrentGeneration)
+}
+
+// TriggerReferenceChangedError rejects a stale controller occurrence whose
+// current Trigger no longer targets the Flow that was compiled.
+type TriggerReferenceChangedError struct{}
+
+func (*TriggerReferenceChangedError) Error() string {
+	return "Trigger Flow reference changed before acceptance"
+}
+
 func (e *StaleTriggerGenerationError) Error() string {
 	return fmt.Sprintf("stale Trigger generation: watch=%d current=%d", e.Expected, e.Current)
 }
@@ -486,16 +507,16 @@ type Receipt struct {
 }
 
 // AcceptTrigger persists a receipt and outbox command in one transaction.
-func (s *Store) AcceptTrigger(ctx context.Context, triggerUID, occurrenceID, flowName, namespace string, input json.RawMessage, deduplicated bool) (Receipt, error) {
-	return s.acceptTrigger(ctx, triggerUID, 0, occurrenceID, flowName, namespace, input, deduplicated, "", "", nil, nil)
+func (s *Store) AcceptTrigger(ctx context.Context, triggerUID string, triggerGeneration uint64, occurrenceID, flowName, namespace string, input json.RawMessage, deduplicated bool) (Receipt, error) {
+	return s.acceptTrigger(ctx, triggerUID, triggerGeneration, occurrenceID, flowName, namespace, input, deduplicated, "", "", nil, nil)
 }
 
 // AcceptTriggerWithPlan persists an immutable compiled plan in the same
 // transaction as the trigger receipt and start command. Runtime acceptors must
 // use this method; AcceptTrigger remains for store-level compatibility tests
 // and pre-v0.1 databases whose commands do not yet carry a plan hash.
-func (s *Store) AcceptTriggerWithPlan(ctx context.Context, triggerUID, occurrenceID, flowName, namespace string, input json.RawMessage, deduplicated bool, plan flow.ExecutionPlan) (Receipt, error) {
-	return s.acceptTrigger(ctx, triggerUID, 0, occurrenceID, flowName, namespace, input, deduplicated, "", "", nil, &plan)
+func (s *Store) AcceptTriggerWithPlan(ctx context.Context, triggerUID string, triggerGeneration uint64, occurrenceID, flowName, namespace string, input json.RawMessage, deduplicated bool, plan flow.ExecutionPlan) (Receipt, error) {
+	return s.acceptTrigger(ctx, triggerUID, triggerGeneration, occurrenceID, flowName, namespace, input, deduplicated, "", "", nil, &plan)
 }
 
 // AcceptProviderTrigger persists receipt, outbox, and provider cursor atomically.
@@ -525,27 +546,11 @@ func (s *Store) acceptTrigger(ctx context.Context, triggerUID string, triggerGen
 		return Receipt{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if providerCursor != "" {
-		var resourceGeneration, stateGeneration uint64
-		var enabled int
-		if err := tx.QueryRowContext(ctx, `SELECT resources.generation,trigger_states.generation,trigger_states.enabled
-			FROM resources JOIN trigger_states ON trigger_states.trigger_uid=resources.uid
-			WHERE resources.kind='Trigger' AND resources.uid=?`, triggerUID).Scan(&resourceGeneration, &stateGeneration, &enabled); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return Receipt{}, ErrNotFound
-			}
+	if triggerGeneration != 0 {
+		if err := validateTriggerAcceptanceTx(ctx, tx, triggerUID, triggerGeneration, flowName, namespace); err != nil {
 			return Receipt{}, err
 		}
-		if resourceGeneration != triggerGeneration {
-			return Receipt{}, &StaleTriggerGenerationError{Expected: triggerGeneration, Current: resourceGeneration}
-		}
-		if stateGeneration != triggerGeneration {
-			return Receipt{}, &StaleTriggerGenerationError{Expected: triggerGeneration, Current: stateGeneration}
-		}
-		if enabled == 0 {
-			return Receipt{}, ErrTriggerDisabled
-		}
-		if afterProviderValidation != nil {
+		if plan == nil && afterProviderValidation != nil {
 			afterProviderValidation()
 		}
 	}
@@ -565,6 +570,12 @@ func (s *Store) acceptTrigger(ctx context.Context, triggerUID string, triggerGen
 	if plan != nil {
 		if plan.PlanHash == "" || plan.FlowUID == "" || plan.InterpreterVersion == "" {
 			return Receipt{}, errors.New("accepted execution plan is incomplete")
+		}
+		if err := validateFlowPlanTx(ctx, tx, flowName, namespace, *plan); err != nil {
+			return Receipt{}, err
+		}
+		if afterProviderValidation != nil {
+			afterProviderValidation()
 		}
 		planJSON, marshalErr := json.Marshal(plan)
 		if marshalErr != nil {
@@ -597,6 +608,52 @@ func (s *Store) acceptTrigger(ctx context.Context, triggerUID string, triggerGen
 		return Receipt{}, err
 	}
 	return receipt, nil
+}
+
+func validateTriggerAcceptanceTx(ctx context.Context, tx *sql.Tx, triggerUID string, triggerGeneration uint64, flowName, namespace string) error {
+	var raw []byte
+	var resourceGeneration, stateGeneration uint64
+	var enabled int
+	if err := tx.QueryRowContext(ctx, `SELECT resources.spec_json,resources.generation,trigger_states.generation,trigger_states.enabled
+		FROM resources JOIN trigger_states ON trigger_states.trigger_uid=resources.uid
+		WHERE resources.kind='Trigger' AND resources.uid=?`, triggerUID).Scan(&raw, &resourceGeneration, &stateGeneration, &enabled); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if resourceGeneration != triggerGeneration {
+		return &StaleTriggerGenerationError{Expected: triggerGeneration, Current: resourceGeneration}
+	}
+	if stateGeneration != triggerGeneration {
+		return &StaleTriggerGenerationError{Expected: triggerGeneration, Current: stateGeneration}
+	}
+	if enabled == 0 {
+		return ErrTriggerDisabled
+	}
+	trigger, err := resource.DecodeTrigger(raw)
+	if err != nil {
+		return errors.New("stored Trigger is invalid")
+	}
+	if trigger.Metadata.Namespace != namespace || trigger.Spec.Flow != flowName {
+		return &TriggerReferenceChangedError{}
+	}
+	return nil
+}
+
+func validateFlowPlanTx(ctx context.Context, tx *sql.Tx, flowName, namespace string, plan flow.ExecutionPlan) error {
+	var uid string
+	var generation uint64
+	if err := tx.QueryRowContext(ctx, `SELECT uid,generation FROM resources WHERE kind='Flow' AND namespace=? AND name=?`, namespace, flowName).Scan(&uid, &generation); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if uid != plan.FlowUID || generation != plan.FlowGeneration {
+		return &StaleFlowPlanError{ExpectedUID: plan.FlowUID, ExpectedGeneration: plan.FlowGeneration, CurrentUID: uid, CurrentGeneration: generation}
+	}
+	return nil
 }
 
 func upsertProviderCursor(ctx context.Context, tx *sql.Tx, triggerUID, cursor, eventID, now string) error {

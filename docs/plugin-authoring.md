@@ -77,6 +77,14 @@ or `Config.Agent`. Trigger watches participate in the same shutdown admission,
 cancellation, and drain accounting. Daemon, resource, bundle, and
 workflow-engine internals are not public APIs.
 
+A trigger plugin publishes exactly one `TriggerDescriptor` in v0.1, containing
+Draft 2020-12 config and event schemas. The daemon resolves the Trigger's
+namespace-local `secretRefs`, removes that host-only map, and validates the
+remaining config before opening a watch. It validates every emitted payload
+against the immutable event schema before durable acceptance and acknowledgement.
+Schema failures stop the watch with path/code diagnostics and never include the
+rejected config, event payload, or secret values.
+
 The daemon canonicalizes and stores the negotiated contract with the immutable
 plugin installation. Enable and later process restarts must reproduce the same
 contract digest. Flow compilation pins the selected action schemas into the

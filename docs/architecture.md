@@ -10,6 +10,12 @@ CLI / TUI ── gRPC/UDS ── daemon ── SQLite WAL
 
 Resources use `orchigram.dev/v1alpha1`, strict decoding, Kubernetes-style metadata, revisions, generations, labels, status, events, and optimistic concurrency. Before acknowledging a trigger, the daemon compiles a `Flow` into an immutable `ExecutionPlan` and atomically persists that plan with the receipt and outbox command. Every `Run` pins its plan hash and interpreter version. Non-core plan nodes additionally pin the plugin version and digest, canonical action schemas and contract digest, plus referenced resource metadata/spec snapshots; secret values remain runtime-only.
 
+One namespace-aware resolver validates desired-resource dependencies for apply,
+GET/LIST/WATCH readiness projection, Flow compilation, webhook/provider setup,
+and runtime binding. Trigger acceptance rechecks the current Trigger generation,
+enabled state, target Flow name, and compiled Flow UID/generation inside the
+receipt/plan/outbox transaction. See [Resource references](resource-references.md).
+
 The daemon owns triggers, receipts, the transactional outbox, run state,
 physical attempt evidence, approvals, plugin lifecycle, workspaces, and
 artifacts. Plugins own only provider-specific trigger, task, or agent behavior.

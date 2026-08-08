@@ -2,6 +2,7 @@
 package pluginmanager
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -340,13 +341,47 @@ func (m *Manager) HasAction(action string) bool {
 // ValidateAction resolves and validates the same immutable binding used by a
 // compiled plan.
 func (m *Manager) ValidateAction(action string, config map[string]any) []flow.Diagnostic {
-	_, diagnostics := m.BindAction(action, config)
+	_, diagnostics := m.BindAction(resource.DefaultNamespace, action, config)
 	return diagnostics
+}
+
+// ValidateTriggerProvider resolves one active provider contract and all of its
+// SecretRef metadata without launching the plugin process.
+func (m *Manager) ValidateTriggerProvider(ctx context.Context, namespace, pluginName string, config map[string]any) []flow.Diagnostic {
+	record, err := m.store.Plugin(ctx, pluginName, "")
+	if err != nil {
+		return []flow.Diagnostic{{Path: "plugin", Code: "provider_unavailable", Message: fmt.Sprintf("provider plugin %q is not active", pluginName)}}
+	}
+	descriptor, err := triggerDescriptor(record)
+	if err != nil {
+		return []flow.Diagnostic{{Path: "plugin", Code: "provider_contract_invalid", Message: err.Error()}}
+	}
+	configCopy, err := cloneConfig(config)
+	if err != nil {
+		return []flow.Diagnostic{{Path: "config", Code: "invalid", Message: "provider config cannot be represented as JSON"}}
+	}
+	secretNames, err := secretReferenceNames(configCopy)
+	if err != nil {
+		return []flow.Diagnostic{{Path: "config.secretRefs", Code: "invalid", Message: err.Error()}}
+	}
+	for _, secretName := range secretNames {
+		if _, getErr := m.store.Get(ctx, "SecretRef", namespace, secretName); getErr != nil {
+			return []flow.Diagnostic{{Path: "config.secretRefs", Code: "reference_not_found", Message: fmt.Sprintf("SecretRef %q is not available in namespace %q", secretName, normalizedNamespace(namespace))}}
+		}
+	}
+	delete(configCopy, "secretRefs")
+	if validationErr := validateTriggerContractValue(descriptor.ConfigSchema, "config", configCopy); validationErr != nil {
+		return []flow.Diagnostic{{Path: validationErr.path, Code: validationErr.code, Message: validationErr.message}}
+	}
+	return nil
 }
 
 // BindAction pins the active plugin binary and every referenced configuration
 // projection while keeping secret values out of the execution plan.
-func (m *Manager) BindAction(action string, config map[string]any) (flow.ActionBinding, []flow.Diagnostic) {
+func (m *Manager) BindAction(namespace, action string, config map[string]any) (flow.ActionBinding, []flow.Diagnostic) {
+	if namespace == "" {
+		namespace = resource.DefaultNamespace
+	}
 	name := strings.SplitN(action, ".", 2)[0]
 	record, err := m.store.Plugin(context.Background(), name, "")
 	if err != nil {
@@ -370,7 +405,7 @@ func (m *Manager) BindAction(action string, config map[string]any) (flow.ActionB
 	}
 	bindings := map[string]flow.ResourceBinding{}
 	bindResource := func(kind, resourceName string) (resource.Document, error) {
-		document, getErr := m.store.Get(context.Background(), kind, resource.DefaultNamespace, resourceName)
+		document, getErr := m.store.Get(context.Background(), kind, namespace, resourceName)
 		if getErr != nil {
 			return resource.Document{}, getErr
 		}
@@ -486,6 +521,59 @@ func actionDescriptor(contract pluginsdk.Contract, action string) (pluginsdk.Act
 	return pluginsdk.ActionDescriptor{}, false
 }
 
+func triggerDescriptor(record store.PluginRecord) (pluginsdk.TriggerDescriptor, error) {
+	contract, err := pluginsdk.DecodeContract(record.ContractJSON)
+	if err != nil {
+		return pluginsdk.TriggerDescriptor{}, errors.New("installed provider contract is invalid")
+	}
+	if len(contract.Triggers) != 1 {
+		return pluginsdk.TriggerDescriptor{}, errors.New("provider plugin must publish exactly one trigger source in v0.1")
+	}
+	return contract.Triggers[0], nil
+}
+
+type triggerContractError struct {
+	path    string
+	code    string
+	message string
+}
+
+func validateTriggerContractValue(raw json.RawMessage, root string, value any) *triggerContractError {
+	schema, err := actioncontract.Compile(raw)
+	if err != nil {
+		return &triggerContractError{path: root, code: "provider_contract_invalid", message: "installed provider schema is invalid"}
+	}
+	violations := schema.Validate(value)
+	if len(violations) == 0 {
+		return nil
+	}
+	path := root
+	if len(violations[0].Path) > 0 {
+		path += "." + strings.Join(violations[0].Path, ".")
+	}
+	return &triggerContractError{path: path, code: violations[0].Code, message: root + " does not satisfy the installed provider schema"}
+}
+
+func validateTriggerContractJSON(schema json.RawMessage, root string, raw []byte) *triggerContractError {
+	if !json.Valid(raw) {
+		return &triggerContractError{path: root, code: "schema_invalid", message: root + " is not valid JSON"}
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return &triggerContractError{path: root, code: "schema_invalid", message: root + " is not valid JSON"}
+	}
+	return validateTriggerContractValue(schema, root, value)
+}
+
+func normalizedNamespace(namespace string) string {
+	if namespace == "" {
+		return resource.DefaultNamespace
+	}
+	return namespace
+}
+
 func cloneConfig(config map[string]any) (map[string]any, error) {
 	encoded, err := json.Marshal(config)
 	if err != nil {
@@ -548,13 +636,13 @@ func (m *Manager) Describe(ctx context.Context, name, version string) (store.Plu
 }
 
 // ResolveSecret resolves one operation-scoped SecretRef for daemon controllers.
-func (m *Manager) ResolveSecret(ctx context.Context, name string) ([]byte, error) {
-	return m.resolveSecret(ctx, name)
+func (m *Manager) ResolveSecret(ctx context.Context, namespace, name string) ([]byte, error) {
+	return m.resolveSecret(ctx, namespace, name)
 }
 
 // SecretStatus reports only reference availability, never secret material.
-func (m *Manager) SecretStatus(ctx context.Context, name string) (string, string) {
-	document, err := m.store.Get(ctx, "SecretRef", resource.DefaultNamespace, name)
+func (m *Manager) SecretStatus(ctx context.Context, namespace, name string) (string, string) {
+	document, err := m.store.Get(ctx, "SecretRef", namespace, name)
 	if err != nil {
 		return "Missing", "unknown"
 	}
@@ -680,8 +768,12 @@ func (m *Manager) Execute(ctx context.Context, runUID string, node flow.PlanNode
 
 // WatchTrigger runs one bidirectional provider stream and acknowledges an
 // event only after the controller callback has durably persisted it.
-func (m *Manager) WatchTrigger(ctx context.Context, pluginName, triggerUID string, config map[string]any, cursor string, activatedAt time.Time, accept func(*pluginv1alpha1.TriggerEvent) error) error {
+func (m *Manager) WatchTrigger(ctx context.Context, pluginName, triggerUID, namespace string, config map[string]any, cursor string, activatedAt time.Time, accept func(*pluginv1alpha1.TriggerEvent) error) error {
 	process, record, err := m.activeProcess(ctx, pluginName)
+	if err != nil {
+		return err
+	}
+	descriptor, err := triggerDescriptor(record)
 	if err != nil {
 		return err
 	}
@@ -692,9 +784,12 @@ func (m *Manager) WatchTrigger(ctx context.Context, pluginName, triggerUID strin
 	if err := validateProviderBootstrap(record, cursor, activatedAt, configCopy); err != nil {
 		return err
 	}
-	secrets, err := m.resolveNodeSecrets(ctx, configCopy)
+	secrets, err := m.resolveNodeSecretsInNamespace(ctx, namespace, configCopy)
 	if err != nil {
 		return err
+	}
+	if validationErr := validateTriggerContractValue(descriptor.ConfigSchema, "config", configCopy); validationErr != nil {
+		return fmt.Errorf("%s (%s): %s", validationErr.path, validationErr.code, validationErr.message)
 	}
 	configJSON, err := json.Marshal(configCopy)
 	if err != nil {
@@ -718,6 +813,9 @@ func (m *Manager) WatchTrigger(ctx context.Context, pluginName, triggerUID strin
 				m.evict(installationKey(record.Name, record.Version))
 			}
 			return receiveErr
+		}
+		if validationErr := validateTriggerContractJSON(descriptor.EventSchema, "event", event.GetPayloadJson()); validationErr != nil {
+			return fmt.Errorf("%s (%s): %s", validationErr.path, validationErr.code, validationErr.message)
 		}
 		if err := accept(event); err != nil {
 			return err
@@ -1144,6 +1242,10 @@ func (m *Manager) launch(ctx context.Context, record store.PluginRecord) (*plugi
 }
 
 func (m *Manager) resolveNodeSecrets(ctx context.Context, config map[string]any, bindingSets ...[]flow.ResourceBinding) (map[string][]byte, error) {
+	return m.resolveNodeSecretsInNamespace(ctx, resource.DefaultNamespace, config, bindingSets...)
+}
+
+func (m *Manager) resolveNodeSecretsInNamespace(ctx context.Context, namespace string, config map[string]any, bindingSets ...[]flow.ResourceBinding) (map[string][]byte, error) {
 	value, exists := config["secretRefs"]
 	if !exists {
 		return nil, nil
@@ -1159,7 +1261,14 @@ func (m *Manager) resolveNodeSecrets(ctx context.Context, config map[string]any,
 		if !ok || name == "" {
 			return nil, fmt.Errorf("secret reference for %s must be a resource name", target)
 		}
-		secret, err := m.resolveBoundSecret(ctx, name, firstBindings(bindingSets))
+		bindings := firstBindings(bindingSets)
+		var secret []byte
+		var err error
+		if len(bindings) > 0 {
+			secret, err = m.resolveBoundSecret(ctx, name, bindings)
+		} else {
+			secret, err = m.resolveSecret(ctx, namespace, name)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1375,7 +1484,7 @@ func firstBindings(bindingSets [][]flow.ResourceBinding) []flow.ResourceBinding 
 
 func (m *Manager) boundAgentProfile(ctx context.Context, bindings []flow.ResourceBinding, name string) (resource.AgentProfileSpec, error) {
 	for _, binding := range bindings {
-		if binding.Kind == "AgentProfile" && binding.Namespace == resource.DefaultNamespace && binding.Name == name {
+		if binding.Kind == "AgentProfile" && binding.Name == name {
 			var spec resource.AgentProfileSpec
 			if err := json.Unmarshal(binding.Spec, &spec); err != nil {
 				return resource.AgentProfileSpec{}, fmt.Errorf("decode pinned AgentProfile %q: %w", name, err)
@@ -1397,7 +1506,7 @@ func (m *Manager) boundAgentProfile(ctx context.Context, bindings []flow.Resourc
 
 func (m *Manager) resolveBoundSecret(ctx context.Context, name string, bindings []flow.ResourceBinding) ([]byte, error) {
 	for _, binding := range bindings {
-		if binding.Kind != "SecretRef" || binding.Namespace != resource.DefaultNamespace || binding.Name != name {
+		if binding.Kind != "SecretRef" || binding.Name != name {
 			continue
 		}
 		var spec resource.SecretRefSpec
@@ -1407,11 +1516,14 @@ func (m *Manager) resolveBoundSecret(ctx context.Context, name string, bindings 
 		return resolveSecretSpec(name, spec)
 	}
 	// Compatibility for prototype plans and controller-owned secret resolution.
-	return m.resolveSecret(ctx, name)
+	return m.resolveSecret(ctx, resource.DefaultNamespace, name)
 }
 
-func (m *Manager) resolveSecret(ctx context.Context, name string) ([]byte, error) {
-	document, err := m.store.Get(ctx, "SecretRef", resource.DefaultNamespace, name)
+func (m *Manager) resolveSecret(ctx context.Context, namespace, name string) ([]byte, error) {
+	if namespace == "" {
+		namespace = resource.DefaultNamespace
+	}
+	document, err := m.store.Get(ctx, "SecretRef", namespace, name)
 	if err != nil {
 		return nil, fmt.Errorf("resolve SecretRef %q: %w", name, err)
 	}
