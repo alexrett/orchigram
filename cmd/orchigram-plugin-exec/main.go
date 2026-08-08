@@ -10,7 +10,7 @@ import (
 
 func main() {
 	pluginprotocol.Serve(pluginprotocol.Servers{
-		Control: &pluginruntime.Control{Info: pluginruntime.Info{Name: "exec", Version: version.Version, Capabilities: []string{"task.exec.run"}}},
+		Control: &pluginruntime.Control{Info: pluginruntime.Info{Name: "exec", Version: version.Semver(), Capabilities: []string{"task.exec.run"}}},
 		Task:    &pluginruntime.Exec{Runner: process.NewRunner()},
 	})
 }

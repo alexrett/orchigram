@@ -375,6 +375,33 @@ func (d Document) WithServerMetadata(meta ObjectMeta) (Document, error) {
 	return d, nil
 }
 
+// WithServerStatus replaces the server-owned status projection. Clients may
+// round-trip a projected resource, but status is never accepted as desired
+// configuration.
+func (d Document) WithServerStatus(status map[string]any) (Document, error) {
+	var value map[string]any
+	if err := json.Unmarshal(d.JSON, &value); err != nil {
+		return Document{}, fmt.Errorf("decode canonical resource: %w", err)
+	}
+	if len(status) == 0 {
+		delete(value, "status")
+		d.Status = []byte("{}")
+	} else {
+		value["status"] = status
+		encoded, err := json.Marshal(status)
+		if err != nil {
+			return Document{}, err
+		}
+		d.Status = encoded
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return Document{}, err
+	}
+	d.JSON = encoded
+	return d, nil
+}
+
 func setMetadata(data []byte, meta ObjectMeta) ([]byte, error) {
 	var value map[string]any
 	if err := json.Unmarshal(data, &value); err != nil {

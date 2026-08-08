@@ -1,0 +1,103 @@
+# Operator guide
+
+Orchigram has one control API and two transports: a local Unix socket or that
+same Unix socket forwarded by OpenSSH. The TUI and every CLI command use named
+contexts from `~/.config/orchigram/contexts.yaml`; this is the only local state.
+
+## Install a server
+
+Place the `orchigram` executable and the four matching first-party plugin
+executables in one directory on an Ubuntu 24.04 host, then run:
+
+```console
+sudo ./orchigram install --plugin-dir .
+```
+
+The installer creates the stable `orchigram` system user and group, installs a
+hardened systemd unit, starts the daemon, verifies each immutable plugin bundle,
+and activates the four plugins. Re-running the command is the supported
+single-node upgrade path: the daemon restarts and reconciles durable state from
+SQLite. It never opens a TCP listener unless `/etc/orchigram/config.yaml`
+explicitly sets `http.listen`.
+
+The server paths are:
+
+- `/usr/local/bin/orchigram` and `/usr/local/lib/orchigram/plugins/`;
+- `/etc/orchigram/config.yaml`;
+- `/var/lib/orchigram/` for SQLite, plugins, workspaces, and artifacts;
+- `/run/orchigram/orchigram.sock` for the control API;
+- `/var/log/orchigram/` for operator-owned log integrations; system logs go to
+  the journal by default.
+
+An operator needs Unix permission to the socket. Add a non-root SSH account to
+the `orchigram` group and start a new login session before using it:
+
+```console
+sudo usermod -aG orchigram operator
+```
+
+`install` warns when `git`, `codex`, or `claude` is unavailable. Agent CLI
+login remains owned by those tools; Orchigram does not copy or print their
+credentials.
+
+## Local and SSH contexts
+
+The default context connects to `/run/orchigram/orchigram.sock`. Add and select
+a remote context with ordinary OpenSSH destination syntax:
+
+```console
+orchigram context set production --ssh-destination operator@example.net
+orchigram context use production
+orchigram context get
+```
+
+An identity file is optional:
+
+```console
+orchigram context set production \
+  --ssh-destination operator@example.net \
+  --identity ~/.ssh/id_ed25519 \
+  --remote-socket /run/orchigram/orchigram.sock
+```
+
+Orchigram executes `ssh` directly, creates a private temporary local socket,
+and supervises `StreamLocal` forwarding with bounded reconnect backoff. No
+gRPC TCP port is exposed on the server.
+
+## TUI
+
+Run `orchigram` to open the English-only interface. The core bindings are:
+
+- `:` command palette, `/` resource filter, and `?` help;
+- `Enter` drill-down and `Esc` back;
+- arrows or `h/j/k/l` to select graph nodes;
+- `g` graph, `l` logs, `e` events, `y` read-only YAML, `d` describe;
+- `E` edit the schema-derived projection;
+- `a` approve, `r` reject, and `c` cancel the selected run;
+- `q` quit.
+
+Forms send the displayed `resourceVersion` as a compare-and-swap condition.
+Conflicts are shown and never overwrite the newer resource. `SecretRef` forms
+expose only backend and reference key/path; status shows `Configured` or
+`Missing`, never the value.
+
+The graph view is shared by Flow definitions, live run status, and historical
+event replay. Mouse click selects a node, double-click opens it, and the wheel
+pans the viewport. Every operation required for approval and inspection also
+has a keyboard path.
+
+## Verification and recovery
+
+Useful server checks are:
+
+```console
+systemctl status orchigram.service
+journalctl -u orchigram.service
+systemd-analyze security orchigram.service
+orchigram plugin list
+orchigram plugin doctor agent-command
+```
+
+The repository's `scripts/verify-ssh-context.sh` performs the manual exec plus
+durable-approval tracer through an SSH context. It requires
+`ORCHIGRAM_TEST_SSH_DESTINATION` and never embeds a test host address.

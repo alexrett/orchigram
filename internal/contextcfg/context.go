@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -82,9 +83,70 @@ func (f File) Validate() error {
 		if (context.Socket == "") == (context.SSH == nil) {
 			return fmt.Errorf("context %q must configure exactly one of socket or ssh", name)
 		}
+		if context.Socket != "" && !filepath.IsAbs(context.Socket) {
+			return fmt.Errorf("context %q socket must be absolute", name)
+		}
 		if context.SSH != nil && (context.SSH.Destination == "" || context.SSH.Socket == "") {
 			return fmt.Errorf("context %q ssh.destination and ssh.socket are required", name)
 		}
+		if context.SSH != nil {
+			if strings.HasPrefix(context.SSH.Destination, "-") || len(strings.Fields(context.SSH.Destination)) != 1 {
+				return fmt.Errorf("context %q ssh.destination is invalid", name)
+			}
+			if !filepath.IsAbs(context.SSH.Socket) || strings.ContainsAny(context.SSH.Socket, ":\r\n") {
+				return fmt.Errorf("context %q ssh.socket must be an absolute path without ':'", name)
+			}
+			if strings.ContainsAny(context.SSH.Identity, "\r\n") {
+				return fmt.Errorf("context %q ssh.identity is invalid", name)
+			}
+		}
 	}
 	return nil
+}
+
+// Save atomically writes contexts with user-only permissions.
+func Save(path string, file File) error {
+	if err := file.Validate(); err != nil {
+		return err
+	}
+	if path == "" {
+		var err error
+		path, err = Path()
+		if err != nil {
+			return err
+		}
+	}
+	encoded, err := yaml.Marshal(file)
+	if err != nil {
+		return err
+	}
+	directory := filepath.Dir(path)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return fmt.Errorf("create context directory: %w", err)
+	}
+	temporary, err := os.CreateTemp(directory, ".contexts-*.yaml")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(encoded); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
 }

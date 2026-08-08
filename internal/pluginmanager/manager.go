@@ -227,6 +227,33 @@ func (m *Manager) ResolveSecret(ctx context.Context, name string) ([]byte, error
 	return m.resolveSecret(ctx, name)
 }
 
+// SecretStatus reports only reference availability, never secret material.
+func (m *Manager) SecretStatus(ctx context.Context, name string) (string, string) {
+	document, err := m.store.Get(ctx, "SecretRef", resource.DefaultNamespace, name)
+	if err != nil {
+		return "Missing", "unknown"
+	}
+	reference, err := resource.DecodeSecretRef(document.JSON)
+	if err != nil {
+		return "Missing", "unknown"
+	}
+	switch reference.Spec.Backend {
+	case "env", "environment":
+		if value, exists := os.LookupEnv(reference.Spec.Key); exists && value != "" {
+			return "Configured", "env"
+		}
+		return "Missing", "env"
+	case "file":
+		info, statErr := os.Stat(reference.Spec.Key)
+		if statErr == nil && info.Mode().IsRegular() && info.Size() > 0 && info.Size() <= maxSecretSize {
+			return "Configured", "file"
+		}
+		return "Missing", "file"
+	default:
+		return "Missing", reference.Spec.Backend
+	}
+}
+
 // Doctor launches the selected plugin and verifies negotiation plus health.
 func (m *Manager) Doctor(ctx context.Context, name, version string) error {
 	record, err := m.store.Plugin(ctx, name, version)

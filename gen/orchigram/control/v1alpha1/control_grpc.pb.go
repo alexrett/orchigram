@@ -496,6 +496,7 @@ var FlowService_ServiceDesc = grpc.ServiceDesc{
 const (
 	RunService_Start_FullMethodName       = "/orchigram.control.v1alpha1.RunService/Start"
 	RunService_List_FullMethodName        = "/orchigram.control.v1alpha1.RunService/List"
+	RunService_Plan_FullMethodName        = "/orchigram.control.v1alpha1.RunService/Plan"
 	RunService_WatchEvents_FullMethodName = "/orchigram.control.v1alpha1.RunService/WatchEvents"
 	RunService_Approve_FullMethodName     = "/orchigram.control.v1alpha1.RunService/Approve"
 	RunService_Reject_FullMethodName      = "/orchigram.control.v1alpha1.RunService/Reject"
@@ -509,6 +510,7 @@ const (
 type RunServiceClient interface {
 	Start(ctx context.Context, in *StartRunRequest, opts ...grpc.CallOption) (*RunRef, error)
 	List(ctx context.Context, in *ListRunsRequest, opts ...grpc.CallOption) (*ListRunsResponse, error)
+	Plan(ctx context.Context, in *RunRequest, opts ...grpc.CallOption) (*CompileResponse, error)
 	WatchEvents(ctx context.Context, in *WatchRunRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RunEvent], error)
 	Approve(ctx context.Context, in *ApprovalRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	Reject(ctx context.Context, in *ApprovalRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
@@ -538,6 +540,16 @@ func (c *runServiceClient) List(ctx context.Context, in *ListRunsRequest, opts .
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListRunsResponse)
 	err := c.cc.Invoke(ctx, RunService_List_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runServiceClient) Plan(ctx context.Context, in *RunRequest, opts ...grpc.CallOption) (*CompileResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CompileResponse)
+	err := c.cc.Invoke(ctx, RunService_Plan_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -609,6 +621,7 @@ func (c *runServiceClient) Reconcile(ctx context.Context, in *ReconcileRequest, 
 type RunServiceServer interface {
 	Start(context.Context, *StartRunRequest) (*RunRef, error)
 	List(context.Context, *ListRunsRequest) (*ListRunsResponse, error)
+	Plan(context.Context, *RunRequest) (*CompileResponse, error)
 	WatchEvents(*WatchRunRequest, grpc.ServerStreamingServer[RunEvent]) error
 	Approve(context.Context, *ApprovalRequest) (*emptypb.Empty, error)
 	Reject(context.Context, *ApprovalRequest) (*emptypb.Empty, error)
@@ -629,6 +642,9 @@ func (UnimplementedRunServiceServer) Start(context.Context, *StartRunRequest) (*
 }
 func (UnimplementedRunServiceServer) List(context.Context, *ListRunsRequest) (*ListRunsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method List not implemented")
+}
+func (UnimplementedRunServiceServer) Plan(context.Context, *RunRequest) (*CompileResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Plan not implemented")
 }
 func (UnimplementedRunServiceServer) WatchEvents(*WatchRunRequest, grpc.ServerStreamingServer[RunEvent]) error {
 	return status.Errorf(codes.Unimplemented, "method WatchEvents not implemented")
@@ -698,6 +714,24 @@ func _RunService_List_Handler(srv interface{}, ctx context.Context, dec func(int
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(RunServiceServer).List(ctx, req.(*ListRunsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RunService_Plan_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RunRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RunServiceServer).Plan(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RunService_Plan_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RunServiceServer).Plan(ctx, req.(*RunRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -799,6 +833,10 @@ var RunService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "List",
 			Handler:    _RunService_List_Handler,
+		},
+		{
+			MethodName: "Plan",
+			Handler:    _RunService_Plan_Handler,
 		},
 		{
 			MethodName: "Approve",

@@ -3174,11 +3174,12 @@ const file_orchigram_control_v1alpha1_control_proto_rawDesc = "" +
 	"\x06Export\x12).orchigram.control.v1alpha1.ExportRequest\x1a*.orchigram.control.v1alpha1.ExportResponse2\xe4\x01\n" +
 	"\vFlowService\x12b\n" +
 	"\aCompile\x12*.orchigram.control.v1alpha1.CompileRequest\x1a+.orchigram.control.v1alpha1.CompileResponse\x12q\n" +
-	"\fPreviewGraph\x12/.orchigram.control.v1alpha1.PreviewGraphRequest\x1a0.orchigram.control.v1alpha1.PreviewGraphResponse2\xff\x04\n" +
+	"\fPreviewGraph\x12/.orchigram.control.v1alpha1.PreviewGraphRequest\x1a0.orchigram.control.v1alpha1.PreviewGraphResponse2\xdc\x05\n" +
 	"\n" +
 	"RunService\x12X\n" +
 	"\x05Start\x12+.orchigram.control.v1alpha1.StartRunRequest\x1a\".orchigram.control.v1alpha1.RunRef\x12a\n" +
-	"\x04List\x12+.orchigram.control.v1alpha1.ListRunsRequest\x1a,.orchigram.control.v1alpha1.ListRunsResponse\x12b\n" +
+	"\x04List\x12+.orchigram.control.v1alpha1.ListRunsRequest\x1a,.orchigram.control.v1alpha1.ListRunsResponse\x12[\n" +
+	"\x04Plan\x12&.orchigram.control.v1alpha1.RunRequest\x1a+.orchigram.control.v1alpha1.CompileResponse\x12b\n" +
 	"\vWatchEvents\x12+.orchigram.control.v1alpha1.WatchRunRequest\x1a$.orchigram.control.v1alpha1.RunEvent0\x01\x12N\n" +
 	"\aApprove\x12+.orchigram.control.v1alpha1.ApprovalRequest\x1a\x16.google.protobuf.Empty\x12M\n" +
 	"\x06Reject\x12+.orchigram.control.v1alpha1.ApprovalRequest\x1a\x16.google.protobuf.Empty\x12N\n" +
@@ -3318,55 +3319,57 @@ var file_orchigram_control_v1alpha1_control_proto_depIdxs = []int32{
 	17, // 44: orchigram.control.v1alpha1.FlowService.PreviewGraph:input_type -> orchigram.control.v1alpha1.PreviewGraphRequest
 	21, // 45: orchigram.control.v1alpha1.RunService.Start:input_type -> orchigram.control.v1alpha1.StartRunRequest
 	24, // 46: orchigram.control.v1alpha1.RunService.List:input_type -> orchigram.control.v1alpha1.ListRunsRequest
-	27, // 47: orchigram.control.v1alpha1.RunService.WatchEvents:input_type -> orchigram.control.v1alpha1.WatchRunRequest
-	29, // 48: orchigram.control.v1alpha1.RunService.Approve:input_type -> orchigram.control.v1alpha1.ApprovalRequest
-	29, // 49: orchigram.control.v1alpha1.RunService.Reject:input_type -> orchigram.control.v1alpha1.ApprovalRequest
-	30, // 50: orchigram.control.v1alpha1.RunService.Cancel:input_type -> orchigram.control.v1alpha1.CancelRunRequest
-	31, // 51: orchigram.control.v1alpha1.RunService.Reconcile:input_type -> orchigram.control.v1alpha1.ReconcileRequest
-	33, // 52: orchigram.control.v1alpha1.TriggerService.Next:input_type -> orchigram.control.v1alpha1.NextOccurrencesRequest
-	32, // 53: orchigram.control.v1alpha1.TriggerService.Enable:input_type -> orchigram.control.v1alpha1.TriggerRequest
-	32, // 54: orchigram.control.v1alpha1.TriggerService.Disable:input_type -> orchigram.control.v1alpha1.TriggerRequest
-	36, // 55: orchigram.control.v1alpha1.TriggerService.Receipts:input_type -> orchigram.control.v1alpha1.ReceiptRequest
-	40, // 56: orchigram.control.v1alpha1.PluginService.Install:input_type -> orchigram.control.v1alpha1.PluginUploadRequest
-	42, // 57: orchigram.control.v1alpha1.PluginService.Enable:input_type -> orchigram.control.v1alpha1.PluginRequest
-	42, // 58: orchigram.control.v1alpha1.PluginService.Disable:input_type -> orchigram.control.v1alpha1.PluginRequest
-	52, // 59: orchigram.control.v1alpha1.PluginService.List:input_type -> google.protobuf.Empty
-	42, // 60: orchigram.control.v1alpha1.PluginService.Describe:input_type -> orchigram.control.v1alpha1.PluginRequest
-	42, // 61: orchigram.control.v1alpha1.PluginService.Doctor:input_type -> orchigram.control.v1alpha1.PluginRequest
-	52, // 62: orchigram.control.v1alpha1.SystemService.Info:input_type -> google.protobuf.Empty
-	52, // 63: orchigram.control.v1alpha1.SystemService.Health:input_type -> google.protobuf.Empty
-	48, // 64: orchigram.control.v1alpha1.SystemService.Backup:input_type -> orchigram.control.v1alpha1.BackupRequest
-	5,  // 65: orchigram.control.v1alpha1.ResourceService.Apply:output_type -> orchigram.control.v1alpha1.ApplyResponse
-	5,  // 66: orchigram.control.v1alpha1.ResourceService.Validate:output_type -> orchigram.control.v1alpha1.ApplyResponse
-	3,  // 67: orchigram.control.v1alpha1.ResourceService.Get:output_type -> orchigram.control.v1alpha1.ResourceDocument
-	8,  // 68: orchigram.control.v1alpha1.ResourceService.List:output_type -> orchigram.control.v1alpha1.ListResponse
-	52, // 69: orchigram.control.v1alpha1.ResourceService.Delete:output_type -> google.protobuf.Empty
-	11, // 70: orchigram.control.v1alpha1.ResourceService.Watch:output_type -> orchigram.control.v1alpha1.ResourceEvent
-	13, // 71: orchigram.control.v1alpha1.ResourceService.Export:output_type -> orchigram.control.v1alpha1.ExportResponse
-	16, // 72: orchigram.control.v1alpha1.FlowService.Compile:output_type -> orchigram.control.v1alpha1.CompileResponse
-	20, // 73: orchigram.control.v1alpha1.FlowService.PreviewGraph:output_type -> orchigram.control.v1alpha1.PreviewGraphResponse
-	22, // 74: orchigram.control.v1alpha1.RunService.Start:output_type -> orchigram.control.v1alpha1.RunRef
-	26, // 75: orchigram.control.v1alpha1.RunService.List:output_type -> orchigram.control.v1alpha1.ListRunsResponse
-	28, // 76: orchigram.control.v1alpha1.RunService.WatchEvents:output_type -> orchigram.control.v1alpha1.RunEvent
-	52, // 77: orchigram.control.v1alpha1.RunService.Approve:output_type -> google.protobuf.Empty
-	52, // 78: orchigram.control.v1alpha1.RunService.Reject:output_type -> google.protobuf.Empty
-	52, // 79: orchigram.control.v1alpha1.RunService.Cancel:output_type -> google.protobuf.Empty
-	25, // 80: orchigram.control.v1alpha1.RunService.Reconcile:output_type -> orchigram.control.v1alpha1.RunSummary
-	35, // 81: orchigram.control.v1alpha1.TriggerService.Next:output_type -> orchigram.control.v1alpha1.NextOccurrencesResponse
-	52, // 82: orchigram.control.v1alpha1.TriggerService.Enable:output_type -> google.protobuf.Empty
-	52, // 83: orchigram.control.v1alpha1.TriggerService.Disable:output_type -> google.protobuf.Empty
-	39, // 84: orchigram.control.v1alpha1.TriggerService.Receipts:output_type -> orchigram.control.v1alpha1.ReceiptResponse
-	41, // 85: orchigram.control.v1alpha1.PluginService.Install:output_type -> orchigram.control.v1alpha1.PluginInstallResponse
-	52, // 86: orchigram.control.v1alpha1.PluginService.Enable:output_type -> google.protobuf.Empty
-	52, // 87: orchigram.control.v1alpha1.PluginService.Disable:output_type -> google.protobuf.Empty
-	44, // 88: orchigram.control.v1alpha1.PluginService.List:output_type -> orchigram.control.v1alpha1.ListPluginsResponse
-	43, // 89: orchigram.control.v1alpha1.PluginService.Describe:output_type -> orchigram.control.v1alpha1.PluginInfo
-	45, // 90: orchigram.control.v1alpha1.PluginService.Doctor:output_type -> orchigram.control.v1alpha1.DoctorResponse
-	46, // 91: orchigram.control.v1alpha1.SystemService.Info:output_type -> orchigram.control.v1alpha1.SystemInfo
-	47, // 92: orchigram.control.v1alpha1.SystemService.Health:output_type -> orchigram.control.v1alpha1.HealthResponse
-	49, // 93: orchigram.control.v1alpha1.SystemService.Backup:output_type -> orchigram.control.v1alpha1.BackupResponse
-	65, // [65:94] is the sub-list for method output_type
-	36, // [36:65] is the sub-list for method input_type
+	23, // 47: orchigram.control.v1alpha1.RunService.Plan:input_type -> orchigram.control.v1alpha1.RunRequest
+	27, // 48: orchigram.control.v1alpha1.RunService.WatchEvents:input_type -> orchigram.control.v1alpha1.WatchRunRequest
+	29, // 49: orchigram.control.v1alpha1.RunService.Approve:input_type -> orchigram.control.v1alpha1.ApprovalRequest
+	29, // 50: orchigram.control.v1alpha1.RunService.Reject:input_type -> orchigram.control.v1alpha1.ApprovalRequest
+	30, // 51: orchigram.control.v1alpha1.RunService.Cancel:input_type -> orchigram.control.v1alpha1.CancelRunRequest
+	31, // 52: orchigram.control.v1alpha1.RunService.Reconcile:input_type -> orchigram.control.v1alpha1.ReconcileRequest
+	33, // 53: orchigram.control.v1alpha1.TriggerService.Next:input_type -> orchigram.control.v1alpha1.NextOccurrencesRequest
+	32, // 54: orchigram.control.v1alpha1.TriggerService.Enable:input_type -> orchigram.control.v1alpha1.TriggerRequest
+	32, // 55: orchigram.control.v1alpha1.TriggerService.Disable:input_type -> orchigram.control.v1alpha1.TriggerRequest
+	36, // 56: orchigram.control.v1alpha1.TriggerService.Receipts:input_type -> orchigram.control.v1alpha1.ReceiptRequest
+	40, // 57: orchigram.control.v1alpha1.PluginService.Install:input_type -> orchigram.control.v1alpha1.PluginUploadRequest
+	42, // 58: orchigram.control.v1alpha1.PluginService.Enable:input_type -> orchigram.control.v1alpha1.PluginRequest
+	42, // 59: orchigram.control.v1alpha1.PluginService.Disable:input_type -> orchigram.control.v1alpha1.PluginRequest
+	52, // 60: orchigram.control.v1alpha1.PluginService.List:input_type -> google.protobuf.Empty
+	42, // 61: orchigram.control.v1alpha1.PluginService.Describe:input_type -> orchigram.control.v1alpha1.PluginRequest
+	42, // 62: orchigram.control.v1alpha1.PluginService.Doctor:input_type -> orchigram.control.v1alpha1.PluginRequest
+	52, // 63: orchigram.control.v1alpha1.SystemService.Info:input_type -> google.protobuf.Empty
+	52, // 64: orchigram.control.v1alpha1.SystemService.Health:input_type -> google.protobuf.Empty
+	48, // 65: orchigram.control.v1alpha1.SystemService.Backup:input_type -> orchigram.control.v1alpha1.BackupRequest
+	5,  // 66: orchigram.control.v1alpha1.ResourceService.Apply:output_type -> orchigram.control.v1alpha1.ApplyResponse
+	5,  // 67: orchigram.control.v1alpha1.ResourceService.Validate:output_type -> orchigram.control.v1alpha1.ApplyResponse
+	3,  // 68: orchigram.control.v1alpha1.ResourceService.Get:output_type -> orchigram.control.v1alpha1.ResourceDocument
+	8,  // 69: orchigram.control.v1alpha1.ResourceService.List:output_type -> orchigram.control.v1alpha1.ListResponse
+	52, // 70: orchigram.control.v1alpha1.ResourceService.Delete:output_type -> google.protobuf.Empty
+	11, // 71: orchigram.control.v1alpha1.ResourceService.Watch:output_type -> orchigram.control.v1alpha1.ResourceEvent
+	13, // 72: orchigram.control.v1alpha1.ResourceService.Export:output_type -> orchigram.control.v1alpha1.ExportResponse
+	16, // 73: orchigram.control.v1alpha1.FlowService.Compile:output_type -> orchigram.control.v1alpha1.CompileResponse
+	20, // 74: orchigram.control.v1alpha1.FlowService.PreviewGraph:output_type -> orchigram.control.v1alpha1.PreviewGraphResponse
+	22, // 75: orchigram.control.v1alpha1.RunService.Start:output_type -> orchigram.control.v1alpha1.RunRef
+	26, // 76: orchigram.control.v1alpha1.RunService.List:output_type -> orchigram.control.v1alpha1.ListRunsResponse
+	16, // 77: orchigram.control.v1alpha1.RunService.Plan:output_type -> orchigram.control.v1alpha1.CompileResponse
+	28, // 78: orchigram.control.v1alpha1.RunService.WatchEvents:output_type -> orchigram.control.v1alpha1.RunEvent
+	52, // 79: orchigram.control.v1alpha1.RunService.Approve:output_type -> google.protobuf.Empty
+	52, // 80: orchigram.control.v1alpha1.RunService.Reject:output_type -> google.protobuf.Empty
+	52, // 81: orchigram.control.v1alpha1.RunService.Cancel:output_type -> google.protobuf.Empty
+	25, // 82: orchigram.control.v1alpha1.RunService.Reconcile:output_type -> orchigram.control.v1alpha1.RunSummary
+	35, // 83: orchigram.control.v1alpha1.TriggerService.Next:output_type -> orchigram.control.v1alpha1.NextOccurrencesResponse
+	52, // 84: orchigram.control.v1alpha1.TriggerService.Enable:output_type -> google.protobuf.Empty
+	52, // 85: orchigram.control.v1alpha1.TriggerService.Disable:output_type -> google.protobuf.Empty
+	39, // 86: orchigram.control.v1alpha1.TriggerService.Receipts:output_type -> orchigram.control.v1alpha1.ReceiptResponse
+	41, // 87: orchigram.control.v1alpha1.PluginService.Install:output_type -> orchigram.control.v1alpha1.PluginInstallResponse
+	52, // 88: orchigram.control.v1alpha1.PluginService.Enable:output_type -> google.protobuf.Empty
+	52, // 89: orchigram.control.v1alpha1.PluginService.Disable:output_type -> google.protobuf.Empty
+	44, // 90: orchigram.control.v1alpha1.PluginService.List:output_type -> orchigram.control.v1alpha1.ListPluginsResponse
+	43, // 91: orchigram.control.v1alpha1.PluginService.Describe:output_type -> orchigram.control.v1alpha1.PluginInfo
+	45, // 92: orchigram.control.v1alpha1.PluginService.Doctor:output_type -> orchigram.control.v1alpha1.DoctorResponse
+	46, // 93: orchigram.control.v1alpha1.SystemService.Info:output_type -> orchigram.control.v1alpha1.SystemInfo
+	47, // 94: orchigram.control.v1alpha1.SystemService.Health:output_type -> orchigram.control.v1alpha1.HealthResponse
+	49, // 95: orchigram.control.v1alpha1.SystemService.Backup:output_type -> orchigram.control.v1alpha1.BackupResponse
+	66, // [66:96] is the sub-list for method output_type
+	36, // [36:66] is the sub-list for method input_type
 	36, // [36:36] is the sub-list for extension type_name
 	36, // [36:36] is the sub-list for extension extendee
 	0,  // [0:36] is the sub-list for field type_name

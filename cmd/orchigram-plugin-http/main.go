@@ -9,7 +9,7 @@ import (
 
 func main() {
 	pluginprotocol.Serve(pluginprotocol.Servers{
-		Control: &pluginruntime.Control{Info: pluginruntime.Info{Name: "http", Version: version.Version, Capabilities: []string{"task.http.request"}}},
+		Control: &pluginruntime.Control{Info: pluginruntime.Info{Name: "http", Version: version.Semver(), Capabilities: []string{"task.http.request"}}},
 		Task:    &pluginruntime.HTTP{},
 	})
 }

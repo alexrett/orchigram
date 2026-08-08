@@ -1,0 +1,30 @@
+apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata:
+  name: operator-smoke
+  labels:
+    orchigram.dev/example: operator-surface
+spec:
+  policies:
+    timeout: 5m
+    maxParallel: 1
+  nodes:
+    - id: execute
+      name: Verify plugin execution
+      uses: exec.run
+      timeout: 30s
+      with:
+        argv: [/usr/bin/printf, "Orchigram remote smoke passed\n"]
+    - id: approval
+      name: Verify durable approval
+      uses: core.approval
+      timeout: 2m
+    - id: finish
+      name: Finish smoke run
+      uses: core.noop
+  edges:
+    - from: execute
+      to: approval
+    - from: approval
+      to: finish
+      when: result.approved

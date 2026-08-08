@@ -69,6 +69,13 @@ func (a *API) apply(ctx context.Context, request *controlv1alpha1.ApplyRequest, 
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
+	// Status is a server projection, not desired state. In particular this keeps
+	// SecretRef resolution state from being persisted when a GET is edited and
+	// applied back through a schema-derived client form.
+	doc, err = doc.WithServerStatus(nil)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
 	diagnostics := []*controlv1alpha1.Diagnostic{}
 	if doc.Kind == "Flow" {
 		flowResource, decodeErr := resource.DecodeFlow(doc.JSON)
@@ -106,7 +113,7 @@ func (a *API) Get(ctx context.Context, request *controlv1alpha1.GetRequest) (*co
 	if err != nil {
 		return nil, rpcError(err)
 	}
-	return resourcePB(doc), nil
+	return a.projectResource(ctx, doc), nil
 }
 
 // List returns a stable resource page.
@@ -117,9 +124,24 @@ func (a *API) List(ctx context.Context, request *controlv1alpha1.ListRequest) (*
 	}
 	result := &controlv1alpha1.ListResponse{Revision: revision, Resources: make([]*controlv1alpha1.ResourceDocument, 0, len(docs))}
 	for _, doc := range docs {
-		result.Resources = append(result.Resources, resourcePB(doc))
+		result.Resources = append(result.Resources, a.projectResource(ctx, doc))
 	}
 	return result, nil
+}
+
+func (a *API) projectResource(ctx context.Context, document resource.Document) *controlv1alpha1.ResourceDocument {
+	if document.Kind != "SecretRef" {
+		return resourcePB(document)
+	}
+	state, backend := a.plugins.SecretStatus(ctx, document.Metadata.Name)
+	var value map[string]any
+	if json.Unmarshal(document.JSON, &value) == nil {
+		value["status"] = map[string]any{"state": state, "backend": backend}
+		if projected, err := json.Marshal(value); err == nil {
+			document.JSON = projected
+		}
+	}
+	return resourcePB(document)
 }
 
 // Delete CAS-deletes a resource.
@@ -253,6 +275,23 @@ func (a *API) ListRuns(ctx context.Context, request *controlv1alpha1.ListRunsReq
 		result.Runs = append(result.Runs, runPB(run))
 	}
 	return result, nil
+}
+
+// RunPlan returns the exact immutable plan pinned by a run.
+func (a *API) RunPlan(ctx context.Context, request *controlv1alpha1.RunRequest) (*controlv1alpha1.CompileResponse, error) {
+	run, err := a.store.GetRun(ctx, request.GetUid())
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	plan, err := a.store.GetPlan(ctx, run.PlanHash)
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	encoded, err := json.Marshal(plan)
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	return &controlv1alpha1.CompileResponse{ExecutionPlanJson: encoded, PlanHash: plan.PlanHash}, nil
 }
 
 // WatchEvents streams durable run events and supports replay from a sequence.
@@ -566,6 +605,9 @@ func (s *runService) Start(ctx context.Context, request *controlv1alpha1.StartRu
 }
 func (s *runService) List(ctx context.Context, request *controlv1alpha1.ListRunsRequest) (*controlv1alpha1.ListRunsResponse, error) {
 	return s.api.ListRuns(ctx, request)
+}
+func (s *runService) Plan(ctx context.Context, request *controlv1alpha1.RunRequest) (*controlv1alpha1.CompileResponse, error) {
+	return s.api.RunPlan(ctx, request)
 }
 func (s *runService) WatchEvents(request *controlv1alpha1.WatchRunRequest, stream grpc.ServerStreamingServer[controlv1alpha1.RunEvent]) error {
 	return s.api.WatchEvents(request, stream)

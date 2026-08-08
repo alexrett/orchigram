@@ -12,7 +12,7 @@ import (
 func main() {
 	runtime := &githubplugin.Runtime{Runner: process.NewRunner()}
 	pluginprotocol.Serve(pluginprotocol.Servers{
-		Control: &pluginruntime.Control{Info: pluginruntime.Info{Name: "github", Version: version.Version, Capabilities: githubplugin.Capabilities}},
+		Control: &pluginruntime.Control{Info: pluginruntime.Info{Name: "github", Version: version.Semver(), Capabilities: githubplugin.Capabilities}},
 		Task:    runtime,
 		Trigger: runtime,
 	})

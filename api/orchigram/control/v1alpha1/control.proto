@@ -188,6 +188,7 @@ service FlowService {
 service RunService {
   rpc Start(StartRunRequest) returns (RunRef);
   rpc List(ListRunsRequest) returns (ListRunsResponse);
+  rpc Plan(RunRequest) returns (CompileResponse);
   rpc WatchEvents(WatchRunRequest) returns (stream RunEvent);
   rpc Approve(ApprovalRequest) returns (google.protobuf.Empty);
   rpc Reject(ApprovalRequest) returns (google.protobuf.Empty);

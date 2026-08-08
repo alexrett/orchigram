@@ -20,7 +20,9 @@ import (
 	clientpkg "github.com/alexrett/orchigram/internal/client"
 	"github.com/alexrett/orchigram/internal/config"
 	"github.com/alexrett/orchigram/internal/contextcfg"
+	"github.com/alexrett/orchigram/internal/contexttransport"
 	"github.com/alexrett/orchigram/internal/daemon"
+	installer "github.com/alexrett/orchigram/internal/install"
 	"github.com/alexrett/orchigram/internal/tui"
 	"github.com/alexrett/orchigram/internal/version"
 	"github.com/google/uuid"
@@ -45,7 +47,17 @@ func NewRoot() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error { return tui.Run(cmd.Context(), client) })
+			return withClient(cmd.Context(), opts, func(client *clientpkg.Client, contextName string) error {
+				contexts, err := contextcfg.Load(opts.contexts)
+				if err != nil {
+					return err
+				}
+				if opts.socket != "" {
+					contextName = "direct"
+					contexts = contextcfg.File{Current: contextName, Contexts: map[string]contextcfg.Context{contextName: {Socket: opts.socket}}}
+				}
+				return tui.RunWithContexts(cmd.Context(), client, contextName, contexts)
+			})
 		},
 	}
 	root.Version = version.String()
@@ -462,12 +474,76 @@ func newContextCommand(opts *options) *cobra.Command {
 		}
 		return nil
 	}}
-	command.AddCommand(get)
+	use := &cobra.Command{Use: "use NAME", Short: "Select the current context", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		file, err := contextcfg.Load(opts.contexts)
+		if err != nil {
+			return err
+		}
+		if _, exists := file.Contexts[args[0]]; !exists {
+			return fmt.Errorf("context %q is not defined", args[0])
+		}
+		file.Current = args[0]
+		if err := contextcfg.Save(opts.contexts, file); err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(cmd.OutOrStdout(), args[0])
+		return err
+	}}
+	var socket, destination, remoteSocket, identity string
+	set := &cobra.Command{Use: "set NAME", Short: "Create or update a local or SSH context", Args: cobra.ExactArgs(1), RunE: func(_ *cobra.Command, args []string) error {
+		if (socket == "") == (destination == "") {
+			return errors.New("configure exactly one of --socket or --ssh-destination")
+		}
+		file, err := contextcfg.Load(opts.contexts)
+		if err != nil {
+			return err
+		}
+		if file.Contexts == nil {
+			file.Contexts = map[string]contextcfg.Context{}
+		}
+		selected := contextcfg.Context{Socket: socket}
+		if destination != "" {
+			if remoteSocket == "" {
+				remoteSocket = "/run/orchigram/orchigram.sock"
+			}
+			selected = contextcfg.Context{SSH: &contextcfg.SSHContext{Destination: destination, Socket: remoteSocket, Identity: identity}}
+		}
+		file.Contexts[args[0]] = selected
+		if file.Current == "" {
+			file.Current = args[0]
+		}
+		return contextcfg.Save(opts.contexts, file)
+	}}
+	set.Flags().StringVar(&socket, "socket", "", "local Unix socket")
+	set.Flags().StringVar(&destination, "ssh-destination", "", "OpenSSH destination, for example operator@host")
+	set.Flags().StringVar(&remoteSocket, "remote-socket", "/run/orchigram/orchigram.sock", "remote Unix socket")
+	set.Flags().StringVar(&identity, "identity", "", "optional SSH identity file")
+	command.AddCommand(get, use, set)
 	return command
 }
 
 func newInstallCommand() *cobra.Command {
-	return &cobra.Command{Use: "install", Short: "Install the local server service", RunE: func(_ *cobra.Command, _ []string) error { return errors.New("installer is implemented in phase 6") }}
+	var pluginDir, root string
+	var noStart bool
+	command := &cobra.Command{Use: "install", Short: "Install the hardened local systemd service", RunE: func(cmd *cobra.Command, _ []string) error {
+		result, err := installer.Run(cmd.Context(), installer.Options{Root: root, PluginDir: pluginDir, Start: !noStart})
+		if err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "binary: %s\nunit: %s\nsocket: %s\n", result.Binary, result.Unit, result.Socket); err != nil {
+			return err
+		}
+		for _, warning := range result.Warnings {
+			if _, err := fmt.Fprintln(cmd.ErrOrStderr(), "warning:", warning); err != nil {
+				return err
+			}
+		}
+		return nil
+	}}
+	command.Flags().StringVar(&pluginDir, "plugin-dir", "", "directory containing the four first-party plugin executables")
+	command.Flags().StringVar(&root, "root", "/", "installation root (used for image construction and tests)")
+	command.Flags().BoolVar(&noStart, "no-start", false, "write installation files without starting systemd")
+	return command
 }
 
 func withClient(ctx context.Context, opts *options, fn func(*clientpkg.Client, string) error) error {
@@ -485,19 +561,21 @@ func withClient(ctx context.Context, opts *options, fn func(*clientpkg.Client, s
 		if !ok {
 			return fmt.Errorf("context %q is not defined", contextName)
 		}
-		if selected.SSH != nil {
-			return errors.New("SSH contexts are implemented in phase 6")
+		connection, err := contexttransport.Connect(ctx, selected)
+		if err != nil {
+			return err
 		}
-		socketPath = selected.Socket
+		defer func() { _ = connection.Close() }()
+		return fn(connection.Client, contextName)
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	client, err := clientpkg.DialUnix(dialCtx, socketPath)
+	connection, err := contexttransport.Connect(dialCtx, contextcfg.Context{Socket: socketPath})
 	if err != nil {
 		return err
 	}
-	defer func() { _ = client.Close() }()
-	return fn(client, contextName)
+	defer func() { _ = connection.Close() }()
+	return fn(connection.Client, contextName)
 }
 
 func requestMeta(contextName string) *controlv1alpha1.RequestMeta {

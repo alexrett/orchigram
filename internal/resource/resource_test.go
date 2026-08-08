@@ -1,6 +1,7 @@
 package resource
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -55,5 +56,24 @@ spec:
 `))
 	if err == nil || !strings.Contains(err.Error(), "exactly one") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestWithServerStatusRemovesClientProjection(t *testing.T) {
+	t.Parallel()
+	doc, err := DecodeStrict([]byte(strings.Replace(validFlow, "spec:\n", "status: {state: client-controlled}\nspec:\n", 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err = doc.WithServerStatus(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var projection map[string]any
+	if err := json.Unmarshal(doc.JSON, &projection); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := projection["status"]; exists {
+		t.Fatalf("client status survived normalization: %s", doc.JSON)
 	}
 }

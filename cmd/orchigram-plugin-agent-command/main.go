@@ -10,7 +10,7 @@ import (
 
 func main() {
 	pluginprotocol.Serve(pluginprotocol.Servers{
-		Control: &pluginruntime.Control{Info: pluginruntime.Info{Name: "agent-command", Version: version.Version, Capabilities: []string{"agent.codex", "agent.claude", "agent.command"}}},
+		Control: &pluginruntime.Control{Info: pluginruntime.Info{Name: "agent-command", Version: version.Semver(), Capabilities: []string{"agent.codex", "agent.claude", "agent.command"}}},
 		Agent:   &pluginruntime.Agent{Runner: process.NewRunner()},
 	})
 }

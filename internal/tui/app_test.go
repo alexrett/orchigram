@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -83,7 +84,9 @@ spec:
 	runResult := make(chan error, 1)
 	go func() { runResult <- runWithApplication(tuiContext, client, application) }()
 	time.Sleep(100 * time.Millisecond)
-	for range 4 {
+	// Contexts/current, Flows/flow, Triggers, Repositories,
+	// AgentProfiles, and the Runs heading precede the run item.
+	for range 8 {
 		postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyDown, 0, tcell.ModNone))
 	}
 	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
@@ -106,8 +109,16 @@ spec:
 
 func postTUIEvent(t *testing.T, screen tcell.SimulationScreen, event tcell.Event) {
 	t.Helper()
-	if err := screen.PostEvent(event); err != nil {
-		t.Fatal(err)
+	deadline := time.Now().Add(time.Second)
+	for {
+		err := screen.PostEvent(event)
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, tcell.ErrEventQFull) || time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
