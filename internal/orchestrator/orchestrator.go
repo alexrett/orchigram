@@ -95,6 +95,15 @@ func (o *Orchestrator) AcceptTrigger(ctx context.Context, triggerUID, occurrence
 // AcceptProviderTrigger applies the same immutable acceptance boundary while
 // also persisting the provider cursor under Trigger generation validation.
 func (o *Orchestrator) AcceptProviderTrigger(ctx context.Context, triggerUID string, triggerGeneration uint64, occurrenceID, flowName, namespace string, input json.RawMessage, cursor string) (store.Receipt, error) {
+	if _, err := o.store.ReceiptByOccurrence(ctx, triggerUID, occurrenceID); err == nil {
+		// Re-enter the store transaction so Trigger generation/enabled state and
+		// the replayed provider cursor are validated and committed together. The
+		// existing receipt guarantees this compatibility method cannot create an
+		// unpinned command, even if the accepted Flow has since been deleted.
+		return o.store.AcceptProviderTrigger(ctx, triggerUID, triggerGeneration, occurrenceID, flowName, namespace, input, cursor)
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return store.Receipt{}, err
+	}
 	plan, err := o.compileCurrentFlow(ctx, flowName, namespace)
 	if err != nil {
 		return store.Receipt{}, err

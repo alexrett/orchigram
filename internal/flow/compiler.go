@@ -189,7 +189,7 @@ func (c *Compiler) Compile(input resource.Flow) (ExecutionPlan, []Diagnostic) {
 			if binder, ok := c.capabilities.(ActionBinder); ok {
 				resolved, bindingDiagnostics := binder.BindAction(node.Uses, node.With)
 				for _, diagnostic := range bindingDiagnostics {
-					diagnostic.Path = path + ".with." + strings.TrimPrefix(diagnostic.Path, "config.")
+					diagnostic.Path = nodeConfigDiagnosticPath(path, diagnostic.Path)
 					diagnostics = append(diagnostics, diagnostic)
 				}
 				if len(bindingDiagnostics) == 0 {
@@ -197,7 +197,7 @@ func (c *Compiler) Compile(input resource.Flow) (ExecutionPlan, []Diagnostic) {
 				}
 			} else if validator, ok := c.capabilities.(ActionValidator); ok {
 				for _, diagnostic := range validator.ValidateAction(node.Uses, node.With) {
-					diagnostic.Path = path + ".with." + strings.TrimPrefix(diagnostic.Path, "config.")
+					diagnostic.Path = nodeConfigDiagnosticPath(path, diagnostic.Path)
 					diagnostics = append(diagnostics, diagnostic)
 				}
 			}
@@ -320,6 +320,13 @@ func (c *Compiler) Compile(input resource.Flow) (ExecutionPlan, []Diagnostic) {
 		plan.PlanHash = hex.EncodeToString(digest[:])
 	}
 	return plan, diagnostics
+}
+
+func nodeConfigDiagnosticPath(nodePath, pluginPath string) string {
+	if pluginPath == "" || pluginPath == "config" {
+		return nodePath + ".with"
+	}
+	return nodePath + ".with." + strings.TrimPrefix(pluginPath, "config.")
 }
 
 func validateMappings(nodeIndex int, node resource.FlowNode, nodes map[string]resource.FlowNode) []Diagnostic {
