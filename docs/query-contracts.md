@@ -15,8 +15,11 @@ mixes two revisions. Invalid, oversized, or filter-mismatched tokens return
 
 Resource watches replay durable events strictly after `after_revision` and
 retain global revision order. Kind and namespace filters apply to `ADDED`, spec
-`MODIFIED`, status-only `MODIFIED`, and `DELETED` events. A delete event has no
-resource document. The v0.1 store does not compact this event log.
+`MODIFIED`, status-only `MODIFIED`, and `DELETED` events. A delete event carries
+a tombstone `ResourceDocument` with kind, namespace, name, UID, and deletion
+revision but no JSON body. This lets a stateless watch client remove the exact
+object without retaining a separate UID index. The v0.1 store does not compact
+this event log.
 
 Export returns deterministic multi-document YAML in request-key order. Server
 status is removed because it is not desired state and cannot be applied by a

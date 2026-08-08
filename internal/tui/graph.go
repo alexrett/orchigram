@@ -48,6 +48,7 @@ func (g *Graph) SetPlan(plan flow.ExecutionPlan) *Graph {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.plan = plan
+	g.status = map[string]string{}
 	g.rects, g.order = layout(plan)
 	if len(g.order) > 0 {
 		g.selected = g.order[0]

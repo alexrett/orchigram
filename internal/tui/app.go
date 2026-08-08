@@ -43,6 +43,7 @@ func RunWithContexts(ctx context.Context, client *clientpkg.Client, contextName 
 }
 
 type navigationEntry struct {
+	key      string
 	label    string
 	activate func()
 }
@@ -53,24 +54,45 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 	inspector := tview.NewTextView().SetDynamicColors(true).SetWrap(true)
 	inspector.SetBorder(true).SetTitle(" Inspector ")
 	events := tview.NewTextView().SetDynamicColors(true)
-	events.SetBorder(true).SetTitle(" Events ")
-	help := tview.NewTextView().SetDynamicColors(true).SetText(" [yellow]:[-] commands  [yellow]/[-] filter  [yellow]?[-] help  [yellow]Enter[-] inspect  [yellow]g[-] graph  [yellow]l/e[-] logs/events  [yellow]y[-] YAML  [yellow]E[-] edit  [yellow]a/r/c[-] decide/cancel  [yellow]q[-] quit")
-	navigation := tview.NewList().ShowSecondaryText(false)
+	events.SetBorder(true).SetTitle(" Notifications ")
+	liveStatus := tview.NewTextView().SetDynamicColors(true)
+	help := tview.NewTextView().SetDynamicColors(true).SetText(" [yellow]:[-] commands  [yellow]/[-] filter  [yellow]?[-] help  [yellow]Enter[-] inspect  [yellow]g[-] graph  [yellow]e/t/f/l[-] events/attempts/artifacts/logs  [yellow]y/E[-] YAML/edit  [yellow]a/r/c[-] decide/cancel  [yellow]q[-] quit")
+	navigation := tview.NewList().ShowSecondaryText(false).SetUseStyleTags(false, false)
 	navigation.SetBorder(true).SetTitle(" Resources ")
+	live := newLiveController(client)
+	latest, err := live.bootstrap(ctx)
+	if err != nil {
+		return err
+	}
 	currentRun := ""
 	var currentResource *controlv1alpha1.ResourceDocument
-	var cancelRunWatch context.CancelFunc
 	entries := []navigationEntry{}
-	add := func(label string, activate func()) {
-		entries = append(entries, navigationEntry{label: label, activate: activate})
-	}
+	visibleEntryKeys := []string{}
+	currentFilter := ""
+	activeNavigationKey := ""
 	rebuild := func(filter string) {
+		currentFilter = strings.ToLower(strings.TrimSpace(filter))
+		preserveKey := activeNavigationKey
+		currentIndex := navigation.GetCurrentItem()
+		if currentIndex >= 0 && currentIndex < len(visibleEntryKeys) {
+			preserveKey = visibleEntryKeys[currentIndex]
+		}
 		navigation.Clear()
-		filter = strings.ToLower(strings.TrimSpace(filter))
+		visibleEntryKeys = visibleEntryKeys[:0]
+		targetIndex := -1
 		for _, entry := range entries {
-			if filter == "" || strings.Contains(strings.ToLower(entry.label), filter) {
+			if currentFilter == "" || strings.Contains(strings.ToLower(entry.label), currentFilter) {
+				if entry.key == preserveKey {
+					targetIndex = len(visibleEntryKeys)
+				}
+				visibleEntryKeys = append(visibleEntryKeys, entry.key)
 				navigation.AddItem(entry.label, "", 0, entry.activate)
 			}
+		}
+		if targetIndex >= 0 {
+			navigation.SetCurrentItem(targetIndex)
+		} else if currentIndex >= 0 && len(visibleEntryKeys) > 0 {
+			navigation.SetCurrentItem(min(currentIndex, len(visibleEntryKeys)-1))
 		}
 	}
 
@@ -84,179 +106,225 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 		application.SetFocus(modal)
 	})
 
-	add("Contexts", nil)
-	contextNames := []string{contextName}
-	if contexts != nil {
-		contextNames = contextNames[:0]
-		for name := range contexts.Contexts {
-			contextNames = append(contextNames, name)
-		}
-		sort.Strings(contextNames)
-	}
-	for _, name := range contextNames {
-		name := name
-		selected := contextcfg.Context{}
-		if contexts != nil {
-			selected = contexts.Contexts[name]
-		}
-		marker := ""
-		if name == contextName {
-			marker = "  [connected]"
-		}
-		add("  "+name+marker, func() {
-			currentResource = nil
-			transport := "the active gRPC route"
-			if selected.Socket != "" {
-				transport = "Unix socket " + selected.Socket
-			}
-			if selected.SSH != nil {
-				transport = "OpenSSH StreamLocal to " + selected.SSH.Destination + ":" + selected.SSH.Socket
-			}
-			inspector.SetText(fmt.Sprintf("[yellow::b]Context %s[-:-:-]\n\n%s\n\nUse :contexts to locate contexts and `orchigram context use` to reconnect on another route.", escape(name), escape(transport)))
-		})
-	}
-	flows, err := client.Resources.List(ctx, &controlv1alpha1.ListRequest{Kind: "Flow", Namespace: "default", Limit: 200})
-	if err != nil {
-		return err
-	}
-	add("Flows", nil)
-	for _, item := range flows.GetResources() {
-		item := item
-		add("  "+item.GetKey().GetName(), func() {
-			currentRun = ""
-			currentResource = item
-			if cancelRunWatch != nil {
-				cancelRunWatch()
-			}
-			flowResource, decodeErr := resource.DecodeFlow(item.GetJson())
-			if decodeErr != nil {
-				events.SetText("[red]" + escape(decodeErr.Error()))
-				return
-			}
-			plan, diagnostics := flow.NewCompiler(nil).Compile(flowResource)
-			if flow.HasErrors(diagnostics) {
-				events.SetText("[red]" + escape(diagnostics[0].Message))
-				return
-			}
-			graph.SetPlan(plan)
-			if selected, ok := graph.Selected(); ok {
-				setInspector(selected)
-			}
-			application.SetFocus(graph)
-		})
-	}
-	triggers, err := client.Resources.List(ctx, &controlv1alpha1.ListRequest{Kind: "Trigger", Namespace: "default", Limit: 200})
-	if err != nil {
-		return err
-	}
-	add("Triggers", nil)
-	for _, item := range triggers.GetResources() {
-		item := item
-		add("  "+item.GetKey().GetName(), func() {
-			currentRun = ""
-			currentResource = item
-			if cancelRunWatch != nil {
-				cancelRunWatch()
-			}
-			openTriggerDetail(ctx, application, pages, client, item, inspector, events, navigation)
-		})
-	}
-	for _, kind := range []string{"Repository", "AgentProfile", "PluginInstallation"} {
-		response, listErr := client.Resources.List(ctx, &controlv1alpha1.ListRequest{Kind: kind, Namespace: "default", Limit: 200})
-		if listErr != nil {
-			return listErr
-		}
-		heading := map[string]string{"Repository": "Repositories", "AgentProfile": "AgentProfiles", "PluginInstallation": "PluginInstallations"}[kind]
-		add(heading, nil)
-		for _, item := range response.GetResources() {
-			item := item
-			add("  "+item.GetKey().GetName(), func() {
-				currentRun = ""
-				currentResource = item
-				showResourceInspector(inspector, item)
-				openResourceDetail(application, pages, client, item, inspector, events, navigation)
-			})
-		}
-	}
-	runs, err := client.Runs.List(ctx, &controlv1alpha1.ListRunsRequest{Limit: 200})
-	if err != nil {
-		return err
-	}
-	add("Runs", nil)
-	for _, run := range runs.GetRuns() {
-		run := run
-		add(fmt.Sprintf("  %s  [%s]", short(run.GetUid()), run.GetPhase()), func() {
-			currentRun = run.GetUid()
-			currentResource = nil
-			inspector.SetText(fmt.Sprintf("[yellow::b]Run %s[-:-:-]\n\nFlow: %s\nPhase: %s\nPlan: %s\nInterpreter: %s", run.GetUid(), run.GetFlow(), run.GetPhase(), run.GetPlanHash(), run.GetInterpreterVersion()))
-			planResponse, planErr := client.Runs.Plan(ctx, &controlv1alpha1.RunRequest{Uid: run.GetUid()})
-			if planErr == nil {
-				var plan flow.ExecutionPlan
-				if json.Unmarshal(planResponse.GetExecutionPlanJson(), &plan) == nil {
-					graph.SetPlan(plan)
+	var handleSnapshot func(liveSnapshot)
+	buildEntries := func(snapshot liveSnapshot) []navigationEntry {
+		result := []navigationEntry{}
+		add := func(key, label string, activate func()) {
+			if activate != nil {
+				operation := activate
+				activate = func() {
+					activeNavigationKey = key
+					operation()
 				}
 			}
-			if cancelRunWatch != nil {
-				cancelRunWatch()
+			result = append(result, navigationEntry{key: key, label: label, activate: activate})
+		}
+
+		add("heading/contexts", "Contexts", nil)
+		contextNames := []string{contextName}
+		if contexts != nil {
+			contextNames = contextNames[:0]
+			for name := range contexts.Contexts {
+				contextNames = append(contextNames, name)
 			}
-			watchContext, cancel := context.WithCancel(ctx)
-			cancelRunWatch = cancel
-			go watchRun(watchContext, application, client, graph, events, run.GetUid())
-			application.SetFocus(graph)
+			sort.Strings(contextNames)
+		}
+		for _, name := range contextNames {
+			name := name
+			selected := contextcfg.Context{}
+			if contexts != nil {
+				selected = contexts.Contexts[name]
+			}
+			marker := ""
+			if name == contextName {
+				marker = "  [connected]"
+			}
+			add("context/"+name, "  "+name+marker, func() {
+				currentRun, currentResource = "", nil
+				transport := "the active gRPC route"
+				if selected.Socket != "" {
+					transport = "Unix socket " + selected.Socket
+				}
+				if selected.SSH != nil {
+					transport = "OpenSSH StreamLocal to " + selected.SSH.Destination + ":" + selected.SSH.Socket
+				}
+				inspector.SetText(fmt.Sprintf("[yellow::b]Context %s[-:-:-]\n\n%s\n\nThis process is connected to the marked context.", escape(name), escape(transport)))
+			})
+		}
+
+		resourceGroups := []struct{ kind, heading string }{
+			{kind: "Flow", heading: "Flows"}, {kind: "Trigger", heading: "Triggers"}, {kind: "Repository", heading: "Repositories"},
+			{kind: "AgentProfile", heading: "AgentProfiles"}, {kind: "PluginInstallation", heading: "PluginInstallations"},
+		}
+		for _, group := range resourceGroups {
+			add("heading/resources/"+group.kind, group.heading, nil)
+			for _, document := range resourcesForKind(snapshot, group.kind) {
+				document := document
+				key := "resource/" + resourceLiveKey(document.GetKey())
+				label := "  " + resourceDisplayName(document.GetKey())
+				switch group.kind {
+				case "Flow":
+					add(key, label, func() {
+						currentRun, currentResource = "", cloneMessage(document)
+						flowResource, decodeErr := resource.DecodeFlow(document.GetJson())
+						if decodeErr != nil {
+							events.SetText("[red]" + escape(decodeErr.Error()))
+							return
+						}
+						plan, diagnostics := flow.NewCompiler(nil).Compile(flowResource)
+						if flow.HasErrors(diagnostics) {
+							events.SetText("[red]" + escape(diagnostics[0].Message))
+							return
+						}
+						graph.SetPlan(plan)
+						if selectedNode, ok := graph.Selected(); ok {
+							setInspector(selectedNode)
+						}
+						application.SetFocus(graph)
+					})
+				case "Trigger":
+					add(key, label, func() {
+						currentRun, currentResource = "", cloneMessage(document)
+						openTriggerDetail(ctx, application, pages, client, currentResource, inspector, events, navigation)
+					})
+				default:
+					add(key, label, func() {
+						currentRun, currentResource = "", cloneMessage(document)
+						showResourceInspector(inspector, currentResource)
+						openResourceDetail(application, pages, client, currentResource, inspector, events, navigation)
+					})
+				}
+			}
+		}
+
+		add("heading/runs", "Runs", nil)
+		for _, run := range sortedRuns(snapshot) {
+			run := run
+			key := "run/" + run.GetUid()
+			add(key, fmt.Sprintf("  %s  [%s]", short(run.GetUid()), run.GetPhase()), func() {
+				currentRun, currentResource = run.GetUid(), nil
+				inspector.SetText(runInspectorText(run))
+				planContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+				defer cancel()
+				planResponse, planErr := client.Runs.Plan(planContext, &controlv1alpha1.RunRequest{Uid: run.GetUid()})
+				if planErr != nil {
+					events.SetText("[red]Unable to load the pinned run plan")
+					return
+				}
+				var plan flow.ExecutionPlan
+				if decodeErr := json.Unmarshal(planResponse.GetExecutionPlanJson(), &plan); decodeErr != nil {
+					events.SetText("[red]Pinned run plan is invalid")
+					return
+				}
+				graph.SetPlan(plan)
+				applyRunEventStatuses(graph, snapshot.RunEvents[run.GetUid()])
+				live.ensureRunHistory(ctx, run.GetUid(), handleSnapshot)
+				application.SetFocus(graph)
+			})
+		}
+
+		add("heading/plugins", "Plugins", nil)
+		for _, plugin := range sortedPlugins(snapshot) {
+			plugin := plugin
+			key := "plugin/" + pluginLiveKey(plugin)
+			add(key, fmt.Sprintf("  %s:%s [%s]", plugin.GetName(), plugin.GetVersion(), plugin.GetState()), func() {
+				currentRun, currentResource = "", nil
+				inspector.SetText(fmt.Sprintf("[yellow::b]Plugin %s[-:-:-]\n\nVersion: %s\nState: %s\nDigest: %s\nCapabilities: %s", escape(plugin.GetName()), escape(plugin.GetVersion()), escape(plugin.GetState()), escape(plugin.GetDigest()), escape(strings.Join(plugin.GetCapabilities(), ", "))))
+				openPluginDetail(ctx, application, pages, client, plugin, events, navigation)
+			})
+		}
+		add("heading/resources/SecretRef", "SecretRefs", nil)
+		for _, document := range resourcesForKind(snapshot, "SecretRef") {
+			document := document
+			key := "resource/" + resourceLiveKey(document.GetKey())
+			add(key, "  "+resourceDisplayName(document.GetKey()), func() {
+				currentRun, currentResource = "", cloneMessage(document)
+				showResourceInspector(inspector, currentResource)
+				openResourceDetail(application, pages, client, currentResource, inspector, events, navigation)
+			})
+		}
+
+		info := snapshot.System
+		health := "unknown"
+		if snapshot.Health != nil {
+			health = "degraded"
+			if snapshot.Health.GetReady() {
+				health = "ready"
+			}
+		}
+		add("system", "System  ["+health+"]", func() {
+			currentRun, currentResource = "", nil
+			if info == nil {
+				inspector.SetText("[yellow]System information is reconnecting")
+				return
+			}
+			inspector.SetText(fmt.Sprintf("[yellow::b]Orchigram %s[-:-:-]\n\nHost: %s\nOS/Arch: %s/%s\nPID: %d\nProtocol: %s\nCapabilities: %s", escape(info.GetVersion()), escape(info.GetHostname()), escape(info.GetOs()), escape(info.GetArchitecture()), info.GetProcessId(), escape(info.GetProtocolVersion()), escape(strings.Join(info.GetCapabilities(), ", "))))
+			openSystemDetail(ctx, application, pages, client, info, events, navigation)
+		})
+		return result
+	}
+
+	handleSnapshot = func(snapshot liveSnapshot) {
+		application.QueueUpdateDraw(func() {
+			latest = snapshot
+			entries = buildEntries(snapshot)
+			if currentResource != nil {
+				selectedGeneration := currentResource.GetGeneration()
+				key := resourceLiveKey(currentResource.GetKey())
+				if updated := snapshot.Resources[key]; updated != nil {
+					currentResource = cloneMessage(updated)
+					if currentResource.GetKey().GetKind() == "Flow" && currentResource.GetGeneration() != selectedGeneration {
+						flowResource, decodeErr := resource.DecodeFlow(currentResource.GetJson())
+						if decodeErr != nil {
+							events.SetText("[red]Unable to decode the updated Flow")
+						} else if plan, diagnostics := flow.NewCompiler(nil).Compile(flowResource); flow.HasErrors(diagnostics) {
+							events.SetText("[red]The updated Flow is invalid")
+						} else {
+							graph.SetPlan(plan)
+							if selectedNode, ok := graph.Selected(); ok {
+								setInspector(selectedNode)
+							}
+						}
+					} else if currentResource.GetKey().GetKind() != "Flow" {
+						showResourceInspector(inspector, currentResource)
+					}
+				} else {
+					currentResource = nil
+					activeNavigationKey = ""
+					inspector.SetText("[yellow]The selected resource was deleted")
+				}
+			}
+			if currentRun != "" {
+				if run := snapshot.Runs[currentRun]; run != nil {
+					applyRunEventStatuses(graph, snapshot.RunEvents[currentRun])
+				} else {
+					currentRun = ""
+					activeNavigationKey = ""
+					inspector.SetText("[yellow]The selected run is no longer retained")
+				}
+			}
+			showLiveStatus(liveStatus, snapshot, currentRun)
+			rebuild(currentFilter)
 		})
 	}
-	plugins, err := client.Plugins.List(ctx, &emptypb.Empty{})
-	if err != nil {
-		return err
-	}
-	add("Plugins", nil)
-	for _, item := range plugins.GetPlugins() {
-		item := item
-		add(fmt.Sprintf("  %s:%s [%s]", item.GetName(), item.GetVersion(), item.GetState()), func() {
-			currentResource = nil
-			inspector.SetText(fmt.Sprintf("[yellow::b]Plugin %s[-:-:-]\n\nVersion: %s\nState: %s\nDigest: %s\nCapabilities: %s", escape(item.GetName()), escape(item.GetVersion()), escape(item.GetState()), escape(item.GetDigest()), escape(strings.Join(item.GetCapabilities(), ", "))))
-			openPluginDetail(ctx, application, pages, client, item, events, navigation)
-		})
-	}
-	secrets, err := client.Resources.List(ctx, &controlv1alpha1.ListRequest{Kind: "SecretRef", Namespace: "default", Limit: 200})
-	if err != nil {
-		return err
-	}
-	add("SecretRefs", nil)
-	for _, item := range secrets.GetResources() {
-		item := item
-		add("  "+item.GetKey().GetName(), func() {
-			currentRun = ""
-			currentResource = item
-			showResourceInspector(inspector, item)
-			openResourceDetail(application, pages, client, item, inspector, events, navigation)
-		})
-	}
-	info, err := client.System.Info(ctx, &emptypb.Empty{})
-	if err != nil {
-		return err
-	}
-	add("System", func() {
-		currentResource = nil
-		inspector.SetText(fmt.Sprintf("[yellow::b]Orchigram %s[-:-:-]\n\nHost: %s\nOS/Arch: %s/%s\nPID: %d\nProtocol: %s\nCapabilities: %s", escape(info.GetVersion()), escape(info.GetHostname()), escape(info.GetOs()), escape(info.GetArchitecture()), info.GetProcessId(), escape(info.GetProtocolVersion()), escape(strings.Join(info.GetCapabilities(), ", "))))
-		openSystemDetail(ctx, application, pages, client, info, events, navigation)
-	})
+	entries = buildEntries(latest)
 	rebuild("")
-	if len(flows.GetResources()) > 0 {
-		flowResource, decodeErr := resource.DecodeFlow(flows.GetResources()[0].GetJson())
+	showLiveStatus(liveStatus, latest, "")
+	if flows := resourcesForKind(latest, "Flow"); len(flows) > 0 {
+		flowResource, decodeErr := resource.DecodeFlow(flows[0].GetJson())
 		if decodeErr == nil {
 			plan, diagnostics := flow.NewCompiler(nil).Compile(flowResource)
 			if !flow.HasErrors(diagnostics) {
 				graph.SetPlan(plan)
-				if selected, ok := graph.Selected(); ok {
-					setInspector(selected)
+				if selectedNode, ok := graph.Selected(); ok {
+					setInspector(selectedNode)
 				}
 			}
 		}
 	}
 
 	body := tview.NewFlex().AddItem(navigation, 25, 0, false).AddItem(graph, 0, 1, true).AddItem(inspector, 34, 0, false)
-	root := tview.NewFlex().SetDirection(tview.FlexRow).AddItem(help, 1, 0, false).AddItem(body, 0, 1, true).AddItem(events, 4, 0, false)
+	root := tview.NewFlex().SetDirection(tview.FlexRow).AddItem(help, 1, 0, false).AddItem(body, 0, 1, true).AddItem(events, 3, 0, false).AddItem(liveStatus, 2, 0, false)
 	pages.AddPage("main", root, true, true)
 	compact := false
 	application.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
@@ -318,9 +386,23 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 			case 'g':
 				application.SetFocus(graph)
 				return nil
-			case 'e', 'l':
+			case 'e':
+				if currentRun != "" {
+					openRunEvents(application, pages, latest, currentRun, graph)
+					return nil
+				}
 				application.SetFocus(events)
 				return nil
+			case 't':
+				if currentRun != "" {
+					openRunAttempts(ctx, application, pages, client, currentRun, events)
+					return nil
+				}
+			case 'f', 'l':
+				if currentRun != "" {
+					openRunArtifacts(ctx, application, pages, client, currentRun, event.Rune() == 'l', events)
+					return nil
+				}
 			case 'y':
 				if currentResource != nil {
 					openYAML(application, pages, currentResource, navigation)
@@ -338,7 +420,7 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 					return nil
 				}
 			case '?':
-				modal := tview.NewModal().SetText("Orchigram keys\n\n: command palette\n/ filter resources\nEnter: inspect or drill down\nh/j/k/l or arrows: select graph node\nw/a/s/d: pan graph (d describes a selected resource)\na/r: approve or reject selected run\nc: cancel selected run\ng: graph, l/e: logs/events, y: YAML, E: edit form\nEsc: go back, q: quit").AddButtons([]string{"Close"})
+				modal := tview.NewModal().SetText("Orchigram keys\n\n: command palette\n/ filter resources\nEnter: inspect or drill down\nh/j/k/l or arrows: select graph node\nw/a/s/d: pan graph (d describes a selected resource)\na/r: approve or reject selected run\nc: cancel selected run\ng: graph\ne: structured events, t: attempts, f: artifacts, l: logs\ny: YAML, E: edit form\nEsc: go back, q: quit").AddButtons([]string{"Close"})
 				modal.SetDoneFunc(func(_ int, _ string) { pages.RemovePage("help"); application.SetFocus(graph) })
 				pages.AddPage("help", centered(modal, 58, 16), true, true)
 				application.SetFocus(modal)
@@ -347,6 +429,9 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 		}
 		return event
 	})
+	liveContext, stopLive := context.WithCancel(ctx)
+	defer stopLive()
+	live.run(liveContext, handleSnapshot)
 	go func() { <-ctx.Done(); application.QueueUpdateDraw(application.Stop) }()
 	return application.SetRoot(pages, true).SetFocus(navigation).Run()
 }
@@ -429,6 +514,10 @@ func openSystemDetail(ctx context.Context, application *tview.Application, pages
 
 func showResourceInspector(inspector *tview.TextView, document *controlv1alpha1.ResourceDocument) {
 	inspector.SetText(fmt.Sprintf("[yellow::b]%s %s[-:-:-]\n\n[gray]UID[-]              %s\n[gray]Resource version[-] %d\n[gray]Generation[-]       %d\n\nPress Enter for schema fields or y for the read-only YAML projection.", escape(document.GetKey().GetKind()), escape(document.GetKey().GetName()), escape(document.GetKey().GetUid()), document.GetResourceVersion(), document.GetGeneration()))
+}
+
+func runInspectorText(run *controlv1alpha1.RunSummary) string {
+	return fmt.Sprintf("[yellow::b]Run %s[-:-:-]\n\nFlow: %s\nPhase: %s\nPlan: %s\nInterpreter: %s", escape(run.GetUid()), escape(run.GetFlow()), escape(run.GetPhase()), escape(run.GetPlanHash()), escape(run.GetInterpreterVersion()))
 }
 
 func openResourceDetail(application *tview.Application, pages *tview.Pages, client *clientpkg.Client, document *controlv1alpha1.ResourceDocument, inspector, events *tview.TextView, returnFocus tview.Primitive) {
@@ -712,76 +801,6 @@ func valueOr(value, fallback string) string {
 		return fallback
 	}
 	return value
-}
-
-func watchRun(ctx context.Context, application *tview.Application, client *clientpkg.Client, graph *Graph, events *tview.TextView, runUID string) {
-	var sequence uint64
-	backoff := 250 * time.Millisecond
-	for ctx.Err() == nil {
-		stream, err := client.Runs.WatchEvents(ctx, &controlv1alpha1.WatchRunRequest{Uid: runUID, AfterSequence: sequence})
-		if err != nil {
-			if !waitForReconnect(ctx, application, events, err, &backoff) {
-				return
-			}
-			continue
-		}
-		for ctx.Err() == nil {
-			event, receiveErr := stream.Recv()
-			if receiveErr != nil {
-				if !waitForReconnect(ctx, application, events, receiveErr, &backoff) {
-					return
-				}
-				break
-			}
-			sequence = event.GetSequence()
-			backoff = 250 * time.Millisecond
-			status := ""
-			switch event.GetType() {
-			case "node.started":
-				status = "running"
-			case "node.completed", "approval.approved":
-				status = "completed"
-			case "node.failed":
-				status = "failed"
-			case "approval.waiting":
-				status = "waiting"
-			case "approval.rejected":
-				status = "rejected"
-			case "node.skipped":
-				status = "skipped"
-			}
-			application.QueueUpdateDraw(func() {
-				if status != "" {
-					graph.SetStatus(event.GetNodeId(), status)
-				}
-				_, _ = fmt.Fprintf(events, "[gray]%d[-] [yellow]%s[-] %s\n", event.GetSequence(), escape(event.GetNodeId()), escape(event.GetType()))
-			})
-			if strings.HasPrefix(event.GetType(), "run.") && event.GetType() != "run.accepted" {
-				return
-			}
-		}
-	}
-}
-
-func waitForReconnect(ctx context.Context, application *tview.Application, events *tview.TextView, cause error, backoff *time.Duration) bool {
-	if ctx.Err() != nil {
-		return false
-	}
-	message := cause.Error()
-	application.QueueUpdateDraw(func() {
-		_, _ = fmt.Fprintf(events, "[yellow]Connection interrupted (%s); retrying…[-]\n", escape(message))
-	})
-	timer := time.NewTimer(*backoff)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-	}
-	if *backoff < 10*time.Second {
-		*backoff *= 2
-	}
-	return true
 }
 
 func openDecisionForm(application *tview.Application, pages *tview.Pages, client *clientpkg.Client, runUID, decision string, events *tview.TextView, returnFocus tview.Primitive) {
