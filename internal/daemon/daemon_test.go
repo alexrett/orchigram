@@ -448,9 +448,194 @@ spec:
 		t.Fatal(err)
 	}
 	waitForRunEvent(t, client, run.GetUid(), 0, "run.succeeded")
-	artifact, err := os.ReadFile(filepath.Join(cfg.StateDir, "artifacts", run.GetUid(), "execute", "attempt-1", "raw.log")) //nolint:gosec // Test-owned daemon state path.
+	artifact, err := os.ReadFile(filepath.Join(cfg.StateDir, "artifacts", run.GetUid(), "execute", "iteration-0", "attempt-1", "raw.log")) //nolint:gosec // Test-owned daemon state path.
 	if err != nil || string(artifact) != "durable-plugin-flow\n" {
 		t.Fatalf("artifact=%q err=%v", artifact, err)
+	}
+	attempts, err := client.Runs.ListAttempts(context.Background(), &controlv1alpha1.ListAttemptsRequest{RunUid: run.GetUid()})
+	if err != nil || len(attempts.GetAttempts()) != 1 {
+		t.Fatalf("attempts=%+v err=%v", attempts, err)
+	}
+	attempt := attempts.GetAttempts()[0]
+	if attempt.GetNodeId() != "execute" || attempt.GetLogicalIteration() != 0 || attempt.GetAttempt() != 1 || attempt.GetFrameworkAttempt() != 1 || attempt.GetPhase() != "succeeded" || attempt.GetExitOutcome() != "exited" {
+		t.Fatalf("attempt evidence=%+v", attempt)
+	}
+	artifacts, err := client.Runs.ListArtifacts(context.Background(), &controlv1alpha1.ListArtifactsRequest{RunUid: run.GetUid()})
+	if err != nil || len(artifacts.GetArtifacts()) != 1 {
+		t.Fatalf("artifacts=%+v err=%v", artifacts, err)
+	}
+	metadata := artifacts.GetArtifacts()[0]
+	if metadata.GetNodeId() != "execute" || metadata.GetAttempt() != 1 || metadata.GetName() != "raw.log" || metadata.GetSizeBytes() != int64(len(artifact)) {
+		t.Fatalf("artifact metadata=%+v", metadata)
+	}
+	digest := sha256.Sum256(artifact)
+	if metadata.GetSha256() != hex.EncodeToString(digest[:]) {
+		t.Fatalf("artifact digest=%q want=%q", metadata.GetSha256(), hex.EncodeToString(digest[:]))
+	}
+	download, err := client.Runs.GetArtifact(context.Background(), &controlv1alpha1.GetArtifactRequest{Uid: metadata.GetUid()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var downloaded bytes.Buffer
+	for {
+		chunk, receiveErr := download.Recv()
+		if errors.Is(receiveErr, io.EOF) {
+			break
+		}
+		if receiveErr != nil {
+			t.Fatal(receiveErr)
+		}
+		downloaded.Write(chunk.GetData())
+	}
+	if !bytes.Equal(downloaded.Bytes(), artifact) {
+		t.Fatalf("downloaded artifact=%q want=%q", downloaded.Bytes(), artifact)
+	}
+
+	eventContext, cancelEvents := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelEvents()
+	events, err := client.Runs.WatchEvents(eventContext, &controlv1alpha1.WatchRunRequest{Uid: run.GetUid()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seenPluginEvents := map[string]bool{}
+	for {
+		event, receiveErr := events.Recv()
+		if receiveErr != nil {
+			t.Fatalf("replay persisted plugin events: %v", receiveErr)
+		}
+		if strings.HasPrefix(event.GetType(), "plugin.") {
+			seenPluginEvents[event.GetType()] = true
+		}
+		if event.GetType() == "run.succeeded" {
+			break
+		}
+	}
+	for _, eventType := range []string{"plugin.task.started", "plugin.task.log.stdout", "plugin.task.completed"} {
+		if !seenPluginEvents[eventType] {
+			t.Fatalf("missing durable %s event; saw %+v", eventType, seenPluginEvents)
+		}
+	}
+}
+
+func TestFlakyPluginRetriesKeepDistinctEvidenceAcrossRestart(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "orchigram-plugin-retry-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	marker := filepath.Join(root, "first-attempt-finished")
+	script := filepath.Join(root, "flaky-plugin-task")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nif [ -f \"$1\" ]; then\n  printf 'second-attempt\\n'\n  exit 0\nfi\nprintf 'first-attempt\\n'\n: > \"$1\"\nexit 17\n"), 0o700); err != nil { //nolint:gosec // Test-owned fixed fixture executable.
+		t.Fatal(err)
+	}
+
+	cfg := config.Development(filepath.Join(root, "state"))
+	stop := serveTestDaemon(t, cfg)
+	client := dialReadyClient(t, cfg.SocketPath)
+	installDaemonPlugin(t, client, daemonPluginBundle(t, "exec", []string{"task.exec.run"}), "exec")
+	applyClientResource(t, client, fmt.Sprintf(`apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: plugin-retry-evidence}
+spec:
+  nodes:
+    - id: flaky
+      uses: exec.run
+      timeout: 10s
+      retry: {limit: 1, backoff: 10ms}
+      with:
+        argv: [%s, %s]
+`, strconv.Quote(script), strconv.Quote(marker)))
+	run, err := client.Runs.Start(context.Background(), &controlv1alpha1.StartRunRequest{Flow: "plugin-retry-evidence", InputJson: []byte(`{}`), IdempotencyKey: "plugin-retry-evidence"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRunEvent(t, client, run.GetUid(), 0, "run.succeeded")
+
+	attemptResponse, err := client.Runs.ListAttempts(context.Background(), &controlv1alpha1.ListAttemptsRequest{RunUid: run.GetUid()})
+	if err != nil || len(attemptResponse.GetAttempts()) != 2 {
+		t.Fatalf("attempts=%+v err=%v", attemptResponse, err)
+	}
+	attempts := attemptResponse.GetAttempts()
+	if attempts[0].GetAttempt() != 1 || attempts[0].GetFrameworkAttempt() != 1 || attempts[0].GetPhase() != "failed" || attempts[0].GetExitOutcome() != "exited" || attempts[1].GetAttempt() != 2 || attempts[1].GetFrameworkAttempt() != 2 || attempts[1].GetPhase() != "succeeded" || attempts[1].GetExitOutcome() != "exited" {
+		t.Fatalf("attempt evidence=%+v", attempts)
+	}
+	if attempts[0].GetIdempotencyKey() == "" || attempts[0].GetIdempotencyKey() != attempts[1].GetIdempotencyKey() {
+		t.Fatalf("logical idempotency identity changed: %+v", attempts)
+	}
+	artifactResponse, err := client.Runs.ListArtifacts(context.Background(), &controlv1alpha1.ListArtifactsRequest{RunUid: run.GetUid()})
+	if err != nil || len(artifactResponse.GetArtifacts()) != 2 {
+		t.Fatalf("artifacts=%+v err=%v", artifactResponse, err)
+	}
+	artifactByAttempt := map[uint32]string{}
+	for _, metadata := range artifactResponse.GetArtifacts() {
+		download, downloadErr := client.Runs.GetArtifact(context.Background(), &controlv1alpha1.GetArtifactRequest{Uid: metadata.GetUid()})
+		if downloadErr != nil {
+			t.Fatal(downloadErr)
+		}
+		var content bytes.Buffer
+		for {
+			chunk, receiveErr := download.Recv()
+			if errors.Is(receiveErr, io.EOF) {
+				break
+			}
+			if receiveErr != nil {
+				t.Fatal(receiveErr)
+			}
+			content.Write(chunk.GetData())
+		}
+		artifactByAttempt[metadata.GetAttempt()] = content.String()
+	}
+	if artifactByAttempt[1] != "first-attempt\n" || artifactByAttempt[2] != "second-attempt\n" {
+		t.Fatalf("attempt artifacts=%+v", artifactByAttempt)
+	}
+
+	eventContext, cancelEvents := context.WithTimeout(context.Background(), 5*time.Second)
+	eventStream, err := client.Runs.WatchEvents(eventContext, &controlv1alpha1.WatchRunRequest{Uid: run.GetUid()})
+	if err != nil {
+		cancelEvents()
+		t.Fatal(err)
+	}
+	pluginEvents := map[uint32][]string{}
+	completedTransitions := 0
+	for {
+		event, receiveErr := eventStream.Recv()
+		if receiveErr != nil {
+			cancelEvents()
+			t.Fatalf("replay retry evidence: %v", receiveErr)
+		}
+		if strings.HasPrefix(event.GetType(), "plugin.") {
+			pluginEvents[event.GetAttempt()] = append(pluginEvents[event.GetAttempt()], event.GetType())
+		}
+		if event.GetType() == "node.completed" {
+			completedTransitions++
+		}
+		if event.GetType() == "run.succeeded" {
+			break
+		}
+	}
+	cancelEvents()
+	if !reflect.DeepEqual(pluginEvents[1], []string{"plugin.task.started", "plugin.task.log.stdout", "plugin.task.process", "plugin.task.failed"}) || !reflect.DeepEqual(pluginEvents[2], []string{"plugin.task.started", "plugin.task.log.stdout", "plugin.task.completed"}) {
+		t.Fatalf("structured attempt streams=%+v", pluginEvents)
+	}
+	if completedTransitions != 1 {
+		t.Fatalf("successful local transitions=%d", completedTransitions)
+	}
+
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stop()
+	restartedStop := serveTestDaemon(t, cfg)
+	defer restartedStop()
+	restarted := dialReadyClient(t, cfg.SocketPath)
+	defer func() { _ = restarted.Close() }()
+	replayedRun, err := restarted.Runs.Start(context.Background(), &controlv1alpha1.StartRunRequest{Flow: "plugin-retry-evidence", InputJson: []byte(`{}`), IdempotencyKey: "plugin-retry-evidence"})
+	if err != nil || replayedRun.GetUid() != run.GetUid() {
+		t.Fatalf("idempotent restart run=%+v err=%v", replayedRun, err)
+	}
+	restartedAttempts, err := restarted.Runs.ListAttempts(context.Background(), &controlv1alpha1.ListAttemptsRequest{RunUid: run.GetUid()})
+	if err != nil || len(restartedAttempts.GetAttempts()) != 2 {
+		t.Fatalf("restart attempts=%+v err=%v", restartedAttempts, err)
 	}
 }
 
@@ -533,6 +718,15 @@ spec:
 	}
 	if summary.GetPhase() != "cancelled" {
 		t.Fatalf("late activity completion regressed run phase to %q", summary.GetPhase())
+	}
+	waitForRunEvent(t, client, started.GetUid(), 0, "plugin.agent.failed")
+	attempts, err := client.Runs.ListAttempts(context.Background(), &controlv1alpha1.ListAttemptsRequest{RunUid: started.GetUid()})
+	if err != nil || len(attempts.GetAttempts()) != 1 {
+		t.Fatalf("cancelled attempts=%+v err=%v", attempts, err)
+	}
+	attempt := attempts.GetAttempts()[0]
+	if attempt.GetPhase() != "failed" || !strings.HasPrefix(attempt.GetExitOutcome(), "cancelled:") || attempt.GetCompletedAt() == nil {
+		t.Fatalf("cancelled attempt evidence=%+v", attempt)
 	}
 }
 

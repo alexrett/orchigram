@@ -124,6 +124,40 @@ message RunEvent {
   bytes payload_json = 6;
   google.protobuf.Timestamp occurred_at = 7;
 }
+message ListAttemptsRequest { string run_uid = 1; string node_id = 2; uint32 limit = 3; }
+message NodeAttempt {
+  string run_uid = 1;
+  string node_id = 2;
+  uint32 logical_iteration = 3;
+  uint32 attempt = 4;
+  string phase = 5;
+  string idempotency_key = 6;
+  bytes input_json = 7;
+  bytes output_json = 8;
+  string error = 9;
+  string exit_outcome = 10;
+  google.protobuf.Timestamp started_at = 11;
+  google.protobuf.Timestamp completed_at = 12;
+  uint32 framework_attempt = 13;
+}
+message ListAttemptsResponse { repeated NodeAttempt attempts = 1; }
+message ListArtifactsRequest { string run_uid = 1; uint32 limit = 2; }
+message ArtifactInfo {
+  string uid = 1;
+  string run_uid = 2;
+  string node_id = 3;
+  uint32 logical_iteration = 4;
+  uint32 attempt = 5;
+  string name = 6;
+  string media_type = 7;
+  int64 size_bytes = 8;
+  string sha256 = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+}
+message ListArtifactsResponse { repeated ArtifactInfo artifacts = 1; }
+message GetArtifactRequest { string uid = 1; }
+message ArtifactChunk { bytes data = 1; }
 message ApprovalRequest { RequestMeta meta = 1; string run_uid = 2; string node_id = 3; string reason = 4; }
 message CancelRunRequest { RequestMeta meta = 1; string run_uid = 2; string reason = 3; }
 message ReconcileRequest { string run_uid = 1; }
@@ -190,6 +224,9 @@ service RunService {
   rpc List(ListRunsRequest) returns (ListRunsResponse);
   rpc Plan(RunRequest) returns (CompileResponse);
   rpc WatchEvents(WatchRunRequest) returns (stream RunEvent);
+  rpc ListAttempts(ListAttemptsRequest) returns (ListAttemptsResponse);
+  rpc ListArtifacts(ListArtifactsRequest) returns (ListArtifactsResponse);
+  rpc GetArtifact(GetArtifactRequest) returns (stream ArtifactChunk);
   rpc Approve(ApprovalRequest) returns (google.protobuf.Empty);
   rpc Reject(ApprovalRequest) returns (google.protobuf.Empty);
   rpc Cancel(CancelRunRequest) returns (google.protobuf.Empty);

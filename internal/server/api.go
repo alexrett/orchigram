@@ -3,11 +3,15 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	controlv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/control/v1alpha1"
@@ -27,6 +31,8 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+const maxArtifactDownload = 64 << 20
 
 // API implements all public control-plane services over one authoritative state.
 type API struct {
@@ -319,6 +325,108 @@ func (a *API) WatchEvents(request *controlv1alpha1.WatchRunRequest, stream grpc.
 	}
 }
 
+// ListAttempts returns durable physical retries for one run.
+func (a *API) ListAttempts(ctx context.Context, request *controlv1alpha1.ListAttemptsRequest) (*controlv1alpha1.ListAttemptsResponse, error) {
+	if request.GetRunUid() == "" {
+		return nil, status.Error(codes.InvalidArgument, "run_uid is required")
+	}
+	attempts, err := a.store.ListNodeAttempts(ctx, request.GetRunUid(), request.GetNodeId(), int(request.GetLimit()))
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	response := &controlv1alpha1.ListAttemptsResponse{}
+	for _, attempt := range attempts {
+		item := &controlv1alpha1.NodeAttempt{
+			RunUid: attempt.RunUID, NodeId: attempt.NodeID, LogicalIteration: uint32(attempt.LogicalIteration), //nolint:gosec // Store rejects negative iterations.
+			Attempt: attempt.Attempt, FrameworkAttempt: attempt.FrameworkAttempt, Phase: attempt.Phase, IdempotencyKey: attempt.IdempotencyKey,
+			InputJson: attempt.Input, OutputJson: attempt.Output, Error: attempt.ErrorText,
+			ExitOutcome: attempt.ExitOutcome, StartedAt: timestamppb.New(attempt.StartedAt),
+		}
+		if !attempt.CompletedAt.IsZero() {
+			item.CompletedAt = timestamppb.New(attempt.CompletedAt)
+		}
+		response.Attempts = append(response.Attempts, item)
+	}
+	return response, nil
+}
+
+// ListArtifacts returns metadata without exposing private server paths.
+func (a *API) ListArtifacts(ctx context.Context, request *controlv1alpha1.ListArtifactsRequest) (*controlv1alpha1.ListArtifactsResponse, error) {
+	if request.GetRunUid() == "" {
+		return nil, status.Error(codes.InvalidArgument, "run_uid is required")
+	}
+	artifacts, err := a.store.ListArtifacts(ctx, request.GetRunUid(), int(request.GetLimit()))
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	response := &controlv1alpha1.ListArtifactsResponse{}
+	for _, artifact := range artifacts {
+		response.Artifacts = append(response.Artifacts, artifactPB(artifact))
+	}
+	return response, nil
+}
+
+// GetArtifact verifies registered metadata before streaming bounded content.
+func (a *API) GetArtifact(request *controlv1alpha1.GetArtifactRequest, stream grpc.ServerStreamingServer[controlv1alpha1.ArtifactChunk]) error {
+	if request.GetUid() == "" {
+		return status.Error(codes.InvalidArgument, "uid is required")
+	}
+	artifact, err := a.store.ArtifactByUID(stream.Context(), request.GetUid())
+	if err != nil {
+		return rpcError(err)
+	}
+	if artifact.SizeBytes < 0 || artifact.SizeBytes > maxArtifactDownload {
+		return status.Error(codes.ResourceExhausted, "artifact exceeds the 64 MiB download limit")
+	}
+	name, err := secureArtifactName(artifact.RelativePath)
+	if err != nil {
+		return status.Error(codes.Internal, err.Error())
+	}
+	root, err := os.OpenRoot(a.stateDir)
+	if err != nil {
+		return status.Error(codes.Internal, err.Error())
+	}
+	defer func() { _ = root.Close() }()
+	file, err := root.Open(name)
+	if err != nil {
+		return status.Error(codes.DataLoss, "registered artifact file is unavailable")
+	}
+	defer func() { _ = file.Close() }()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() != artifact.SizeBytes {
+		return status.Error(codes.DataLoss, "artifact metadata does not match the registered file")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxArtifactDownload+1))
+	if err != nil {
+		return status.Error(codes.Internal, err.Error())
+	}
+	if int64(len(data)) != artifact.SizeBytes {
+		return status.Error(codes.DataLoss, "artifact size changed while it was read")
+	}
+	digest := sha256.Sum256(data)
+	if hex.EncodeToString(digest[:]) != artifact.SHA256 {
+		return status.Error(codes.DataLoss, "artifact digest verification failed")
+	}
+	for offset := 0; offset < len(data); offset += 64 << 10 {
+		end := min(offset+(64<<10), len(data))
+		if err := stream.Send(&controlv1alpha1.ArtifactChunk{Data: data[offset:end]}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func secureArtifactName(relativePath string) (string, error) {
+	if relativePath == "" || filepath.IsAbs(relativePath) {
+		return "", errors.New("artifact path is not relative")
+	}
+	name := filepath.Clean(filepath.FromSlash(relativePath))
+	if name == "." || name == ".." || strings.HasPrefix(name, ".."+string(filepath.Separator)) {
+		return "", errors.New("artifact path escapes state directory")
+	}
+	return name, nil
+}
+
 // Approve persists then delivers an approval signal.
 func (a *API) Approve(ctx context.Context, request *controlv1alpha1.ApprovalRequest) (*emptypb.Empty, error) {
 	return a.decide(ctx, request, "approved")
@@ -565,6 +673,15 @@ func pluginInfo(record store.PluginRecord) *controlv1alpha1.PluginInfo {
 	return &controlv1alpha1.PluginInfo{Name: record.Name, Version: record.Version, Digest: record.Digest, State: state, Capabilities: manifest.Capabilities}
 }
 
+func artifactPB(artifact store.ArtifactRecord) *controlv1alpha1.ArtifactInfo {
+	return &controlv1alpha1.ArtifactInfo{
+		Uid: artifact.UID, RunUid: artifact.RunUID, NodeId: artifact.NodeID,
+		LogicalIteration: uint32(artifact.LogicalIteration), Attempt: artifact.Attempt, //nolint:gosec // Store rejects negative iterations.
+		Name: artifact.Name, MediaType: artifact.MediaType, SizeBytes: artifact.SizeBytes,
+		Sha256: artifact.SHA256, CreatedAt: timestamppb.New(artifact.CreatedAt), UpdatedAt: timestamppb.New(artifact.UpdatedAt),
+	}
+}
+
 func rpcError(err error) error {
 	var conflict *store.ConflictError
 	switch {
@@ -632,6 +749,15 @@ func (s *runService) Plan(ctx context.Context, request *controlv1alpha1.RunReque
 }
 func (s *runService) WatchEvents(request *controlv1alpha1.WatchRunRequest, stream grpc.ServerStreamingServer[controlv1alpha1.RunEvent]) error {
 	return s.api.WatchEvents(request, stream)
+}
+func (s *runService) ListAttempts(ctx context.Context, request *controlv1alpha1.ListAttemptsRequest) (*controlv1alpha1.ListAttemptsResponse, error) {
+	return s.api.ListAttempts(ctx, request)
+}
+func (s *runService) ListArtifacts(ctx context.Context, request *controlv1alpha1.ListArtifactsRequest) (*controlv1alpha1.ListArtifactsResponse, error) {
+	return s.api.ListArtifacts(ctx, request)
+}
+func (s *runService) GetArtifact(request *controlv1alpha1.GetArtifactRequest, stream grpc.ServerStreamingServer[controlv1alpha1.ArtifactChunk]) error {
+	return s.api.GetArtifact(request, stream)
 }
 func (s *runService) Approve(ctx context.Context, request *controlv1alpha1.ApprovalRequest) (*emptypb.Empty, error) {
 	return s.api.Approve(ctx, request)

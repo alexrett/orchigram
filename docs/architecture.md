@@ -10,7 +10,13 @@ CLI / TUI ── gRPC/UDS ── daemon ── SQLite WAL
 
 Resources use `orchigram.dev/v1alpha1`, strict decoding, Kubernetes-style metadata, revisions, generations, labels, status, events, and optimistic concurrency. Before acknowledging a trigger, the daemon compiles a `Flow` into an immutable `ExecutionPlan` and atomically persists that plan with the receipt and outbox command. Every `Run` pins its plan hash and interpreter version. Non-core plan nodes additionally pin the plugin version and digest plus referenced resource metadata/spec snapshots; secret values remain runtime-only.
 
-The daemon owns triggers, receipts, the transactional outbox, run state, approvals, plugin lifecycle, workspaces, and artifacts. Plugins own only provider-specific trigger, task, or agent behavior. Public resources never expose go-workflows or go-plugin types.
+The daemon owns triggers, receipts, the transactional outbox, run state,
+physical attempt evidence, approvals, plugin lifecycle, workspaces, and
+artifacts. Plugins own only provider-specific trigger, task, or agent behavior.
+Public resources never expose go-workflows or go-plugin types. Run inspection
+uses `RunService`: event replay includes validated plugin stream events,
+`ListAttempts` exposes retry identity and outcome, while `ListArtifacts` and
+bounded `GetArtifact` expose registered evidence without leaking daemon paths.
 
 `sdk/plugin` is the public author boundary. It owns the shared go-plugin
 handshake, protocol-v1 negotiation, task adapters, cancellation registry,

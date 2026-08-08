@@ -109,6 +109,9 @@ func (e *Exec) Execute(ctx context.Context, request pluginsdk.TaskRequest, sink 
 		return sink.Log("task.log."+output.Stream, output.Data)
 	})
 	if err != nil {
+		if emitErr := sink.Emit("task.process", map[string]any{"exitCode": result.ExitCode, "outcome": result.Outcome}); emitErr != nil {
+			return nil, emitErr
+		}
 		return nil, fmt.Errorf("%w (outcome=%s, exit=%d)", err, result.Outcome, result.ExitCode)
 	}
 	return map[string]any{

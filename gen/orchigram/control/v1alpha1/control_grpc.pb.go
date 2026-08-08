@@ -494,14 +494,17 @@ var FlowService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	RunService_Start_FullMethodName       = "/orchigram.control.v1alpha1.RunService/Start"
-	RunService_List_FullMethodName        = "/orchigram.control.v1alpha1.RunService/List"
-	RunService_Plan_FullMethodName        = "/orchigram.control.v1alpha1.RunService/Plan"
-	RunService_WatchEvents_FullMethodName = "/orchigram.control.v1alpha1.RunService/WatchEvents"
-	RunService_Approve_FullMethodName     = "/orchigram.control.v1alpha1.RunService/Approve"
-	RunService_Reject_FullMethodName      = "/orchigram.control.v1alpha1.RunService/Reject"
-	RunService_Cancel_FullMethodName      = "/orchigram.control.v1alpha1.RunService/Cancel"
-	RunService_Reconcile_FullMethodName   = "/orchigram.control.v1alpha1.RunService/Reconcile"
+	RunService_Start_FullMethodName         = "/orchigram.control.v1alpha1.RunService/Start"
+	RunService_List_FullMethodName          = "/orchigram.control.v1alpha1.RunService/List"
+	RunService_Plan_FullMethodName          = "/orchigram.control.v1alpha1.RunService/Plan"
+	RunService_WatchEvents_FullMethodName   = "/orchigram.control.v1alpha1.RunService/WatchEvents"
+	RunService_ListAttempts_FullMethodName  = "/orchigram.control.v1alpha1.RunService/ListAttempts"
+	RunService_ListArtifacts_FullMethodName = "/orchigram.control.v1alpha1.RunService/ListArtifacts"
+	RunService_GetArtifact_FullMethodName   = "/orchigram.control.v1alpha1.RunService/GetArtifact"
+	RunService_Approve_FullMethodName       = "/orchigram.control.v1alpha1.RunService/Approve"
+	RunService_Reject_FullMethodName        = "/orchigram.control.v1alpha1.RunService/Reject"
+	RunService_Cancel_FullMethodName        = "/orchigram.control.v1alpha1.RunService/Cancel"
+	RunService_Reconcile_FullMethodName     = "/orchigram.control.v1alpha1.RunService/Reconcile"
 )
 
 // RunServiceClient is the client API for RunService service.
@@ -512,6 +515,9 @@ type RunServiceClient interface {
 	List(ctx context.Context, in *ListRunsRequest, opts ...grpc.CallOption) (*ListRunsResponse, error)
 	Plan(ctx context.Context, in *RunRequest, opts ...grpc.CallOption) (*CompileResponse, error)
 	WatchEvents(ctx context.Context, in *WatchRunRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RunEvent], error)
+	ListAttempts(ctx context.Context, in *ListAttemptsRequest, opts ...grpc.CallOption) (*ListAttemptsResponse, error)
+	ListArtifacts(ctx context.Context, in *ListArtifactsRequest, opts ...grpc.CallOption) (*ListArtifactsResponse, error)
+	GetArtifact(ctx context.Context, in *GetArtifactRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ArtifactChunk], error)
 	Approve(ctx context.Context, in *ApprovalRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	Reject(ctx context.Context, in *ApprovalRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	Cancel(ctx context.Context, in *CancelRunRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
@@ -575,6 +581,45 @@ func (c *runServiceClient) WatchEvents(ctx context.Context, in *WatchRunRequest,
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type RunService_WatchEventsClient = grpc.ServerStreamingClient[RunEvent]
 
+func (c *runServiceClient) ListAttempts(ctx context.Context, in *ListAttemptsRequest, opts ...grpc.CallOption) (*ListAttemptsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListAttemptsResponse)
+	err := c.cc.Invoke(ctx, RunService_ListAttempts_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runServiceClient) ListArtifacts(ctx context.Context, in *ListArtifactsRequest, opts ...grpc.CallOption) (*ListArtifactsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListArtifactsResponse)
+	err := c.cc.Invoke(ctx, RunService_ListArtifacts_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runServiceClient) GetArtifact(ctx context.Context, in *GetArtifactRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ArtifactChunk], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &RunService_ServiceDesc.Streams[1], RunService_GetArtifact_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[GetArtifactRequest, ArtifactChunk]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type RunService_GetArtifactClient = grpc.ServerStreamingClient[ArtifactChunk]
+
 func (c *runServiceClient) Approve(ctx context.Context, in *ApprovalRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
@@ -623,6 +668,9 @@ type RunServiceServer interface {
 	List(context.Context, *ListRunsRequest) (*ListRunsResponse, error)
 	Plan(context.Context, *RunRequest) (*CompileResponse, error)
 	WatchEvents(*WatchRunRequest, grpc.ServerStreamingServer[RunEvent]) error
+	ListAttempts(context.Context, *ListAttemptsRequest) (*ListAttemptsResponse, error)
+	ListArtifacts(context.Context, *ListArtifactsRequest) (*ListArtifactsResponse, error)
+	GetArtifact(*GetArtifactRequest, grpc.ServerStreamingServer[ArtifactChunk]) error
 	Approve(context.Context, *ApprovalRequest) (*emptypb.Empty, error)
 	Reject(context.Context, *ApprovalRequest) (*emptypb.Empty, error)
 	Cancel(context.Context, *CancelRunRequest) (*emptypb.Empty, error)
@@ -648,6 +696,15 @@ func (UnimplementedRunServiceServer) Plan(context.Context, *RunRequest) (*Compil
 }
 func (UnimplementedRunServiceServer) WatchEvents(*WatchRunRequest, grpc.ServerStreamingServer[RunEvent]) error {
 	return status.Errorf(codes.Unimplemented, "method WatchEvents not implemented")
+}
+func (UnimplementedRunServiceServer) ListAttempts(context.Context, *ListAttemptsRequest) (*ListAttemptsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListAttempts not implemented")
+}
+func (UnimplementedRunServiceServer) ListArtifacts(context.Context, *ListArtifactsRequest) (*ListArtifactsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListArtifacts not implemented")
+}
+func (UnimplementedRunServiceServer) GetArtifact(*GetArtifactRequest, grpc.ServerStreamingServer[ArtifactChunk]) error {
+	return status.Errorf(codes.Unimplemented, "method GetArtifact not implemented")
 }
 func (UnimplementedRunServiceServer) Approve(context.Context, *ApprovalRequest) (*emptypb.Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Approve not implemented")
@@ -747,6 +804,53 @@ func _RunService_WatchEvents_Handler(srv interface{}, stream grpc.ServerStream) 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type RunService_WatchEventsServer = grpc.ServerStreamingServer[RunEvent]
 
+func _RunService_ListAttempts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListAttemptsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RunServiceServer).ListAttempts(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RunService_ListAttempts_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RunServiceServer).ListAttempts(ctx, req.(*ListAttemptsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RunService_ListArtifacts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListArtifactsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RunServiceServer).ListArtifacts(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RunService_ListArtifacts_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RunServiceServer).ListArtifacts(ctx, req.(*ListArtifactsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RunService_GetArtifact_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(GetArtifactRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(RunServiceServer).GetArtifact(m, &grpc.GenericServerStream[GetArtifactRequest, ArtifactChunk]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type RunService_GetArtifactServer = grpc.ServerStreamingServer[ArtifactChunk]
+
 func _RunService_Approve_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ApprovalRequest)
 	if err := dec(in); err != nil {
@@ -839,6 +943,14 @@ var RunService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _RunService_Plan_Handler,
 		},
 		{
+			MethodName: "ListAttempts",
+			Handler:    _RunService_ListAttempts_Handler,
+		},
+		{
+			MethodName: "ListArtifacts",
+			Handler:    _RunService_ListArtifacts_Handler,
+		},
+		{
 			MethodName: "Approve",
 			Handler:    _RunService_Approve_Handler,
 		},
@@ -859,6 +971,11 @@ var RunService_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "WatchEvents",
 			Handler:       _RunService_WatchEvents_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "GetArtifact",
+			Handler:       _RunService_GetArtifact_Handler,
 			ServerStreams: true,
 		},
 	},

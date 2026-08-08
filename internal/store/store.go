@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -751,6 +752,388 @@ func (s *Store) ListRuns(ctx context.Context, limit int) ([]Run, error) {
 	return result, rows.Err()
 }
 
+// NodeAttempt is one durable physical execution of a logical node iteration.
+type NodeAttempt struct {
+	RunUID           string
+	NodeID           string
+	LogicalIteration int
+	Attempt          uint32
+	FrameworkAttempt uint32
+	Phase            string
+	IdempotencyKey   string
+	Input            json.RawMessage
+	Output           json.RawMessage
+	ErrorText        string
+	ExitOutcome      string
+	StartedAt        time.Time
+	CompletedAt      time.Time
+}
+
+// BeginNodeAttempt durably records one physical attempt before an external
+// invocation. Re-delivery replays a terminal record; an incomplete delivery is
+// marked lost and receives a new monotonic physical attempt.
+func (s *Store) BeginNodeAttempt(ctx context.Context, runUID, nodeID string, logicalIteration int, frameworkAttempt uint32, idempotencyKey string, input json.RawMessage) (NodeAttempt, bool, error) {
+	if logicalIteration < 0 || frameworkAttempt == 0 || idempotencyKey == "" {
+		return NodeAttempt{}, false, errors.New("node attempt identity is incomplete")
+	}
+	if len(input) == 0 {
+		input = json.RawMessage(`{}`)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return NodeAttempt{}, false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	latest, err := nodeAttemptForFrameworkTx(ctx, tx, runUID, nodeID, logicalIteration, frameworkAttempt)
+	if err == nil && !latest.CompletedAt.IsZero() {
+		return latest, false, tx.Commit()
+	}
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return NodeAttempt{}, false, err
+	}
+	hasIncompleteDelivery := err == nil
+	var runPhase string
+	if err := tx.QueryRowContext(ctx, `SELECT phase FROM runs WHERE uid=?`, runUID).Scan(&runPhase); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return NodeAttempt{}, false, ErrNotFound
+		}
+		return NodeAttempt{}, false, err
+	}
+	if terminalRunPhase(runPhase) {
+		return NodeAttempt{}, false, fmt.Errorf("run %s is already %s", runUID, runPhase)
+	}
+	now := s.timestamp()
+	if hasIncompleteDelivery {
+		const lostMessage = "activity delivery ended without a durable completion"
+		if _, err := tx.ExecContext(ctx, `UPDATE node_attempts SET phase='failed',error_text=?,exit_outcome='delivery-lost',completed_at=? WHERE run_uid=? AND node_id=? AND logical_iteration=? AND attempt=? AND completed_at IS NULL`, lostMessage, now, runUID, nodeID, logicalIteration, latest.Attempt); err != nil {
+			return NodeAttempt{}, false, err
+		}
+		payload, _ := json.Marshal(map[string]any{"error": lostMessage, "outcome": "delivery-lost"})
+		if _, err := s.appendRunEventTx(ctx, tx, runUID, nodeID, "node.failed", "running", latest.Attempt, payload, now); err != nil {
+			return NodeAttempt{}, false, err
+		}
+	}
+	var physicalAttempt int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(attempt),0)+1 FROM node_attempts WHERE run_uid=? AND node_id=? AND logical_iteration=?`, runUID, nodeID, logicalIteration).Scan(&physicalAttempt); err != nil {
+		return NodeAttempt{}, false, err
+	}
+	if physicalAttempt <= 0 || physicalAttempt > int64(^uint32(0)) {
+		return NodeAttempt{}, false, errors.New("node attempt sequence is exhausted")
+	}
+	attempt := uint32(physicalAttempt) //nolint:gosec // Explicit range check above.
+	if _, err := tx.ExecContext(ctx, `INSERT INTO node_attempts(run_uid,node_id,logical_iteration,attempt,framework_attempt,phase,idempotency_key,input_json,started_at) VALUES(?,?,?,?,?,?,?,?,?)`, runUID, nodeID, logicalIteration, attempt, frameworkAttempt, "running", idempotencyKey, input, now); err != nil {
+		return NodeAttempt{}, false, err
+	}
+	if _, err := s.appendRunEventTx(ctx, tx, runUID, nodeID, "node.started", "running", attempt, mustJSONObject(nil), now); err != nil {
+		return NodeAttempt{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return NodeAttempt{}, false, err
+	}
+	started, _ := time.Parse(time.RFC3339Nano, now)
+	return NodeAttempt{RunUID: runUID, NodeID: nodeID, LogicalIteration: logicalIteration, Attempt: attempt, FrameworkAttempt: frameworkAttempt, Phase: "running", IdempotencyKey: idempotencyKey, Input: input, StartedAt: started}, true, nil
+}
+
+// CompleteNodeAttempt records the first terminal outcome and appends exactly
+// one node transition. Re-delivery returns the stored outcome unchanged.
+func (s *Store) CompleteNodeAttempt(ctx context.Context, runUID, nodeID string, logicalIteration int, attempt uint32, phase string, output json.RawMessage, errorText, exitOutcome string) (NodeAttempt, error) {
+	if phase != "succeeded" && phase != "failed" && phase != "cancelled" {
+		return NodeAttempt{}, fmt.Errorf("invalid node attempt phase %q", phase)
+	}
+	if len(output) == 0 {
+		output = json.RawMessage(`{}`)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return NodeAttempt{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	existing, err := nodeAttemptTx(ctx, tx, runUID, nodeID, logicalIteration, attempt)
+	if err != nil {
+		return NodeAttempt{}, err
+	}
+	if !existing.CompletedAt.IsZero() {
+		return existing, tx.Commit()
+	}
+	effectiveOutcome := exitOutcome
+	if existing.ExitOutcome != "" {
+		effectiveOutcome = existing.ExitOutcome
+	}
+	now := s.timestamp()
+	if _, err := tx.ExecContext(ctx, `UPDATE node_attempts SET phase=?,output_json=?,error_text=?,exit_outcome=CASE WHEN exit_outcome='' THEN ? ELSE exit_outcome END,completed_at=? WHERE run_uid=? AND node_id=? AND logical_iteration=? AND attempt=? AND completed_at IS NULL`, phase, output, errorText, exitOutcome, now, runUID, nodeID, logicalIteration, attempt); err != nil {
+		return NodeAttempt{}, err
+	}
+	eventType := "node.completed"
+	payload := output
+	if phase != "succeeded" {
+		eventType = "node.failed"
+		payload, _ = json.Marshal(map[string]any{"error": errorText, "outcome": effectiveOutcome})
+	}
+	if _, err := s.appendRunEventTx(ctx, tx, runUID, nodeID, eventType, "running", attempt, payload, now); err != nil {
+		return NodeAttempt{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return NodeAttempt{}, err
+	}
+	return s.NodeAttempt(ctx, runUID, nodeID, logicalIteration, attempt)
+}
+
+// SetNodeAttemptOutcome records plugin-specific process or transport outcome
+// before the engine records the terminal activity result.
+func (s *Store) SetNodeAttemptOutcome(ctx context.Context, runUID, nodeID string, logicalIteration int, attempt uint32, outcome string) error {
+	if outcome == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE node_attempts SET exit_outcome=? WHERE run_uid=? AND node_id=? AND logical_iteration=? AND attempt=? AND exit_outcome=''`, outcome, runUID, nodeID, logicalIteration, attempt)
+	return err
+}
+
+// NodeAttempt returns one durable attempt.
+func (s *Store) NodeAttempt(ctx context.Context, runUID, nodeID string, logicalIteration int, attempt uint32) (NodeAttempt, error) {
+	return nodeAttemptQuery(ctx, s.db, runUID, nodeID, logicalIteration, attempt)
+}
+
+// ListNodeAttempts returns attempts in logical and physical execution order.
+func (s *Store) ListNodeAttempts(ctx context.Context, runUID, nodeID string, limit int) ([]NodeAttempt, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	query := `SELECT run_uid,node_id,logical_iteration,attempt,framework_attempt,phase,idempotency_key,input_json,output_json,error_text,exit_outcome,started_at,completed_at FROM node_attempts WHERE run_uid=?`
+	arguments := []any{runUID}
+	if nodeID != "" {
+		query += ` AND node_id=?`
+		arguments = append(arguments, nodeID)
+	}
+	query += ` ORDER BY logical_iteration,attempt,node_id LIMIT ?`
+	arguments = append(arguments, limit)
+	rows, err := s.db.QueryContext(ctx, query, arguments...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	result := []NodeAttempt{}
+	for rows.Next() {
+		attempt, scanErr := scanNodeAttempt(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		result = append(result, attempt)
+	}
+	return result, rows.Err()
+}
+
+func nodeAttemptTx(ctx context.Context, tx *sql.Tx, runUID, nodeID string, logicalIteration int, attempt uint32) (NodeAttempt, error) {
+	return nodeAttemptQuery(ctx, tx, runUID, nodeID, logicalIteration, attempt)
+}
+
+func nodeAttemptForFrameworkTx(ctx context.Context, tx *sql.Tx, runUID, nodeID string, logicalIteration int, frameworkAttempt uint32) (NodeAttempt, error) {
+	query := `SELECT run_uid,node_id,logical_iteration,attempt,framework_attempt,phase,idempotency_key,input_json,output_json,error_text,exit_outcome,started_at,completed_at FROM node_attempts WHERE run_uid=? AND node_id=? AND logical_iteration=? AND framework_attempt=? ORDER BY attempt DESC LIMIT 1`
+	return scanNodeAttempt(tx.QueryRowContext(ctx, query, runUID, nodeID, logicalIteration, frameworkAttempt))
+}
+
+type rowScanner interface {
+	Scan(...any) error
+}
+
+type rowQueryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func nodeAttemptQuery(ctx context.Context, queryer rowQueryer, runUID, nodeID string, logicalIteration int, attempt uint32) (NodeAttempt, error) {
+	return scanNodeAttempt(queryer.QueryRowContext(ctx, `SELECT run_uid,node_id,logical_iteration,attempt,framework_attempt,phase,idempotency_key,input_json,output_json,error_text,exit_outcome,started_at,completed_at FROM node_attempts WHERE run_uid=? AND node_id=? AND logical_iteration=? AND attempt=?`, runUID, nodeID, logicalIteration, attempt))
+}
+
+func scanNodeAttempt(row rowScanner) (NodeAttempt, error) {
+	var result NodeAttempt
+	var output []byte
+	var started string
+	var completed sql.NullString
+	if err := row.Scan(&result.RunUID, &result.NodeID, &result.LogicalIteration, &result.Attempt, &result.FrameworkAttempt, &result.Phase, &result.IdempotencyKey, &result.Input, &output, &result.ErrorText, &result.ExitOutcome, &started, &completed); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return NodeAttempt{}, ErrNotFound
+		}
+		return NodeAttempt{}, err
+	}
+	result.Output = output
+	result.StartedAt, _ = time.Parse(time.RFC3339Nano, started)
+	if completed.Valid {
+		result.CompletedAt, _ = time.Parse(time.RFC3339Nano, completed.String)
+	}
+	return result, nil
+}
+
+// AppendPluginEvent persists one validated provider event and projects it into
+// the existing run event stream. Duplicate stream sequences are idempotent.
+func (s *Store) AppendPluginEvent(ctx context.Context, runUID, nodeID string, logicalIteration int, attempt uint32, sequence uint64, eventType string, payload json.RawMessage, occurredAt time.Time) error {
+	if sequence == 0 || eventType == "" || !json.Valid(payload) {
+		return errors.New("plugin event is incomplete")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	when := occurredAt.UTC().Format(time.RFC3339Nano)
+	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO plugin_events(run_uid,node_id,logical_iteration,attempt,sequence,event_type,payload_json,occurred_at) VALUES(?,?,?,?,?,?,?,?)`, runUID, nodeID, logicalIteration, attempt, sequence, eventType, payload, when)
+	if err != nil {
+		return err
+	}
+	inserted, _ := result.RowsAffected()
+	if inserted == 0 {
+		var storedType, storedWhen string
+		var storedPayload []byte
+		if err := tx.QueryRowContext(ctx, `SELECT event_type,payload_json,occurred_at FROM plugin_events WHERE run_uid=? AND node_id=? AND logical_iteration=? AND attempt=? AND sequence=?`, runUID, nodeID, logicalIteration, attempt, sequence).Scan(&storedType, &storedPayload, &storedWhen); err != nil {
+			return err
+		}
+		if storedType != eventType || storedWhen != when || !bytes.Equal(storedPayload, payload) {
+			return errors.New("plugin event sequence conflicts with durable evidence")
+		}
+	} else {
+		envelope, _ := json.Marshal(map[string]any{"sequence": sequence, "occurredAt": when, "payload": json.RawMessage(payload)})
+		if err := s.appendRunEvidenceTx(ctx, tx, runUID, nodeID, "plugin."+eventType, attempt, envelope, s.timestamp()); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) appendRunEvidenceTx(ctx context.Context, tx *sql.Tx, runUID, nodeID, eventType string, attempt uint32, payload json.RawMessage, occurredAt string) error {
+	var currentPhase string
+	if err := tx.QueryRowContext(ctx, `SELECT phase FROM runs WHERE uid=?`, runUID).Scan(&currentPhase); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	var sequence uint64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM run_events WHERE run_uid=?`, runUID).Scan(&sequence); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO run_events(run_uid,sequence,node_id,attempt,event_type,payload_json,occurred_at) VALUES(?,?,?,?,?,?,?)`, runUID, sequence, nodeID, attempt, eventType, payload, occurredAt); err != nil {
+		return err
+	}
+	if !terminalRunPhase(currentPhase) {
+		_, err := tx.ExecContext(ctx, `UPDATE runs SET updated_at=? WHERE uid=?`, occurredAt, runUID)
+		return err
+	}
+	return nil
+}
+
+// ArtifactRecord is durable metadata for a private run artifact.
+type ArtifactRecord struct {
+	UID              string
+	RunUID           string
+	NodeID           string
+	LogicalIteration int
+	Attempt          uint32
+	Name             string
+	MediaType        string
+	RelativePath     string
+	SizeBytes        int64
+	SHA256           string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
+// PutArtifact upserts metadata for one immutable attempt-local artifact name.
+func (s *Store) PutArtifact(ctx context.Context, artifact ArtifactRecord) (ArtifactRecord, error) {
+	if artifact.RunUID == "" || artifact.NodeID == "" || artifact.LogicalIteration < 0 || artifact.Attempt == 0 || artifact.Name == "" || artifact.RelativePath == "" || artifact.SizeBytes < 0 {
+		return ArtifactRecord{}, errors.New("artifact metadata is incomplete")
+	}
+	decodedDigest, err := hex.DecodeString(artifact.SHA256)
+	if err != nil || len(decodedDigest) != sha256.Size {
+		return ArtifactRecord{}, errors.New("artifact sha256 is invalid")
+	}
+	cleanPath := filepath.Clean(filepath.FromSlash(artifact.RelativePath))
+	if filepath.IsAbs(cleanPath) || cleanPath == "." || cleanPath == ".." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) {
+		return ArtifactRecord{}, errors.New("artifact path escapes the state directory")
+	}
+	artifact.RelativePath = filepath.ToSlash(cleanPath)
+	if artifact.UID == "" {
+		artifact.UID = uuid.NewString()
+	}
+	if artifact.MediaType == "" {
+		artifact.MediaType = "application/octet-stream"
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ArtifactRecord{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var completed sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT completed_at FROM node_attempts WHERE run_uid=? AND node_id=? AND logical_iteration=? AND attempt=?`, artifact.RunUID, artifact.NodeID, artifact.LogicalIteration, artifact.Attempt).Scan(&completed); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ArtifactRecord{}, ErrNotFound
+		}
+		return ArtifactRecord{}, err
+	}
+	existing, existingErr := scanArtifact(tx.QueryRowContext(ctx, `SELECT uid,run_uid,node_id,logical_iteration,attempt,name,media_type,relative_path,size_bytes,sha256,created_at,updated_at FROM artifacts WHERE run_uid=? AND node_id=? AND logical_iteration=? AND attempt=? AND name=?`, artifact.RunUID, artifact.NodeID, artifact.LogicalIteration, artifact.Attempt, artifact.Name))
+	if existingErr == nil {
+		artifact.UID = existing.UID
+		if completed.Valid {
+			if existing.MediaType != artifact.MediaType || existing.RelativePath != artifact.RelativePath || existing.SizeBytes != artifact.SizeBytes || existing.SHA256 != artifact.SHA256 {
+				return ArtifactRecord{}, errors.New("completed attempt artifact differs from durable metadata")
+			}
+			return existing, tx.Commit()
+		}
+	} else if !errors.Is(existingErr, ErrNotFound) {
+		return ArtifactRecord{}, existingErr
+	}
+	now := s.timestamp()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO artifacts(uid,run_uid,node_id,logical_iteration,attempt,name,media_type,relative_path,size_bytes,sha256,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_uid,node_id,logical_iteration,attempt,name) DO UPDATE SET media_type=excluded.media_type,relative_path=excluded.relative_path,size_bytes=excluded.size_bytes,sha256=excluded.sha256,updated_at=excluded.updated_at`, artifact.UID, artifact.RunUID, artifact.NodeID, artifact.LogicalIteration, artifact.Attempt, artifact.Name, artifact.MediaType, artifact.RelativePath, artifact.SizeBytes, artifact.SHA256, now, now); err != nil {
+		return ArtifactRecord{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return ArtifactRecord{}, err
+	}
+	return s.Artifact(ctx, artifact.RunUID, artifact.NodeID, artifact.LogicalIteration, artifact.Attempt, artifact.Name)
+}
+
+// Artifact returns one attempt-local artifact by coordinates.
+func (s *Store) Artifact(ctx context.Context, runUID, nodeID string, logicalIteration int, attempt uint32, name string) (ArtifactRecord, error) {
+	return scanArtifact(s.db.QueryRowContext(ctx, `SELECT uid,run_uid,node_id,logical_iteration,attempt,name,media_type,relative_path,size_bytes,sha256,created_at,updated_at FROM artifacts WHERE run_uid=? AND node_id=? AND logical_iteration=? AND attempt=? AND name=?`, runUID, nodeID, logicalIteration, attempt, name))
+}
+
+// ArtifactByUID resolves server download metadata.
+func (s *Store) ArtifactByUID(ctx context.Context, uid string) (ArtifactRecord, error) {
+	return scanArtifact(s.db.QueryRowContext(ctx, `SELECT uid,run_uid,node_id,logical_iteration,attempt,name,media_type,relative_path,size_bytes,sha256,created_at,updated_at FROM artifacts WHERE uid=?`, uid))
+}
+
+// ListArtifacts returns run artifacts in execution order.
+func (s *Store) ListArtifacts(ctx context.Context, runUID string, limit int) ([]ArtifactRecord, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT uid,run_uid,node_id,logical_iteration,attempt,name,media_type,relative_path,size_bytes,sha256,created_at,updated_at FROM artifacts WHERE run_uid=? ORDER BY logical_iteration,attempt,node_id,name LIMIT ?`, runUID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	result := []ArtifactRecord{}
+	for rows.Next() {
+		artifact, scanErr := scanArtifact(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		result = append(result, artifact)
+	}
+	return result, rows.Err()
+}
+
+func scanArtifact(row rowScanner) (ArtifactRecord, error) {
+	var artifact ArtifactRecord
+	var created, updated string
+	if err := row.Scan(&artifact.UID, &artifact.RunUID, &artifact.NodeID, &artifact.LogicalIteration, &artifact.Attempt, &artifact.Name, &artifact.MediaType, &artifact.RelativePath, &artifact.SizeBytes, &artifact.SHA256, &created, &updated); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ArtifactRecord{}, ErrNotFound
+		}
+		return ArtifactRecord{}, err
+	}
+	artifact.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+	artifact.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+	return artifact, nil
+}
+
 // AppendRunEvent serializes a state transition and its event.
 func (s *Store) AppendRunEvent(ctx context.Context, runUID, nodeID, eventType, phase string, attempt uint32, payload json.RawMessage) error {
 	if len(payload) == 0 {
@@ -761,32 +1144,46 @@ func (s *Store) AppendRunEvent(ctx context.Context, runUID, nodeID, eventType, p
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	var currentPhase string
-	if err := tx.QueryRowContext(ctx, `SELECT phase FROM runs WHERE uid=?`, runUID).Scan(&currentPhase); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrNotFound
-		}
-		return err
-	}
-	if terminalRunPhase(currentPhase) {
-		return tx.Commit()
-	}
-	var sequence uint64
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM run_events WHERE run_uid=?`, runUID).Scan(&sequence); err != nil {
-		return err
-	}
-	now := s.timestamp()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO run_events(run_uid,sequence,node_id,attempt,event_type,payload_json,occurred_at) VALUES(?,?,?,?,?,?,?)`, runUID, sequence, nodeID, attempt, eventType, payload, now); err != nil {
-		return err
-	}
-	completed := any(nil)
-	if phase == "succeeded" || phase == "failed" || phase == "cancelled" || phase == "rejected" {
-		completed = now
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE runs SET phase=?,updated_at=?,completed_at=COALESCE(?,completed_at) WHERE uid=?`, phase, now, completed, runUID); err != nil {
+	_, err = s.appendRunEventTx(ctx, tx, runUID, nodeID, eventType, phase, attempt, payload, s.timestamp())
+	if err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+func (s *Store) appendRunEventTx(ctx context.Context, tx *sql.Tx, runUID, nodeID, eventType, phase string, attempt uint32, payload json.RawMessage, occurredAt string) (bool, error) {
+	var currentPhase string
+	if err := tx.QueryRowContext(ctx, `SELECT phase FROM runs WHERE uid=?`, runUID).Scan(&currentPhase); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, ErrNotFound
+		}
+		return false, err
+	}
+	if terminalRunPhase(currentPhase) {
+		return false, nil
+	}
+	var sequence uint64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM run_events WHERE run_uid=?`, runUID).Scan(&sequence); err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO run_events(run_uid,sequence,node_id,attempt,event_type,payload_json,occurred_at) VALUES(?,?,?,?,?,?,?)`, runUID, sequence, nodeID, attempt, eventType, payload, occurredAt); err != nil {
+		return false, err
+	}
+	completed := any(nil)
+	if phase == "succeeded" || phase == "failed" || phase == "cancelled" || phase == "rejected" {
+		completed = occurredAt
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE runs SET phase=?,updated_at=?,completed_at=COALESCE(?,completed_at) WHERE uid=?`, phase, occurredAt, completed, runUID); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func mustJSONObject(payload json.RawMessage) json.RawMessage {
+	if len(payload) == 0 {
+		return json.RawMessage(`{}`)
+	}
+	return payload
 }
 
 func terminalRunPhase(phase string) bool {

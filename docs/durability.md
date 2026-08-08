@@ -16,6 +16,36 @@ cannot alter or strand the accepted execution.
 
 External activities are at-least-once. The unavoidable crash window is after a remote side effect succeeds and before its completion is recorded locally. Every plugin call therefore receives a stable idempotency key derived from run, node, logical iteration, and operation. Providers that cannot enforce it must reconcile with deterministic remote identifiers or hidden markers and expose the residual risk to the operator.
 
+The durable evidence model distinguishes a logical operation from its physical
+delivery attempts. Before invoking a plugin, the interpreter creates a
+`node_attempts` record identified by run, node, logical iteration, and the
+monotonic physical delivery number while also recording the workflow engine's
+retry ordinal. Retries reuse the logical operation's idempotency key but receive
+a new physical attempt number. If a worker disappears before recording an
+outcome, the old delivery becomes `delivery-lost` and redelivery under the same
+framework retry ordinal gets another physical number. Start time, terminal
+output or error, process or transport outcome, and completion time are preserved
+per attempt. A redelivered framework attempt with an already-recorded terminal
+result is replayed locally instead of invoking the external operation again.
+
+Validated plugin events are persisted with their original per-attempt sequence
+before they are projected into the run event stream. Raw output is redacted
+before it is appended to an attempt-local artifact. The control API lists
+attempts and artifact metadata without exposing server paths; artifact download
+rechecks the registered size and SHA-256 and refuses content over 64 MiB.
+Secret values are redacted before structured events, terminal results, or raw
+artifacts enter durable storage. Raw writes are synced before their metadata is
+committed; daemon startup scans attempt-local raw logs and registers a file left
+between those two durability boundaries. Once an attempt is terminal, its
+registered artifact metadata is immutable and startup fails visibly if the file
+no longer matches its recorded size and digest.
+
+Terminal run state is immutable, but evidence is append-only: a plugin terminal
+event that arrives during cancellation may be sequenced after `run.cancelled`
+without changing the Run phase or completion timestamp. Replay therefore keeps
+the actual process outcome even when the operator's cancellation wins the state
+transition race.
+
 The Slack Incoming Webhook tracer demonstrates the residual case. Orchigram
 keeps its `Idempotency-Key` stable across HTTP retries, but Incoming Webhooks
 expose no documented deduplication identifier. If Slack accepts a message and
@@ -40,7 +70,11 @@ agent calls. The bounded provider `Cancel` RPC runs before the streaming RPC is
 cancelled, and command providers terminate the process group with `SIGTERM`
 followed by bounded `SIGKILL` escalation.
 
-Approvals, retry timers, plan versions, provider cursors, and run events are durable. TUI state is not. On upgrade, an existing run remains pinned to its interpreter version or becomes visibly blocked; it is never silently reinterpreted by incompatible code.
+Approvals, retry timers, plan versions, provider cursors, physical attempts,
+plugin event sequences, artifact metadata, and run events are durable. TUI
+state is not. On upgrade, an existing run remains pinned to its interpreter
+version or becomes visibly blocked; it is never silently reinterpreted by
+incompatible code.
 
 The compiler collapses strongly connected components and rejects every cycle
 without a finite `loop.maxIterations` policy. The durable interpreter executes

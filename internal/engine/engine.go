@@ -12,6 +12,7 @@ import (
 
 	"github.com/alexrett/orchigram/internal/flow"
 	"github.com/alexrett/orchigram/internal/store"
+	workflowActivity "github.com/cschleiden/go-workflows/activity"
 	"github.com/cschleiden/go-workflows/backend"
 	workflowSqlite "github.com/cschleiden/go-workflows/backend/sqlite"
 	workflowClient "github.com/cschleiden/go-workflows/client"
@@ -45,6 +46,34 @@ type DurableEngine interface {
 // TaskExecutor invokes non-core actions at an at-least-once activity boundary.
 type TaskExecutor interface {
 	Execute(context.Context, string, flow.PlanNode, json.RawMessage, map[string]any, string) (json.RawMessage, error)
+}
+
+type taskIdentityKey struct{}
+
+// TaskIdentity identifies one physical delivery and its workflow-engine retry
+// ordinal within a logical node iteration. Executors use it for CallMeta,
+// artifacts, and structured events.
+type TaskIdentity struct {
+	LogicalIteration int
+	Attempt          uint32
+	FrameworkAttempt uint32
+}
+
+// TaskIdentityFromContext returns the durable execution identity. Direct
+// executor conformance calls default to the first attempt of iteration zero.
+func TaskIdentityFromContext(ctx context.Context) TaskIdentity {
+	identity, _ := ctx.Value(taskIdentityKey{}).(TaskIdentity)
+	if identity.Attempt == 0 {
+		identity.Attempt = 1
+	}
+	if identity.FrameworkAttempt == 0 {
+		identity.FrameworkAttempt = 1
+	}
+	return identity
+}
+
+func withTaskIdentity(ctx context.Context, identity TaskIdentity) context.Context {
+	return context.WithValue(ctx, taskIdentityKey{}, identity)
 }
 
 type runCanceler interface {
@@ -536,37 +565,74 @@ func (a *Activities) ExecuteNode(ctx context.Context, request NodeRequest) (Node
 	if request.Iteration < 0 || request.Iteration >= 1000 {
 		return NodeResult{}, errors.New("node iteration is outside the compiled limit")
 	}
-	attempt := uint32(request.Iteration) + 1 //nolint:gosec // Iteration was bounded to [0, 999] above.
-	if err := a.store.AppendRunEvent(ctx, request.RunUID, request.Node.ID, "node.started", "running", attempt, nil); err != nil {
+	frameworkAttempt := workflowActivity.Attempt(ctx) + 1
+	if frameworkAttempt < 1 || frameworkAttempt > request.Node.RetryLimit+1 {
+		return NodeResult{}, fmt.Errorf("framework attempt %d is outside retry policy", frameworkAttempt)
+	}
+	frameworkAttemptNumber := uint32(frameworkAttempt) //nolint:gosec // Framework attempt is bounded by the compiled retry limit.
+	key := fmt.Sprintf("run/%s/node/%s/iteration/%d/operation/execute", request.RunUID, request.Node.ID, request.Iteration)
+	record, created, err := a.store.BeginNodeAttempt(ctx, request.RunUID, request.Node.ID, request.Iteration, frameworkAttemptNumber, key, request.Input)
+	if err != nil {
 		return NodeResult{}, err
 	}
+	if !created && !record.CompletedAt.IsZero() {
+		if record.Phase != "succeeded" {
+			return NodeResult{}, errors.New(record.ErrorText)
+		}
+		activated, evaluateErr := evaluate(request, record.Output)
+		if evaluateErr != nil {
+			return NodeResult{}, evaluateErr
+		}
+		return NodeResult{Output: record.Output, Activated: activated}, nil
+	}
+	attempt := record.Attempt
 	var output json.RawMessage
-	var err error
+	var executeErr error
+	exitOutcome := "completed"
 	switch request.Node.Uses {
 	case "core.noop":
 		output = json.RawMessage(`{"ok":true}`)
 		if configured, exists := request.Node.With["result"]; exists {
-			output, err = json.Marshal(configured)
+			output, executeErr = json.Marshal(configured)
 		}
 	case "core.fail":
-		err = errors.New("core.fail requested")
+		executeErr = errors.New("core.fail requested")
+		exitOutcome = "core-error"
 	default:
 		if a.executor == nil {
-			err = fmt.Errorf("no task executor for %q", request.Node.Uses)
+			executeErr = fmt.Errorf("no task executor for %q", request.Node.Uses)
+			exitOutcome = "executor-unavailable"
 		} else {
-			key := fmt.Sprintf("run/%s/node/%s/iteration/%d/operation/execute", request.RunUID, request.Node.ID, request.Iteration)
-			output, err = a.executor.Execute(ctx, request.RunUID, request.Node, request.Input, request.Nodes, key)
+			executionContext := withTaskIdentity(ctx, TaskIdentity{LogicalIteration: request.Iteration, Attempt: attempt, FrameworkAttempt: frameworkAttemptNumber})
+			output, executeErr = a.executor.Execute(executionContext, request.RunUID, request.Node, request.Input, request.Nodes, key)
+			exitOutcome = "plugin-completed"
 		}
 	}
-	if err != nil {
-		_ = a.store.AppendRunEvent(ctx, request.RunUID, request.Node.ID, "node.failed", "running", attempt, mustJSON(map[string]any{"error": err.Error()}))
-		return NodeResult{}, err
+	if executeErr != nil {
+		switch {
+		case errors.Is(executeErr, context.Canceled):
+			exitOutcome = "cancelled"
+		case errors.Is(executeErr, context.DeadlineExceeded):
+			exitOutcome = "deadline-exceeded"
+		case exitOutcome == "plugin-completed":
+			exitOutcome = "plugin-failed"
+		}
+		persistContext, cancelPersistence := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		_, _ = a.store.CompleteNodeAttempt(persistContext, request.RunUID, request.Node.ID, request.Iteration, attempt, "failed", nil, executeErr.Error(), exitOutcome)
+		cancelPersistence()
+		return NodeResult{}, executeErr
 	}
-	activated, err := evaluate(request, output)
-	if err != nil {
-		return NodeResult{}, err
+	activated, evaluateErr := evaluate(request, output)
+	if evaluateErr != nil {
+		persistContext, cancelPersistence := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		_, _ = a.store.CompleteNodeAttempt(persistContext, request.RunUID, request.Node.ID, request.Iteration, attempt, "failed", nil, evaluateErr.Error(), "evaluation-failed")
+		cancelPersistence()
+		return NodeResult{}, evaluateErr
 	}
-	if err := a.store.AppendRunEvent(ctx, request.RunUID, request.Node.ID, "node.completed", "running", attempt, output); err != nil {
+	persistContext, cancelPersistence := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	_, err = a.store.CompleteNodeAttempt(persistContext, request.RunUID, request.Node.ID, request.Iteration, attempt, "succeeded", output, "", exitOutcome)
+	cancelPersistence()
+	if err != nil {
 		return NodeResult{}, err
 	}
 	return NodeResult{Output: output, Activated: activated}, nil
