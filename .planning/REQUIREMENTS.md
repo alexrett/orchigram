@@ -25,6 +25,7 @@
 - [x] TRG-02: Opt-in durable webhook ingress with bearer SecretRef and body limit.
 - [x] TRG-03: Cursor-backed provider subscriptions and persisted acknowledgement.
 - [x] TRG-04: Weekday Teams-compatible scheduled tracer.
+- [x] TRG-05: Weekday Slack scheduled tracer with SecretRef delivery and explicit at-least-once semantics.
 
 ## GitHub tracer
 
@@ -42,4 +43,4 @@
 
 - [ ] PUB-01: Tests, secret scan, license inventory, SBOM, reproducible artifacts and attestations.
 - [x] PUB-02: Backup/restore, active-run upgrade, plugin rollback, clean Ubuntu installation.
-- [ ] PUB-03: Documentation reproduces both end-to-end tracers before public v0.1.0.
+- [x] PUB-03: Documentation reproduces both end-to-end tracers before public v0.1.0.
