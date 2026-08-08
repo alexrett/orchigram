@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -72,6 +73,8 @@ func NewRoot() *cobra.Command {
 		newServerCommand(),
 		newApplyCommand(opts),
 		newGetCommand(opts),
+		newWatchCommand(opts),
+		newExportCommand(opts),
 		newDescribeCommand(opts),
 		newDeleteCommand(opts),
 		newFlowCommand(opts),
@@ -196,64 +199,193 @@ func newApplyCommand(opts *options) *cobra.Command {
 		if file == "" {
 			return errors.New("-f is required")
 		}
-		data, err := os.ReadFile(file) //nolint:gosec // The operator explicitly supplies the manifest path.
-		if err != nil {
-			return err
-		}
-		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, contextName string) error {
-			response, err := client.Resources.Apply(cmd.Context(), &controlv1alpha1.ApplyRequest{Meta: requestMeta(contextName), Document: data, ExpectedResourceVersion: expected, DryRun: dryRun})
+		reader := cmd.InOrStdin()
+		if file != "-" {
+			opened, err := os.Open(filepath.Clean(file)) //nolint:gosec // The operator explicitly supplies the manifest path.
 			if err != nil {
 				return err
 			}
-			if len(response.GetDiagnostics()) > 0 {
-				hasErrors := false
-				for _, diagnostic := range response.GetDiagnostics() {
-					hasErrors = hasErrors || diagnostic.GetSeverity() == controlv1alpha1.Diagnostic_SEVERITY_ERROR || diagnostic.GetSeverity() == controlv1alpha1.Diagnostic_SEVERITY_UNSPECIFIED
-					if _, writeErr := fmt.Fprintf(cmd.ErrOrStderr(), "%s: %s (%s)\n", diagnostic.GetPath(), diagnostic.GetMessage(), diagnostic.GetCode()); writeErr != nil {
-						return writeErr
-					}
+			defer func() { _ = opened.Close() }()
+			reader = opened
+		}
+		documents, err := readManifestDocuments(reader)
+		if err != nil {
+			return err
+		}
+		if expected != 0 && len(documents) != 1 {
+			return errors.New("--resource-version can only be used with one document")
+		}
+		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, contextName string) error {
+			validated := make([][]byte, 0, len(documents))
+			for index, document := range documents {
+				response, validateErr := client.Resources.Validate(cmd.Context(), &controlv1alpha1.ApplyRequest{Meta: requestMeta(contextName), Document: document.data, ExpectedResourceVersion: document.expectedResourceVersion, DryRun: true})
+				if validateErr != nil {
+					return fmt.Errorf("validate document %d; no resources were applied: %w", index+1, validateErr)
+				}
+				hasErrors, writeErr := printDiagnostics(cmd.ErrOrStderr(), response.GetDiagnostics())
+				if writeErr != nil {
+					return writeErr
 				}
 				if hasErrors {
-					return errors.New("resource validation failed")
+					return fmt.Errorf("document %d failed validation; no resources were applied", index+1)
 				}
+				validated = append(validated, response.GetResource().GetJson())
 			}
-			return printDocument(cmd.OutOrStdout(), response.GetResource().GetJson(), opts.output)
+			if dryRun {
+				return printDocuments(cmd.OutOrStdout(), validated, opts.output)
+			}
+			applied := make([][]byte, 0, len(documents))
+			for index, document := range documents {
+				expectedVersion := document.expectedResourceVersion
+				if expected != 0 {
+					expectedVersion = expected
+				}
+				response, applyErr := client.Resources.Apply(cmd.Context(), &controlv1alpha1.ApplyRequest{Meta: requestMeta(contextName), Document: document.data, ExpectedResourceVersion: expectedVersion})
+				if applyErr != nil {
+					return fmt.Errorf("apply document %d after %d successful document(s): %w", index+1, len(applied), applyErr)
+				}
+				applied = append(applied, response.GetResource().GetJson())
+			}
+			return printDocuments(cmd.OutOrStdout(), applied, opts.output)
 		})
 	}}
-	command.Flags().StringVarP(&file, "filename", "f", "", "YAML or JSON resource")
+	command.Flags().StringVarP(&file, "filename", "f", "", "YAML or JSON resources; use - for stdin")
 	command.Flags().Uint64Var(&expected, "resource-version", 0, "required current revision for update")
 	command.Flags().BoolVar(&dryRun, "dry-run", false, "validate without persisting")
 	return command
 }
 
 func newGetCommand(opts *options) *cobra.Command {
-	return &cobra.Command{Use: "get KIND [NAME]", Short: "List or get resources", Args: cobra.RangeArgs(1, 2), RunE: func(cmd *cobra.Command, args []string) error {
+	var namespace string
+	var allNamespaces bool
+	var selectors []string
+	var pageSize uint32
+	command := &cobra.Command{Use: "get KIND [NAME]", Short: "List or get resources", Args: cobra.RangeArgs(1, 2), RunE: func(cmd *cobra.Command, args []string) error {
+		if allNamespaces && cmd.Flags().Changed("namespace") {
+			return errors.New("--all-namespaces and --namespace cannot be combined")
+		}
+		if allNamespaces {
+			namespace = ""
+		}
+		labels, err := parseLabelSelectors(selectors)
+		if err != nil {
+			return err
+		}
+		if len(args) == 2 && len(labels) > 0 {
+			return errors.New("--selector is only valid when listing resources")
+		}
 		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error {
 			if len(args) == 2 {
-				response, err := client.Resources.Get(cmd.Context(), &controlv1alpha1.GetRequest{Key: &controlv1alpha1.ResourceKey{Kind: canonicalKind(args[0]), Namespace: "default", Name: args[1]}})
+				if allNamespaces {
+					return errors.New("--all-namespaces is not valid when getting one resource")
+				}
+				response, err := client.Resources.Get(cmd.Context(), &controlv1alpha1.GetRequest{Key: &controlv1alpha1.ResourceKey{Kind: canonicalKind(args[0]), Namespace: namespace, Name: args[1]}})
 				if err != nil {
 					return err
 				}
 				return printDocument(cmd.OutOrStdout(), response.GetJson(), opts.output)
 			}
-			response, err := client.Resources.List(cmd.Context(), &controlv1alpha1.ListRequest{Kind: canonicalKind(args[0]), Namespace: "default", Limit: 100})
+			continueToken := ""
+			for {
+				response, listErr := client.Resources.List(cmd.Context(), &controlv1alpha1.ListRequest{Kind: canonicalKind(args[0]), Namespace: namespace, Labels: labels, Limit: pageSize, ContinueToken: continueToken})
+				if listErr != nil {
+					return listErr
+				}
+				for _, item := range response.GetResources() {
+					if _, writeErr := fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\t%d\t%d\n", item.GetKey().GetNamespace(), item.GetKey().GetName(), item.GetKey().GetUid(), item.GetResourceVersion(), item.GetGeneration()); writeErr != nil {
+						return writeErr
+					}
+				}
+				continueToken = response.GetContinueToken()
+				if continueToken == "" {
+					return nil
+				}
+			}
+		})
+	}}
+	command.Flags().StringVarP(&namespace, "namespace", "n", "default", "resource namespace")
+	command.Flags().BoolVarP(&allNamespaces, "all-namespaces", "A", false, "list resources across namespaces")
+	command.Flags().StringArrayVarP(&selectors, "selector", "l", nil, "exact label selector key=value; repeat for AND")
+	command.Flags().Uint32Var(&pageSize, "limit", 100, "server page size (1-1000); all pages are returned")
+	return command
+}
+
+func newWatchCommand(opts *options) *cobra.Command {
+	var namespace string
+	var allNamespaces bool
+	var afterRevision uint64
+	var count uint32
+	command := &cobra.Command{Use: "watch KIND", Short: "Watch durable resource events", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		if allNamespaces && cmd.Flags().Changed("namespace") {
+			return errors.New("--all-namespaces and --namespace cannot be combined")
+		}
+		if allNamespaces {
+			namespace = ""
+		}
+		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error {
+			stream, err := client.Resources.Watch(cmd.Context(), &controlv1alpha1.WatchRequest{Kind: canonicalKind(args[0]), Namespace: namespace, AfterRevision: afterRevision})
 			if err != nil {
 				return err
 			}
-			for _, item := range response.GetResources() {
-				if _, writeErr := fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%d\t%d\n", item.GetKey().GetName(), item.GetKey().GetUid(), item.GetResourceVersion(), item.GetGeneration()); writeErr != nil {
+			var received uint32
+			for {
+				event, receiveErr := stream.Recv()
+				if receiveErr != nil {
+					if errors.Is(receiveErr, io.EOF) || cmd.Context().Err() != nil {
+						return nil
+					}
+					return receiveErr
+				}
+				key := event.GetResource().GetKey()
+				if _, writeErr := fmt.Fprintf(cmd.OutOrStdout(), "%d\t%s\t%s\t%s\t%s\n", event.GetRevision(), event.GetType(), key.GetKind(), key.GetNamespace(), key.GetName()); writeErr != nil {
 					return writeErr
 				}
+				received++
+				if count > 0 && received >= count {
+					return nil
+				}
 			}
-			return nil
 		})
 	}}
+	command.Flags().StringVarP(&namespace, "namespace", "n", "default", "resource namespace")
+	command.Flags().BoolVarP(&allNamespaces, "all-namespaces", "A", false, "watch resources across namespaces")
+	command.Flags().Uint64Var(&afterRevision, "after-revision", 0, "resume after this durable global revision")
+	command.Flags().Uint32Var(&count, "count", 0, "stop after this many events (0 waits until cancellation)")
+	return command
+}
+
+func newExportCommand(opts *options) *cobra.Command {
+	var namespace string
+	command := &cobra.Command{Use: "export KIND NAME [NAME...]", Short: "Export desired-state resource YAML", Args: cobra.MinimumNArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
+		keys := make([]*controlv1alpha1.ResourceKey, 0, len(args)-1)
+		for _, name := range args[1:] {
+			keys = append(keys, &controlv1alpha1.ResourceKey{Kind: canonicalKind(args[0]), Namespace: namespace, Name: name})
+		}
+		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error {
+			response, err := client.Resources.Export(cmd.Context(), &controlv1alpha1.ExportRequest{Keys: keys})
+			if err != nil {
+				return err
+			}
+			if opts.output == "yaml" {
+				_, err = cmd.OutOrStdout().Write(response.GetYaml())
+				return err
+			}
+			documents, err := exportJSONDocuments(response.GetYaml())
+			if err != nil {
+				return err
+			}
+			return printDocuments(cmd.OutOrStdout(), documents, opts.output)
+		})
+	}}
+	command.Flags().StringVarP(&namespace, "namespace", "n", "default", "resource namespace")
+	return command
 }
 
 func newDescribeCommand(opts *options) *cobra.Command {
-	return &cobra.Command{Use: "describe KIND NAME", Short: "Describe a resource", Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
+	var namespace string
+	command := &cobra.Command{Use: "describe KIND NAME", Short: "Describe a resource", Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
 		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error {
-			response, err := client.Resources.Get(cmd.Context(), &controlv1alpha1.GetRequest{Key: &controlv1alpha1.ResourceKey{Kind: canonicalKind(args[0]), Namespace: "default", Name: args[1]}})
+			response, err := client.Resources.Get(cmd.Context(), &controlv1alpha1.GetRequest{Key: &controlv1alpha1.ResourceKey{Kind: canonicalKind(args[0]), Namespace: namespace, Name: args[1]}})
 			if err != nil {
 				return err
 			}
@@ -263,20 +395,24 @@ func newDescribeCommand(opts *options) *cobra.Command {
 			return printDocument(cmd.OutOrStdout(), response.GetJson(), opts.output)
 		})
 	}}
+	command.Flags().StringVarP(&namespace, "namespace", "n", "default", "resource namespace")
+	return command
 }
 
 func newDeleteCommand(opts *options) *cobra.Command {
 	var expected uint64
+	var namespace string
 	command := &cobra.Command{Use: "delete KIND NAME", Short: "Delete a resource", Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
 		if expected == 0 {
 			return errors.New("--resource-version is required")
 		}
 		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, contextName string) error {
-			_, err := client.Resources.Delete(cmd.Context(), &controlv1alpha1.DeleteRequest{Meta: requestMeta(contextName), Key: &controlv1alpha1.ResourceKey{Kind: canonicalKind(args[0]), Namespace: "default", Name: args[1]}, ExpectedResourceVersion: expected})
+			_, err := client.Resources.Delete(cmd.Context(), &controlv1alpha1.DeleteRequest{Meta: requestMeta(contextName), Key: &controlv1alpha1.ResourceKey{Kind: canonicalKind(args[0]), Namespace: namespace, Name: args[1]}, ExpectedResourceVersion: expected})
 			return err
 		})
 	}}
 	command.Flags().Uint64Var(&expected, "resource-version", 0, "required current revision")
+	command.Flags().StringVarP(&namespace, "namespace", "n", "default", "resource namespace")
 	return command
 }
 
@@ -313,12 +449,34 @@ func newFlowCommand(opts *options) *cobra.Command {
 		})
 	}}
 	validate.Flags().StringVarP(&file, "filename", "f", "", "Flow YAML or JSON")
-	command.AddCommand(validate)
+	var namespace string
+	graph := &cobra.Command{Use: "graph NAME", Short: "Render a compiled Flow as a deterministic ASCII graph", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error {
+			document, err := client.Resources.Get(cmd.Context(), &controlv1alpha1.GetRequest{Key: &controlv1alpha1.ResourceKey{Kind: "Flow", Namespace: namespace, Name: args[0]}})
+			if err != nil {
+				return err
+			}
+			response, err := client.Flows.PreviewGraph(cmd.Context(), &controlv1alpha1.PreviewGraphRequest{FlowOrPlan: document.GetJson()})
+			if err != nil {
+				return err
+			}
+			hasErrors, err := printDiagnostics(cmd.ErrOrStderr(), response.GetDiagnostics())
+			if err != nil {
+				return err
+			}
+			if hasErrors {
+				return errors.New("flow graph compilation failed")
+			}
+			return renderGraph(cmd.OutOrStdout(), response)
+		})
+	}}
+	graph.Flags().StringVarP(&namespace, "namespace", "n", "default", "Flow namespace")
+	command.AddCommand(validate, graph)
 	return command
 }
 
 func newRunCommand(opts *options) *cobra.Command {
-	command := &cobra.Command{Use: "run", Short: "Start, watch, approve, reject, or cancel runs"}
+	command := &cobra.Command{Use: "run", Short: "Start, inspect, reconcile, watch, approve, reject, or cancel runs"}
 	var input, idempotencyKey string
 	start := &cobra.Command{Use: "start FLOW", Short: "Start a manual run", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		inputJSON, err := readInput(input)
@@ -356,7 +514,60 @@ func newRunCommand(opts *options) *cobra.Command {
 			}
 		})
 	}}
-	command.AddCommand(start, watch, approvalCommand(opts, "approve"), approvalCommand(opts, "reject"), cancelCommand(opts))
+	var flowName, phase string
+	var limit uint32
+	list := &cobra.Command{Use: "list", Short: "List runs", RunE: func(cmd *cobra.Command, _ []string) error {
+		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error {
+			response, err := client.Runs.List(cmd.Context(), &controlv1alpha1.ListRunsRequest{Flow: flowName, Phase: phase, Limit: limit})
+			if err != nil {
+				return err
+			}
+			for _, run := range response.GetRuns() {
+				if _, writeErr := fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\t%s\t%s\n", run.GetUid(), run.GetFlow(), run.GetPhase(), run.GetPlanHash(), run.GetUpdatedAt().AsTime().Format(time.RFC3339)); writeErr != nil {
+					return writeErr
+				}
+			}
+			return nil
+		})
+	}}
+	list.Flags().StringVar(&flowName, "flow", "", "Flow name or UID")
+	list.Flags().StringVar(&phase, "phase", "", "run phase")
+	list.Flags().Uint32Var(&limit, "limit", 100, "maximum runs (1-1000)")
+	var attemptsLimit, artifactsLimit uint32
+	describe := &cobra.Command{Use: "describe RUN", Short: "Describe a run, its pinned plan, attempts, and artifacts", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error {
+			run, err := client.Runs.Get(cmd.Context(), &controlv1alpha1.RunRequest{Uid: args[0]})
+			if err != nil {
+				return err
+			}
+			plan, err := client.Runs.Plan(cmd.Context(), &controlv1alpha1.RunRequest{Uid: args[0]})
+			if err != nil {
+				return err
+			}
+			attempts, err := client.Runs.ListAttempts(cmd.Context(), &controlv1alpha1.ListAttemptsRequest{RunUid: args[0], Limit: attemptsLimit})
+			if err != nil {
+				return err
+			}
+			artifacts, err := client.Runs.ListArtifacts(cmd.Context(), &controlv1alpha1.ListArtifactsRequest{RunUid: args[0], Limit: artifactsLimit})
+			if err != nil {
+				return err
+			}
+			return printRunDescription(cmd.OutOrStdout(), run, plan, attempts, artifacts, opts.output)
+		})
+	}}
+	describe.Flags().Uint32Var(&attemptsLimit, "attempts-limit", 1000, "maximum node attempts")
+	describe.Flags().Uint32Var(&artifactsLimit, "artifacts-limit", 1000, "maximum artifact records")
+	reconcile := &cobra.Command{Use: "reconcile RUN", Short: "Request durable reconciliation and return current state", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error {
+			run, err := client.Runs.Reconcile(cmd.Context(), &controlv1alpha1.ReconcileRequest{RunUid: args[0]})
+			if err != nil {
+				return err
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\t%s\n", run.GetUid(), run.GetFlow(), run.GetPhase(), run.GetPlanHash())
+			return err
+		})
+	}}
+	command.AddCommand(start, list, describe, reconcile, watch, approvalCommand(opts, "approve"), approvalCommand(opts, "reject"), cancelCommand(opts))
 	return command
 }
 
@@ -411,7 +622,28 @@ func newTriggerCommand(opts *options) *cobra.Command {
 		})
 	}}
 	next.Flags().Uint32Var(&count, "count", 5, "number of occurrences to preview")
-	command.AddCommand(next, triggerMutationCommand(opts, true), triggerMutationCommand(opts, false))
+	var receiptLimit uint32
+	receipts := &cobra.Command{Use: "receipts UID", Short: "Inspect durable receipts and skipped occurrences", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error {
+			response, err := client.Triggers.Receipts(cmd.Context(), &controlv1alpha1.ReceiptRequest{TriggerUid: args[0], Limit: receiptLimit})
+			if err != nil {
+				return err
+			}
+			for _, receipt := range response.GetReceipts() {
+				if _, writeErr := fmt.Fprintf(cmd.OutOrStdout(), "RECEIPT\t%s\t%s\t%s\t%t\t%s\n", receipt.GetUid(), receipt.GetOccurrenceId(), receipt.GetRunUid(), receipt.GetDeduplicated(), receipt.GetAcceptedAt().AsTime().Format(time.RFC3339)); writeErr != nil {
+					return writeErr
+				}
+			}
+			for _, skip := range response.GetSkips() {
+				if _, writeErr := fmt.Fprintf(cmd.OutOrStdout(), "SKIP\t%s\t%s\t%s\n", skip.GetOccurrenceId(), skip.GetReason(), skip.GetScheduledAt().AsTime().Format(time.RFC3339)); writeErr != nil {
+					return writeErr
+				}
+			}
+			return nil
+		})
+	}}
+	receipts.Flags().Uint32Var(&receiptLimit, "limit", 100, "maximum receipts and skips")
+	command.AddCommand(next, receipts, triggerMutationCommand(opts, true), triggerMutationCommand(opts, false))
 	return command
 }
 
@@ -490,7 +722,24 @@ func newPluginCommand(opts *options) *cobra.Command {
 			return nil
 		})
 	}}
-	command.AddCommand(pack, install, list, pluginMutationCommand(opts, "enable"), pluginMutationCommand(opts, "disable"), pluginDoctorCommand(opts))
+	describe := &cobra.Command{Use: "describe NAME [VERSION]", Short: "Describe an installed plugin version", Args: cobra.RangeArgs(1, 2), RunE: func(cmd *cobra.Command, args []string) error {
+		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error {
+			request := &controlv1alpha1.PluginRequest{Name: args[0]}
+			if len(args) == 2 {
+				request.Version = args[1]
+			}
+			plugin, err := client.Plugins.Describe(cmd.Context(), request)
+			if err != nil {
+				return err
+			}
+			encoded, err := json.Marshal(map[string]any{"name": plugin.GetName(), "version": plugin.GetVersion(), "digest": plugin.GetDigest(), "state": plugin.GetState(), "capabilities": plugin.GetCapabilities()})
+			if err != nil {
+				return err
+			}
+			return printDocument(cmd.OutOrStdout(), encoded, opts.output)
+		})
+	}}
+	command.AddCommand(pack, install, list, describe, pluginMutationCommand(opts, "enable"), pluginMutationCommand(opts, "disable"), pluginDoctorCommand(opts))
 	return command
 }
 
@@ -682,25 +931,22 @@ func requestMeta(contextName string) *controlv1alpha1.RequestMeta {
 
 func printDocument(writer io.Writer, data []byte, format string) error {
 	if format == "json" {
-		var value any
-		if err := json.Unmarshal(data, &value); err != nil {
+		var encoded bytes.Buffer
+		if err := json.Indent(&encoded, data, "", "  "); err != nil {
 			return err
 		}
-		encoded, err := json.MarshalIndent(value, "", "  ")
-		if err != nil {
-			return err
-		}
-		_, err = fmt.Fprintln(writer, string(encoded))
+		_, err := fmt.Fprintln(writer, encoded.String())
 		return err
 	}
 	if format != "yaml" {
 		return fmt.Errorf("unsupported output format %q", format)
 	}
-	var value any
-	if err := json.Unmarshal(data, &value); err != nil {
+	var value yaml.Node
+	if err := yaml.Unmarshal(data, &value); err != nil {
 		return err
 	}
-	encoded, err := yaml.Marshal(value)
+	clearYAMLStyles(&value)
+	encoded, err := yaml.Marshal(&value)
 	if err != nil {
 		return err
 	}

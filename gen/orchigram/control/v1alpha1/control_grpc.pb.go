@@ -495,6 +495,7 @@ var FlowService_ServiceDesc = grpc.ServiceDesc{
 
 const (
 	RunService_Start_FullMethodName         = "/orchigram.control.v1alpha1.RunService/Start"
+	RunService_Get_FullMethodName           = "/orchigram.control.v1alpha1.RunService/Get"
 	RunService_List_FullMethodName          = "/orchigram.control.v1alpha1.RunService/List"
 	RunService_Plan_FullMethodName          = "/orchigram.control.v1alpha1.RunService/Plan"
 	RunService_WatchEvents_FullMethodName   = "/orchigram.control.v1alpha1.RunService/WatchEvents"
@@ -512,6 +513,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type RunServiceClient interface {
 	Start(ctx context.Context, in *StartRunRequest, opts ...grpc.CallOption) (*RunRef, error)
+	Get(ctx context.Context, in *RunRequest, opts ...grpc.CallOption) (*RunSummary, error)
 	List(ctx context.Context, in *ListRunsRequest, opts ...grpc.CallOption) (*ListRunsResponse, error)
 	Plan(ctx context.Context, in *RunRequest, opts ...grpc.CallOption) (*CompileResponse, error)
 	WatchEvents(ctx context.Context, in *WatchRunRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RunEvent], error)
@@ -536,6 +538,16 @@ func (c *runServiceClient) Start(ctx context.Context, in *StartRunRequest, opts 
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RunRef)
 	err := c.cc.Invoke(ctx, RunService_Start_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *runServiceClient) Get(ctx context.Context, in *RunRequest, opts ...grpc.CallOption) (*RunSummary, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RunSummary)
+	err := c.cc.Invoke(ctx, RunService_Get_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -665,6 +677,7 @@ func (c *runServiceClient) Reconcile(ctx context.Context, in *ReconcileRequest, 
 // for forward compatibility.
 type RunServiceServer interface {
 	Start(context.Context, *StartRunRequest) (*RunRef, error)
+	Get(context.Context, *RunRequest) (*RunSummary, error)
 	List(context.Context, *ListRunsRequest) (*ListRunsResponse, error)
 	Plan(context.Context, *RunRequest) (*CompileResponse, error)
 	WatchEvents(*WatchRunRequest, grpc.ServerStreamingServer[RunEvent]) error
@@ -687,6 +700,9 @@ type UnimplementedRunServiceServer struct{}
 
 func (UnimplementedRunServiceServer) Start(context.Context, *StartRunRequest) (*RunRef, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Start not implemented")
+}
+func (UnimplementedRunServiceServer) Get(context.Context, *RunRequest) (*RunSummary, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Get not implemented")
 }
 func (UnimplementedRunServiceServer) List(context.Context, *ListRunsRequest) (*ListRunsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method List not implemented")
@@ -753,6 +769,24 @@ func _RunService_Start_Handler(srv interface{}, ctx context.Context, dec func(in
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(RunServiceServer).Start(ctx, req.(*StartRunRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RunService_Get_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RunRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RunServiceServer).Get(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RunService_Get_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RunServiceServer).Get(ctx, req.(*RunRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -933,6 +967,10 @@ var RunService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Start",
 			Handler:    _RunService_Start_Handler,
+		},
+		{
+			MethodName: "Get",
+			Handler:    _RunService_Get_Handler,
 		},
 		{
 			MethodName: "List",

@@ -221,6 +221,7 @@ service FlowService {
 }
 service RunService {
   rpc Start(StartRunRequest) returns (RunRef);
+  rpc Get(RunRequest) returns (RunSummary);
   rpc List(ListRunsRequest) returns (ListRunsResponse);
   rpc Plan(RunRequest) returns (CompileResponse);
   rpc WatchEvents(WatchRunRequest) returns (stream RunEvent);

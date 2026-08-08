@@ -86,6 +86,48 @@ event replay. Mouse click selects a node, double-click opens it, and the wheel
 pans the viewport. Every operation required for approval and inspection also
 has a keyboard path.
 
+## Scriptable CLI
+
+The CLI uses the same gRPC services and contexts as the TUI. Apply one or more
+strict resources from a file or stdin:
+
+```console
+orchigram apply -f resources.yaml
+orchigram apply -f - < resources.yaml
+```
+
+Multi-document apply validates every document before the first write. An
+update uses each document's `metadata.resourceVersion`; a later compare-and-swap
+conflict reports both the failing document and how many earlier documents were
+committed. Export emits status-free desired-state YAML that can be applied back:
+
+```console
+orchigram export flow daily-review weekly-review > flows.yaml
+orchigram apply -f flows.yaml
+```
+
+Resource lists automatically traverse revision-bound pages. Exact label
+selectors are ANDed, and watches expose their durable resume revision:
+
+```console
+orchigram get flows -A --selector team=platform --limit 100
+orchigram watch flows -A --after-revision 42
+```
+
+Operator inspection and reconciliation remain separate operations:
+
+```console
+orchigram flow graph daily-review
+orchigram run list --flow daily-review --phase waiting
+orchigram run describe RUN_UID
+orchigram run reconcile RUN_UID
+orchigram trigger receipts TRIGGER_UID
+orchigram plugin describe github 0.1.0
+```
+
+`run describe` returns the immutable pinned plan plus attempt and artifact
+metadata; it does not reconcile the workflow or inline raw artifact content.
+
 ## Verification and recovery
 
 Useful server checks are:

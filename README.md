@@ -12,7 +12,7 @@ Orchigram is a local-first, declarative agent workflow orchestrator with a k9s-s
 
 - `orchigram` opens the TUI.
 - `orchigram server` runs the daemon.
-- `orchigram apply/get/describe/delete` manage strict YAML resources.
+- `orchigram apply/get/watch/export/describe/delete` manage strict YAML resources.
 - `orchigram run`, `flow`, `trigger`, `plugin`, and `context` provide scriptable operations.
 - First-party agent, exec, HTTP, and GitHub providers are independent gRPC plugin executables.
 - Community plugins build in separate modules against [`sdk/plugin`](sdk/plugin); `orchigram plugin pack` creates deterministic installable bundles locally.
