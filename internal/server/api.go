@@ -250,6 +250,8 @@ func (a *API) Watch(request *controlv1alpha1.WatchRequest, stream grpc.ServerStr
 					return status.Error(codes.Internal, "stored resource event is invalid")
 				}
 				document = a.projectResource(stream.Context(), doc)
+			} else {
+				document = &controlv1alpha1.ResourceDocument{Key: &controlv1alpha1.ResourceKey{Kind: event.Kind, Namespace: event.Namespace, Name: event.Name, Uid: event.UID}, ResourceVersion: event.Revision}
 			}
 			if err := stream.Send(&controlv1alpha1.ResourceEvent{Revision: event.Revision, Type: event.Type, Resource: document, ObservedAt: timestamppb.New(event.ObservedAt)}); err != nil {
 				return err

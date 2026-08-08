@@ -71,7 +71,8 @@ Run `orchigram` to open the English-only interface. The core bindings are:
 - `:` command palette, `/` resource filter, and `?` help;
 - `Enter` drill-down and `Esc` back;
 - arrows or `h/j/k/l` to select graph nodes;
-- `g` graph, `l` logs, `e` events, `y` read-only YAML, `d` describe;
+- `g` graph, `e` structured events, `t` attempts, `f` artifacts, and `l` logs;
+- `y` read-only YAML and `d` describe;
 - `E` edit the schema-derived projection;
 - `a` approve, `r` reject, and `c` cancel the selected run;
 - `q` quit.
@@ -85,6 +86,20 @@ The graph view is shared by Flow definitions, live run status, and historical
 event replay. Mouse click selects a node, double-click opens it, and the wheel
 pans the viewport. Every operation required for approval and inspection also
 has a keyboard path.
+
+The resource tree is a live projection, not a startup snapshot. The TUI loads
+one revision-bound all-resource snapshot and resumes one durable global watch
+from that revision. A page conflict causes a bounded-backoff full resync;
+stream interruption resumes from the last applied revision. Active run phases
+come from durable per-run event streams with sequence deduplication, while a
+bounded list poll discovers newly accepted runs. Plugin state and aggregate
+health refresh independently. The status line reports only component state and
+never includes raw dependency errors.
+
+Events, attempts, artifacts, and logs are separate run views. Historical runs
+replay their durable event sequence onto the same graph primitive used for Flow
+definitions and active overlays. Text artifacts have a bounded 2 MiB preview;
+binary artifacts remain metadata-only in the TUI.
 
 ## Scriptable CLI
 

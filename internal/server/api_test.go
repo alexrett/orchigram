@@ -337,7 +337,8 @@ spec: {type: command, executable: next-agent}
 			t.Fatalf("watch event %d=%+v", index, stream.events[index])
 		}
 	}
-	if stream.events[1].GetResource().GetGeneration() != stream.events[0].GetResource().GetGeneration() || stream.events[1].GetResource().GetResourceVersion() <= stream.events[0].GetResource().GetResourceVersion() || stream.events[3].GetResource() != nil {
+	deleted := stream.events[3].GetResource()
+	if stream.events[1].GetResource().GetGeneration() != stream.events[0].GetResource().GetGeneration() || stream.events[1].GetResource().GetResourceVersion() <= stream.events[0].GetResource().GetResourceVersion() || deleted.GetKey().GetKind() != "AgentProfile" || deleted.GetKey().GetNamespace() != resource.DefaultNamespace || deleted.GetKey().GetName() != "delta" || deleted.GetKey().GetUid() == "" || deleted.GetResourceVersion() != stream.events[3].GetRevision() {
 		t.Fatalf("status/delete watch events=%+v", stream.events)
 	}
 }

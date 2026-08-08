@@ -63,6 +63,16 @@ func TestGraphMouseSelectsAndOpensNode(t *testing.T) {
 	}
 }
 
+func TestGraphPlanReplacementClearsLiveOverlay(t *testing.T) {
+	t.Parallel()
+	graph := NewGraph().SetPlan(flow.ExecutionPlan{Nodes: []flow.PlanNode{{ID: "old", Uses: "core.noop"}}})
+	graph.SetStatus("old", "completed")
+	graph.SetPlan(flow.ExecutionPlan{Nodes: []flow.PlanNode{{ID: "new", Uses: "core.noop"}}})
+	if len(graph.status) != 0 {
+		t.Fatalf("stale live overlay survived plan replacement: %+v", graph.status)
+	}
+}
+
 func TestSecretRefFormExposesOnlyReferenceMetadata(t *testing.T) {
 	t.Parallel()
 	fields := resourceFormFields("SecretRef", map[string]any{})

@@ -4,8 +4,8 @@ Status: active recovery milestone
 Current milestone: v0.1.0 First Real Release
 Current phase: 9 of 12
 Progress: 1/5 release phases
-Last activity: 2026-08-08
-Current focus: complete the live watch-driven TUI operator surface after the real-UDS CLI gate
+Last activity: 2026-08-09
+Current focus: complete keyboard-only TUI mutations and interactive graph editing on the live model
 
 ## Reality check
 
@@ -48,6 +48,14 @@ aggregate health.
 The fourth Phase 9 gate now passes exact label selection, revision-bound keyset
 pagination, durable watch replay, desired-state YAML export, and composed Run
 filters through the public gRPC API.
+
+The fifth Phase 9 gate now passes the complete scriptable CLI contract through
+a real Unix-socket daemon, including validation-first multi-document apply,
+watch/export, graph, run evidence, receipts, plugin inspection, and health.
+
+The sixth Phase 9 gate now passes live resource tombstones, revision/sequence
+resume, daemon-socket restart recovery, run overlays and historical replay, and
+distinct event/attempt/artifact/log views in the same terminal process.
 
 ## Active phase gate
 

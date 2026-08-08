@@ -599,6 +599,10 @@ func (s *Store) delete(ctx context.Context, kind, namespace, name string, expect
 type ResourceEvent struct {
 	Revision   uint64
 	Type       string
+	Kind       string
+	Namespace  string
+	Name       string
+	UID        string
 	Document   []byte
 	ObservedAt time.Time
 }
@@ -608,7 +612,7 @@ func (s *Store) EventsAfter(ctx context.Context, kind, namespace string, revisio
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT revision,event_type,resource_json,observed_at FROM resource_events WHERE revision>? AND (?='' OR kind=?) AND (?='' OR namespace=?) ORDER BY revision LIMIT ?`, revision, kind, kind, namespace, namespace, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT revision,event_type,kind,namespace,name,uid,resource_json,observed_at FROM resource_events WHERE revision>? AND (?='' OR kind=?) AND (?='' OR namespace=?) ORDER BY revision LIMIT ?`, revision, kind, kind, namespace, namespace, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -617,7 +621,7 @@ func (s *Store) EventsAfter(ctx context.Context, kind, namespace string, revisio
 	for rows.Next() {
 		var event ResourceEvent
 		var observed string
-		if err := rows.Scan(&event.Revision, &event.Type, &event.Document, &observed); err != nil {
+		if err := rows.Scan(&event.Revision, &event.Type, &event.Kind, &event.Namespace, &event.Name, &event.UID, &event.Document, &observed); err != nil {
 			return nil, err
 		}
 		event.ObservedAt, _ = time.Parse(time.RFC3339Nano, observed)
