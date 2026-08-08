@@ -1,7 +1,8 @@
 # Triggers
 
 Every external occurrence crosses the same SQLite transaction boundary. The
-daemon writes a `TriggerReceipt` and a `start-run` outbox command before it
+daemon compiles the target Flow and writes its immutable `ExecutionPlan`, a
+`TriggerReceipt`, and a `start-run` outbox command in one transaction before it
 returns HTTP 202 or acknowledges a provider event. The receipt's stable
 occurrence identity selects exactly one local Run UID. External activities are
 still at-least-once and must use their stable node idempotency key.
@@ -38,9 +39,10 @@ creation without losing events across daemon restart. Non-replay bootstrap
 fails closed unless the plugin declares
 `trigger.bootstrap.activation-fence`; older providers can run only from an
 existing cursor or with an explicit replay request.
-The daemon sends an acknowledgement only after receipt, outbox, and cursor are
-committed together. A stream restart therefore replays safely. The bundled
-GitHub provider uses polling rather than requiring public ingress.
+The daemon sends an acknowledgement only after plan, receipt, outbox, and cursor
+are committed together. A stream restart therefore replays safely and dispatch
+does not read mutable current Flow state. The bundled GitHub provider uses
+polling rather than requiring public ingress.
 Provider acceptance also verifies the authoritative Trigger generation and
 enabled state in that transaction. Disable and delete therefore fence an
 in-flight watch before it can commit a later receipt; controller cancellation is

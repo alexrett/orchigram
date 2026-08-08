@@ -191,53 +191,216 @@ func (m *Manager) HasAction(action string) bool {
 	return false
 }
 
-// ValidateAction asks the active provider to validate configuration at compile time.
+// ValidateAction resolves and validates the same immutable binding used by a
+// compiled plan.
 func (m *Manager) ValidateAction(action string, config map[string]any) []flow.Diagnostic {
+	_, diagnostics := m.BindAction(action, config)
+	return diagnostics
+}
+
+// BindAction pins the active plugin binary and every referenced configuration
+// projection while keeping secret values out of the execution plan.
+func (m *Manager) BindAction(action string, config map[string]any) (flow.ActionBinding, []flow.Diagnostic) {
 	name := strings.SplitN(action, ".", 2)[0]
-	if name == "agent-command" {
-		profile, _ := config["profile"].(string)
-		if profile == "" {
-			return []flow.Diagnostic{{Path: "config.profile", Code: "required", Message: "agent-command action requires a profile"}}
-		}
-		if _, err := m.store.Get(context.Background(), "AgentProfile", resource.DefaultNamespace, profile); err != nil {
-			return []flow.Diagnostic{{Path: "config.profile", Code: "not_found", Message: fmt.Sprintf("AgentProfile %q is not available", profile)}}
-		}
-		return nil
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	process, _, err := m.activeProcess(ctx, name)
+	record, err := m.store.Plugin(context.Background(), name, "")
 	if err != nil {
-		return []flow.Diagnostic{{Path: "config", Code: "plugin_unavailable", Message: err.Error()}}
+		return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config", Code: "plugin_unavailable", Message: err.Error()}}
 	}
-	copyConfig := make(map[string]any, len(config))
-	for key, value := range config {
-		if key != "secretRefs" && key != "mappings" {
-			copyConfig[key] = value
+	var manifest pluginbundle.Manifest
+	if err := json.Unmarshal(record.ManifestJSON, &manifest); err != nil {
+		return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config", Code: "plugin_invalid", Message: err.Error()}}
+	}
+	boundConfig, err := cloneConfig(config)
+	if err != nil {
+		return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config", Code: "invalid", Message: err.Error()}}
+	}
+	bindings := map[string]flow.ResourceBinding{}
+	bindResource := func(kind, resourceName string) (resource.Document, error) {
+		document, getErr := m.store.Get(context.Background(), kind, resource.DefaultNamespace, resourceName)
+		if getErr != nil {
+			return resource.Document{}, getErr
 		}
+		binding := flow.ResourceBinding{
+			Kind: kind, Namespace: document.Metadata.Namespace, Name: document.Metadata.Name,
+			UID: document.Metadata.UID, ResourceVersion: document.Metadata.ResourceVersion,
+			Generation: document.Metadata.Generation, Spec: append(json.RawMessage(nil), document.Spec...),
+		}
+		bindings[kind+"/"+document.Metadata.Namespace+"/"+document.Metadata.Name] = binding
+		return document, nil
+	}
+	bindSecret := func(secretName string) error {
+		if secretName == "" {
+			return errors.New("SecretRef name is empty")
+		}
+		_, bindErr := bindResource("SecretRef", secretName)
+		return bindErr
+	}
+	if name == "agent-command" {
+		profileName, _ := boundConfig["profile"].(string)
+		if profileName == "" {
+			return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config.profile", Code: "required", Message: "agent-command action requires a profile"}}
+		}
+		document, bindErr := bindResource("AgentProfile", profileName)
+		if bindErr != nil {
+			return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config.profile", Code: "not_found", Message: fmt.Sprintf("AgentProfile %q is not available", profileName)}}
+		}
+		profile, decodeErr := resource.DecodeAgentProfile(document.JSON)
+		if decodeErr != nil {
+			return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config.profile", Code: "invalid", Message: decodeErr.Error()}}
+		}
+		for _, reference := range profile.Spec.SecretRefs {
+			_, secretName := splitSecretBinding(reference)
+			if bindErr := bindSecret(secretName); bindErr != nil {
+				return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config.profile", Code: "not_found", Message: bindErr.Error()}}
+			}
+		}
+		return actionBinding(record, manifest, boundConfig, bindings), nil
 	}
 	if action == "github.workspace.checkout" {
-		if err := m.expandRepositoryConfig(context.Background(), copyConfig); err != nil {
-			return []flow.Diagnostic{{Path: "config.repositoryRef", Code: "not_found", Message: err.Error()}}
+		repositoryName, _ := boundConfig["repositoryRef"].(string)
+		if repositoryName == "" {
+			return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config.repositoryRef", Code: "required", Message: "repositoryRef is required"}}
+		}
+		document, bindErr := bindResource("Repository", repositoryName)
+		if bindErr != nil {
+			return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config.repositoryRef", Code: "not_found", Message: fmt.Sprintf("resolve Repository %q: %v", repositoryName, bindErr)}}
+		}
+		repository, decodeErr := resource.DecodeRepository(document.JSON)
+		if decodeErr != nil {
+			return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config.repositoryRef", Code: "invalid", Message: decodeErr.Error()}}
+		}
+		delete(boundConfig, "repositoryRef")
+		boundConfig["cloneURL"] = repository.Spec.CloneURL
+		boundConfig["defaultBranch"] = repository.Spec.DefaultBranch
+		if repository.Spec.AuthSecretRef != "" {
+			if bindErr := bindSecret(repository.Spec.AuthSecretRef); bindErr != nil {
+				return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config.repositoryRef", Code: "not_found", Message: bindErr.Error()}}
+			}
+			if bindErr := bindSecretConfig(boundConfig, "token", repository.Spec.AuthSecretRef); bindErr != nil {
+				return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config.secretRefs", Code: "invalid", Message: bindErr.Error()}}
+			}
+			if _, exists := boundConfig["tokenSecret"]; !exists {
+				boundConfig["tokenSecret"] = "token"
+			}
+		}
+	}
+	secretNames, err := secretReferenceNames(boundConfig)
+	if err != nil {
+		return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config.secretRefs", Code: "invalid", Message: err.Error()}}
+	}
+	for _, secretName := range secretNames {
+		if bindErr := bindSecret(secretName); bindErr != nil {
+			return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config.secretRefs", Code: "not_found", Message: bindErr.Error()}}
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	process, _, err := m.processFor(ctx, name, record.Version, record.Digest)
+	if err != nil {
+		return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config", Code: "plugin_unavailable", Message: err.Error()}}
+	}
+	validationConfig := make(map[string]any, len(boundConfig))
+	for key, value := range boundConfig {
+		if key != "secretRefs" && key != "mappings" {
+			validationConfig[key] = value
 		}
 	}
 	if strings.HasPrefix(action, "github.workspace.") {
-		copyConfig["workspaceRoot"] = m.workspaces
+		validationConfig["workspaceRoot"] = m.workspaces
 	}
-	delete(copyConfig, "secretRefs")
-	configJSON, err := json.Marshal(copyConfig)
+	configJSON, err := json.Marshal(validationConfig)
 	if err != nil {
-		return []flow.Diagnostic{{Path: "config", Code: "invalid", Message: err.Error()}}
+		return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config", Code: "invalid", Message: err.Error()}}
 	}
 	response, err := process.Clients().Task.ValidateAction(ctx, &pluginv1alpha1.ValidateActionRequest{Action: action, ConfigJson: configJSON})
 	if err != nil {
-		return []flow.Diagnostic{{Path: "config", Code: "validation_failed", Message: err.Error()}}
+		return flow.ActionBinding{}, []flow.Diagnostic{{Path: "config", Code: "validation_failed", Message: err.Error()}}
 	}
 	diagnostics := make([]flow.Diagnostic, 0, len(response.GetIssues()))
 	for _, issue := range response.GetIssues() {
 		diagnostics = append(diagnostics, flow.Diagnostic{Path: issue.GetPath(), Code: issue.GetCode(), Message: issue.GetMessage()})
 	}
-	return diagnostics
+	if len(diagnostics) != 0 {
+		return flow.ActionBinding{}, diagnostics
+	}
+	return actionBinding(record, manifest, boundConfig, bindings), nil
+}
+
+func actionBinding(record store.PluginRecord, manifest pluginbundle.Manifest, config map[string]any, resources map[string]flow.ResourceBinding) flow.ActionBinding {
+	bindings := make([]flow.ResourceBinding, 0, len(resources))
+	for _, binding := range resources {
+		bindings = append(bindings, binding)
+	}
+	sort.Slice(bindings, func(i, j int) bool {
+		left := bindings[i].Kind + "/" + bindings[i].Namespace + "/" + bindings[i].Name
+		right := bindings[j].Kind + "/" + bindings[j].Namespace + "/" + bindings[j].Name
+		return left < right
+	})
+	protocol := uint32(1)
+	if manifest.Protocol.Maximum < protocol {
+		protocol = manifest.Protocol.Maximum
+	}
+	return flow.ActionBinding{
+		Plugin: flow.PluginBinding{Name: record.Name, Version: record.Version, Digest: record.Digest, ProtocolVersion: protocol},
+		Config: config, Resources: bindings,
+	}
+}
+
+func cloneConfig(config map[string]any) (map[string]any, error) {
+	encoded, err := json.Marshal(config)
+	if err != nil {
+		return nil, err
+	}
+	result := map[string]any{}
+	if err := json.Unmarshal(encoded, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func bindSecretConfig(config map[string]any, target, name string) error {
+	bindings, exists := config["secretRefs"]
+	if !exists {
+		bindings = map[string]any{}
+		config["secretRefs"] = bindings
+	}
+	bindingMap, ok := bindings.(map[string]any)
+	if !ok {
+		return errors.New("with.secretRefs must be a string map")
+	}
+	if _, exists := bindingMap[target]; !exists {
+		bindingMap[target] = name
+	}
+	return nil
+}
+
+func secretReferenceNames(config map[string]any) ([]string, error) {
+	raw, exists := config["secretRefs"]
+	if !exists {
+		return nil, nil
+	}
+	references, ok := raw.(map[string]any)
+	if !ok {
+		return nil, errors.New("with.secretRefs must be a string map")
+	}
+	result := make([]string, 0, len(references))
+	for target, value := range references {
+		name, ok := value.(string)
+		if !ok || name == "" {
+			return nil, fmt.Errorf("secret reference for %s must be a resource name", target)
+		}
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func splitSecretBinding(binding string) (string, string) {
+	if parts := strings.SplitN(binding, "=", 2); len(parts) == 2 {
+		return parts[0], parts[1]
+	}
+	return "", binding
 }
 
 // Describe returns one installed or active version.
@@ -329,7 +492,18 @@ func (m *Manager) Doctor(ctx context.Context, name, version string) error {
 // Execute implements engine.TaskExecutor for non-core Flow nodes.
 func (m *Manager) Execute(ctx context.Context, runUID string, node flow.PlanNode, input json.RawMessage, nodes map[string]any, idempotencyKey string) (json.RawMessage, error) {
 	pluginName := strings.SplitN(node.Uses, ".", 2)[0]
-	process, record, err := m.activeProcess(ctx, pluginName)
+	var process *pluginhost.Process
+	var record store.PluginRecord
+	var err error
+	if node.Plugin != nil {
+		if node.Plugin.Name != pluginName {
+			return nil, fmt.Errorf("plan plugin binding %q does not provide action %q", node.Plugin.Name, node.Uses)
+		}
+		process, record, err = m.processFor(ctx, node.Plugin.Name, node.Plugin.Version, node.Plugin.Digest)
+	} else {
+		// Compatibility for prototype plans compiled before dependency binding.
+		process, record, err = m.activeProcess(ctx, pluginName)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -440,14 +614,16 @@ func (m *Manager) executeTask(ctx context.Context, process *pluginhost.Process, 
 		return nil, err
 	}
 	if node.Uses == "github.workspace.checkout" {
-		if err := m.expandRepositoryConfig(ctx, config); err != nil {
-			return nil, err
+		if _, legacy := config["repositoryRef"]; legacy {
+			if err := m.expandRepositoryConfig(ctx, config); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if strings.HasPrefix(node.Uses, "github.workspace.") {
 		config["workspaceRoot"] = m.workspaces
 	}
-	secrets, err := m.resolveNodeSecrets(ctx, config)
+	secrets, err := m.resolveNodeSecrets(ctx, config, node.Resources)
 	if err != nil {
 		return nil, err
 	}
@@ -503,19 +679,15 @@ func (m *Manager) executeAgent(ctx context.Context, process *pluginhost.Process,
 	if profileName == "" {
 		return nil, errors.New("agent-command node requires with.profile")
 	}
-	document, err := m.store.Get(ctx, "AgentProfile", resource.DefaultNamespace, profileName)
+	profileSpec, err := m.boundAgentProfile(ctx, node.Resources, profileName)
 	if err != nil {
 		return nil, err
 	}
-	profile, err := resource.DecodeAgentProfile(document.JSON)
+	secrets, err := m.resolveProfileSecrets(ctx, profileSpec.SecretRefs, node.Resources)
 	if err != nil {
 		return nil, err
 	}
-	secrets, err := m.resolveProfileSecrets(ctx, profile.Spec.SecretRefs)
-	if err != nil {
-		return nil, err
-	}
-	profileJSON, err := json.Marshal(profile.Spec)
+	profileJSON, err := json.Marshal(profileSpec)
 	if err != nil {
 		return nil, err
 	}
@@ -549,7 +721,7 @@ func (m *Manager) executeAgent(ctx context.Context, process *pluginhost.Process,
 	if err != nil {
 		return nil, err
 	}
-	stream, err := process.Clients().Agent.Execute(ctx, &pluginv1alpha1.AgentRequest{Meta: meta, ProfileType: profile.Spec.Type, ProfileJson: profileJSON, InputJson: agentInput, Secrets: secrets})
+	stream, err := process.Clients().Agent.Execute(ctx, &pluginv1alpha1.AgentRequest{Meta: meta, ProfileType: profileSpec.Type, ProfileJson: profileJSON, InputJson: agentInput, Secrets: secrets})
 	if err != nil {
 		return nil, err
 	}
@@ -605,6 +777,13 @@ func (m *Manager) consume(ctx context.Context, artifact runArtifact, stream even
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
+			code := status.Code(err)
+			if code == codes.Canceled {
+				return nil, context.Canceled
+			}
+			if code == codes.DeadlineExceeded {
+				return nil, context.DeadlineExceeded
+			}
 			return nil, sanitizePluginError(err, artifact.redactions)
 		}
 		if terminal != "" {
@@ -645,7 +824,22 @@ func (m *Manager) activeProcess(ctx context.Context, name string) (*pluginhost.P
 	if err != nil {
 		return nil, store.PluginRecord{}, fmt.Errorf("active plugin %q: %w", name, err)
 	}
-	key := installationKey(name, record.Version)
+	return m.processForRecord(ctx, record)
+}
+
+func (m *Manager) processFor(ctx context.Context, name, version, digest string) (*pluginhost.Process, store.PluginRecord, error) {
+	record, err := m.store.Plugin(ctx, name, version)
+	if err != nil {
+		return nil, store.PluginRecord{}, fmt.Errorf("pinned plugin %s@%s: %w", name, version, err)
+	}
+	if record.Digest != digest {
+		return nil, store.PluginRecord{}, fmt.Errorf("pinned plugin %s@%s digest mismatch", name, version)
+	}
+	return m.processForRecord(ctx, record)
+}
+
+func (m *Manager) processForRecord(ctx context.Context, record store.PluginRecord) (*pluginhost.Process, store.PluginRecord, error) {
+	key := installationKey(record.Name, record.Version)
 	m.mu.Lock()
 	if running := m.processes[key]; running != nil && !running.Exited() {
 		m.mu.Unlock()
@@ -688,7 +882,7 @@ func (m *Manager) launch(ctx context.Context, record store.PluginRecord) (*plugi
 	return process, nil
 }
 
-func (m *Manager) resolveNodeSecrets(ctx context.Context, config map[string]any) (map[string][]byte, error) {
+func (m *Manager) resolveNodeSecrets(ctx context.Context, config map[string]any, bindingSets ...[]flow.ResourceBinding) (map[string][]byte, error) {
 	value, exists := config["secretRefs"]
 	if !exists {
 		return nil, nil
@@ -704,7 +898,7 @@ func (m *Manager) resolveNodeSecrets(ctx context.Context, config map[string]any)
 		if !ok || name == "" {
 			return nil, fmt.Errorf("secret reference for %s must be a resource name", target)
 		}
-		secret, err := m.resolveSecret(ctx, name)
+		secret, err := m.resolveBoundSecret(ctx, name, firstBindings(bindingSets))
 		if err != nil {
 			return nil, err
 		}
@@ -895,23 +1089,64 @@ func setPointerValue(current any, tokens []string, value any) (any, error) {
 	}
 }
 
-func (m *Manager) resolveProfileSecrets(ctx context.Context, references []string) (map[string][]byte, error) {
+func (m *Manager) resolveProfileSecrets(ctx context.Context, references []string, bindingSets ...[]flow.ResourceBinding) (map[string][]byte, error) {
 	result := make(map[string][]byte, len(references))
 	for _, binding := range references {
-		target, name := "", binding
-		if parts := strings.SplitN(binding, "=", 2); len(parts) == 2 {
-			target, name = parts[0], parts[1]
-		}
+		target, name := splitSecretBinding(binding)
 		if target == "" {
 			target = secretEnvironmentName(name)
 		}
-		secret, err := m.resolveSecret(ctx, name)
+		secret, err := m.resolveBoundSecret(ctx, name, firstBindings(bindingSets))
 		if err != nil {
 			return nil, err
 		}
 		result[target] = secret
 	}
 	return result, nil
+}
+
+func firstBindings(bindingSets [][]flow.ResourceBinding) []flow.ResourceBinding {
+	if len(bindingSets) == 0 {
+		return nil
+	}
+	return bindingSets[0]
+}
+
+func (m *Manager) boundAgentProfile(ctx context.Context, bindings []flow.ResourceBinding, name string) (resource.AgentProfileSpec, error) {
+	for _, binding := range bindings {
+		if binding.Kind == "AgentProfile" && binding.Namespace == resource.DefaultNamespace && binding.Name == name {
+			var spec resource.AgentProfileSpec
+			if err := json.Unmarshal(binding.Spec, &spec); err != nil {
+				return resource.AgentProfileSpec{}, fmt.Errorf("decode pinned AgentProfile %q: %w", name, err)
+			}
+			return spec, nil
+		}
+	}
+	// Compatibility for prototype plans compiled before resource binding.
+	document, err := m.store.Get(ctx, "AgentProfile", resource.DefaultNamespace, name)
+	if err != nil {
+		return resource.AgentProfileSpec{}, err
+	}
+	profile, err := resource.DecodeAgentProfile(document.JSON)
+	if err != nil {
+		return resource.AgentProfileSpec{}, err
+	}
+	return profile.Spec, nil
+}
+
+func (m *Manager) resolveBoundSecret(ctx context.Context, name string, bindings []flow.ResourceBinding) ([]byte, error) {
+	for _, binding := range bindings {
+		if binding.Kind != "SecretRef" || binding.Namespace != resource.DefaultNamespace || binding.Name != name {
+			continue
+		}
+		var spec resource.SecretRefSpec
+		if err := json.Unmarshal(binding.Spec, &spec); err != nil {
+			return nil, fmt.Errorf("decode pinned SecretRef %q: %w", name, err)
+		}
+		return resolveSecretSpec(name, spec)
+	}
+	// Compatibility for prototype plans and controller-owned secret resolution.
+	return m.resolveSecret(ctx, name)
 }
 
 func (m *Manager) resolveSecret(ctx context.Context, name string) ([]byte, error) {
@@ -923,15 +1158,19 @@ func (m *Manager) resolveSecret(ctx context.Context, name string) ([]byte, error
 	if err != nil {
 		return nil, err
 	}
-	switch reference.Spec.Backend {
+	return resolveSecretSpec(name, reference.Spec)
+}
+
+func resolveSecretSpec(name string, spec resource.SecretRefSpec) ([]byte, error) {
+	switch spec.Backend {
 	case "environment", "env":
-		value, exists := os.LookupEnv(reference.Spec.Key)
+		value, exists := os.LookupEnv(spec.Key)
 		if !exists {
 			return nil, fmt.Errorf("SecretRef %q is not configured", name)
 		}
 		return []byte(value), nil
 	case "file":
-		file, err := os.Open(filepath.Clean(reference.Spec.Key)) //nolint:gosec // The operator explicitly configures this SecretRef path.
+		file, err := os.Open(filepath.Clean(spec.Key)) //nolint:gosec // The operator explicitly configures this SecretRef path.
 		if err != nil {
 			return nil, fmt.Errorf("SecretRef %q is not configured", name)
 		}
@@ -942,7 +1181,7 @@ func (m *Manager) resolveSecret(ctx context.Context, name string) ([]byte, error
 		}
 		return data, nil
 	default:
-		return nil, fmt.Errorf("SecretRef %q uses unsupported backend %q", name, reference.Spec.Backend)
+		return nil, fmt.Errorf("SecretRef %q uses unsupported backend %q", name, spec.Backend)
 	}
 }
 

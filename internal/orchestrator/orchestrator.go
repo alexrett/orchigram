@@ -64,7 +64,7 @@ func (o *Orchestrator) StartManual(ctx context.Context, flowName, namespace stri
 	if idempotencyKey == "" {
 		idempotencyKey = uuid.NewString()
 	}
-	receipt, err := o.store.AcceptTrigger(ctx, "manual:"+namespace+":"+flowName, idempotencyKey, flowName, namespace, input, deduplicated)
+	receipt, err := o.AcceptTrigger(ctx, "manual:"+namespace+":"+flowName, idempotencyKey, flowName, namespace, input, deduplicated)
 	if err != nil {
 		return store.Receipt{}, err
 	}
@@ -75,26 +75,49 @@ func (o *Orchestrator) StartManual(ctx context.Context, flowName, namespace stri
 	return receipt, nil
 }
 
+// AcceptTrigger compiles the referenced Flow before acknowledging the
+// occurrence and atomically stores the resulting immutable plan with the
+// receipt and outbox command.
+func (o *Orchestrator) AcceptTrigger(ctx context.Context, triggerUID, occurrenceID, flowName, namespace string, input json.RawMessage, deduplicated bool) (store.Receipt, error) {
+	if existing, err := o.store.ReceiptByOccurrence(ctx, triggerUID, occurrenceID); err == nil {
+		existing.Existing = true
+		return existing, nil
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return store.Receipt{}, err
+	}
+	plan, err := o.compileCurrentFlow(ctx, flowName, namespace)
+	if err != nil {
+		return store.Receipt{}, err
+	}
+	return o.store.AcceptTriggerWithPlan(ctx, triggerUID, occurrenceID, flowName, namespace, input, deduplicated, plan)
+}
+
+// AcceptProviderTrigger applies the same immutable acceptance boundary while
+// also persisting the provider cursor under Trigger generation validation.
+func (o *Orchestrator) AcceptProviderTrigger(ctx context.Context, triggerUID string, triggerGeneration uint64, occurrenceID, flowName, namespace string, input json.RawMessage, cursor string) (store.Receipt, error) {
+	plan, err := o.compileCurrentFlow(ctx, flowName, namespace)
+	if err != nil {
+		return store.Receipt{}, err
+	}
+	return o.store.AcceptProviderTriggerWithPlan(ctx, triggerUID, triggerGeneration, occurrenceID, flowName, namespace, input, cursor, plan)
+}
+
 // ReconcileOne dispatches at most one durable outbox command.
 func (o *Orchestrator) ReconcileOne(ctx context.Context) error {
 	command, err := o.store.ClaimStart(ctx, o.claimStaleAfter)
 	if err != nil {
 		return err
 	}
-	doc, err := o.store.Get(ctx, "Flow", command.Payload.Namespace, command.Payload.FlowName)
+	var plan flow.ExecutionPlan
+	if command.Payload.PlanHash != "" {
+		plan, err = o.store.GetPlan(ctx, command.Payload.PlanHash)
+	} else {
+		// Compatibility path for prototype databases that contain an accepted
+		// pre-v0.1 outbox command. All new runtime acceptors persist PlanHash.
+		plan, err = o.compileCurrentFlow(ctx, command.Payload.FlowName, command.Payload.Namespace)
+	}
 	if err != nil {
 		_ = o.store.RetryOutbox(ctx, command.ID, err, time.Second)
-		return fmt.Errorf("resolve flow: %w", err)
-	}
-	flowResource, err := resource.DecodeFlow(doc.JSON)
-	if err != nil {
-		_ = o.store.RetryOutbox(ctx, command.ID, err, time.Minute)
-		return err
-	}
-	plan, diagnostics := o.compiler.Compile(flowResource)
-	if len(diagnostics) > 0 {
-		err = fmt.Errorf("flow compile failed: %s at %s", diagnostics[0].Message, diagnostics[0].Path)
-		_ = o.store.RetryOutbox(ctx, command.ID, err, time.Minute)
 		return err
 	}
 	created, err := o.store.EnsureRun(ctx, command.Payload, plan)
@@ -133,6 +156,22 @@ func (o *Orchestrator) ReconcileOne(ctx context.Context) error {
 		return err
 	}
 	return o.store.CompleteOutbox(ctx, command.ID)
+}
+
+func (o *Orchestrator) compileCurrentFlow(ctx context.Context, flowName, namespace string) (flow.ExecutionPlan, error) {
+	doc, err := o.store.Get(ctx, "Flow", namespace, flowName)
+	if err != nil {
+		return flow.ExecutionPlan{}, fmt.Errorf("resolve flow: %w", err)
+	}
+	flowResource, err := resource.DecodeFlow(doc.JSON)
+	if err != nil {
+		return flow.ExecutionPlan{}, err
+	}
+	plan, diagnostics := o.compiler.Compile(flowResource)
+	if len(diagnostics) > 0 {
+		return flow.ExecutionPlan{}, fmt.Errorf("flow compile failed: %s at %s", diagnostics[0].Message, diagnostics[0].Path)
+	}
+	return plan, nil
 }
 
 func (o *Orchestrator) loop(ctx context.Context) {

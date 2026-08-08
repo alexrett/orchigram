@@ -108,6 +108,61 @@ func TestCrashBoundariesRecoverOnePinnedRun(t *testing.T) {
 	}
 }
 
+func TestAcceptedPlanSurvivesFlowMutationBeforeFirstDispatch(t *testing.T) {
+	t.Parallel()
+	for _, mutation := range []string{"update", "delete"} {
+		mutation := mutation
+		t.Run(mutation, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			state, err := store.Open(filepath.Join(t.TempDir(), "state.sqlite"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = state.Close() }()
+
+			original := applyFlow(ctx, t, state, `
+    - {id: accepted, uses: core.noop}
+`, "", 0)
+			expectedPlan, diagnostics := flow.NewCompiler(nil).Compile(mustFlow(t, original.JSON))
+			if len(diagnostics) != 0 {
+				t.Fatalf("compile original: %+v", diagnostics)
+			}
+			fake := &fakeEngine{}
+			control := New(state, flow.NewCompiler(nil), fake)
+			receipt, err := control.StartManual(ctx, "demo", "default", json.RawMessage(`{"accepted":true}`), "mutate-before-dispatch-"+mutation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := state.GetPlan(ctx, expectedPlan.PlanHash); err != nil {
+				t.Fatalf("accepted plan was not stored before acknowledgement: %v", err)
+			}
+
+			switch mutation {
+			case "update":
+				applyFlow(ctx, t, state, `
+    - {id: replacement, uses: core.noop}
+`, "", original.Metadata.ResourceVersion)
+			case "delete":
+				if err := state.Delete(ctx, "Flow", original.Metadata.Namespace, original.Metadata.Name, original.Metadata.ResourceVersion, "delete-before-dispatch"); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if err := control.ReconcileOne(ctx); err != nil {
+				t.Fatalf("dispatch accepted plan after Flow %s: %v", mutation, err)
+			}
+			run, err := state.GetRun(ctx, receipt.RunUID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if run.PlanHash != expectedPlan.PlanHash || fake.unique[receipt.RunUID] != expectedPlan.PlanHash {
+				t.Fatalf("run=%+v engine=%+v expected plan=%s", run, fake.unique, expectedPlan.PlanHash)
+			}
+		})
+	}
+}
+
 func TestCancelBeforeStartSuppressesOutboxAndReconcilesTerminalRun(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

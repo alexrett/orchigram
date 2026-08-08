@@ -171,6 +171,33 @@ func TestTriggerReceiptAndOutboxAreDeduplicated(t *testing.T) {
 	}
 }
 
+func TestAcceptedPlanAndOutboxAreCommittedTogether(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openTestStore(t)
+	plan := flow.ExecutionPlan{
+		APIVersion: resource.APIVersion, FlowUID: "flow-accepted", FlowGeneration: 7,
+		InterpreterVersion: flow.InterpreterVersion, Timeout: "1h0m0s", MaxParallel: 1,
+		Nodes:    []flow.PlanNode{{ID: "accepted", Name: "accepted", Uses: "core.noop", Timeout: "1h0m0s", RetryBackoff: "1s"}},
+		PlanHash: "accepted-plan-hash",
+	}
+	receipt, err := s.AcceptTriggerWithPlan(ctx, "manual", "accepted-occurrence", "demo", "default", json.RawMessage(`{"x":1}`), true, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := s.GetPlan(ctx, plan.PlanHash)
+	if err != nil || stored.FlowUID != plan.FlowUID {
+		t.Fatalf("stored plan=%+v err=%v", stored, err)
+	}
+	command, err := s.ClaimStart(ctx, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if command.Payload.RunUID != receipt.RunUID || command.Payload.PlanHash != plan.PlanHash {
+		t.Fatalf("command=%+v receipt=%+v", command, receipt)
+	}
+}
+
 func TestTriggerApplyPersistsActivationAndScopesProviderCursorToGeneration(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

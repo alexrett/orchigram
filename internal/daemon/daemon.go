@@ -80,13 +80,13 @@ func Open(ctx context.Context, cfg config.Config, executor engine.TaskExecutor) 
 	}
 	compiler := flow.NewCompiler(plugins)
 	control := orchestrator.New(state, compiler, durable)
-	triggers := triggercontroller.NewController(state, plugins)
+	triggers := triggercontroller.NewController(state, plugins, control)
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(2<<20),
 		grpc.MaxSendMsgSize(8<<20),
 	)
 	server.NewAPI(state, compiler, control, durable, plugins, triggers, cfg.StateDir).Register(grpcServer)
-	ingress, err := httpingress.Listen(ctx, cfg.HTTP.Listen, state, plugins)
+	ingress, err := httpingress.Listen(ctx, cfg.HTTP.Listen, state, plugins, control)
 	if err != nil {
 		_ = listener.Close()
 		_ = durable.Close()

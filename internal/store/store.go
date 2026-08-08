@@ -444,6 +444,7 @@ type StartPayload struct {
 	ReceiptUID     string          `json:"receiptUID"`
 	FlowName       string          `json:"flowName"`
 	Namespace      string          `json:"namespace"`
+	PlanHash       string          `json:"planHash,omitempty"`
 	Input          json.RawMessage `json:"input"`
 	IdempotencyKey string          `json:"idempotencyKey"`
 }
@@ -461,7 +462,15 @@ type Receipt struct {
 
 // AcceptTrigger persists a receipt and outbox command in one transaction.
 func (s *Store) AcceptTrigger(ctx context.Context, triggerUID, occurrenceID, flowName, namespace string, input json.RawMessage, deduplicated bool) (Receipt, error) {
-	return s.acceptTrigger(ctx, triggerUID, 0, occurrenceID, flowName, namespace, input, deduplicated, "", "", nil)
+	return s.acceptTrigger(ctx, triggerUID, 0, occurrenceID, flowName, namespace, input, deduplicated, "", "", nil, nil)
+}
+
+// AcceptTriggerWithPlan persists an immutable compiled plan in the same
+// transaction as the trigger receipt and start command. Runtime acceptors must
+// use this method; AcceptTrigger remains for store-level compatibility tests
+// and pre-v0.1 databases whose commands do not yet carry a plan hash.
+func (s *Store) AcceptTriggerWithPlan(ctx context.Context, triggerUID, occurrenceID, flowName, namespace string, input json.RawMessage, deduplicated bool, plan flow.ExecutionPlan) (Receipt, error) {
+	return s.acceptTrigger(ctx, triggerUID, 0, occurrenceID, flowName, namespace, input, deduplicated, "", "", nil, &plan)
 }
 
 // AcceptProviderTrigger persists receipt, outbox, and provider cursor atomically.
@@ -469,11 +478,17 @@ func (s *Store) AcceptProviderTrigger(ctx context.Context, triggerUID string, tr
 	return s.acceptProviderTrigger(ctx, triggerUID, triggerGeneration, occurrenceID, flowName, namespace, input, cursor, nil)
 }
 
-func (s *Store) acceptProviderTrigger(ctx context.Context, triggerUID string, triggerGeneration uint64, occurrenceID, flowName, namespace string, input json.RawMessage, cursor string, afterValidation func()) (Receipt, error) {
-	return s.acceptTrigger(ctx, triggerUID, triggerGeneration, occurrenceID, flowName, namespace, input, true, cursor, occurrenceID, afterValidation)
+// AcceptProviderTriggerWithPlan atomically persists a provider cursor, receipt,
+// immutable plan, and outbox command after validating the Trigger generation.
+func (s *Store) AcceptProviderTriggerWithPlan(ctx context.Context, triggerUID string, triggerGeneration uint64, occurrenceID, flowName, namespace string, input json.RawMessage, cursor string, plan flow.ExecutionPlan) (Receipt, error) {
+	return s.acceptTrigger(ctx, triggerUID, triggerGeneration, occurrenceID, flowName, namespace, input, true, cursor, occurrenceID, nil, &plan)
 }
 
-func (s *Store) acceptTrigger(ctx context.Context, triggerUID string, triggerGeneration uint64, occurrenceID, flowName, namespace string, input json.RawMessage, deduplicated bool, providerCursor, providerEventID string, afterProviderValidation func()) (Receipt, error) {
+func (s *Store) acceptProviderTrigger(ctx context.Context, triggerUID string, triggerGeneration uint64, occurrenceID, flowName, namespace string, input json.RawMessage, cursor string, afterValidation func()) (Receipt, error) {
+	return s.acceptTrigger(ctx, triggerUID, triggerGeneration, occurrenceID, flowName, namespace, input, true, cursor, occurrenceID, afterValidation, nil)
+}
+
+func (s *Store) acceptTrigger(ctx context.Context, triggerUID string, triggerGeneration uint64, occurrenceID, flowName, namespace string, input json.RawMessage, deduplicated bool, providerCursor, providerEventID string, afterProviderValidation func(), plan *flow.ExecutionPlan) (Receipt, error) {
 	if namespace == "" {
 		namespace = resource.DefaultNamespace
 	}
@@ -522,10 +537,25 @@ func (s *Store) acceptTrigger(ctx context.Context, triggerUID string, triggerGen
 	if !errors.Is(err, ErrNotFound) {
 		return Receipt{}, err
 	}
+	if plan != nil {
+		if plan.PlanHash == "" || plan.FlowUID == "" || plan.InterpreterVersion == "" {
+			return Receipt{}, errors.New("accepted execution plan is incomplete")
+		}
+		planJSON, marshalErr := json.Marshal(plan)
+		if marshalErr != nil {
+			return Receipt{}, fmt.Errorf("encode accepted execution plan: %w", marshalErr)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO compiled_plans(plan_hash,flow_uid,flow_generation,interpreter_version,plan_json,created_at) VALUES(?,?,?,?,?,?)`, plan.PlanHash, plan.FlowUID, plan.FlowGeneration, plan.InterpreterVersion, planJSON, s.timestamp()); err != nil {
+			return Receipt{}, err
+		}
+	}
 	now := s.timestamp()
 	receipt := Receipt{UID: uuid.NewString(), TriggerUID: triggerUID, OccurrenceID: occurrenceID, RunUID: uuid.NewString(), Deduplicated: deduplicated}
 	receipt.AcceptedAt, _ = time.Parse(time.RFC3339Nano, now)
 	payload := StartPayload{RunUID: receipt.RunUID, ReceiptUID: receipt.UID, FlowName: flowName, Namespace: namespace, Input: input, IdempotencyKey: "trigger/" + triggerUID + "/" + occurrenceID}
+	if plan != nil {
+		payload.PlanHash = plan.PlanHash
+	}
 	payloadJSON, _ := json.Marshal(payload)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO trigger_receipts(uid,trigger_uid,occurrence_id,payload_json,deduplicated,run_uid,accepted_at) VALUES(?,?,?,?,?,?,?)`, receipt.UID, triggerUID, occurrenceID, input, boolInt(deduplicated), receipt.RunUID, now); err != nil {
 		return Receipt{}, err

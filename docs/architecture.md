@@ -8,7 +8,7 @@ CLI / TUI ── gRPC/UDS ── daemon ── SQLite WAL
     └── OpenSSH UDS ───────└────── gRPC plugin processes
 ```
 
-Resources use `orchigram.dev/v1alpha1`, strict decoding, Kubernetes-style metadata, revisions, generations, labels, status, events, and optimistic concurrency. The daemon compiles a `Flow` into an immutable `ExecutionPlan`; every `Run` pins its plan hash and interpreter version.
+Resources use `orchigram.dev/v1alpha1`, strict decoding, Kubernetes-style metadata, revisions, generations, labels, status, events, and optimistic concurrency. Before acknowledging a trigger, the daemon compiles a `Flow` into an immutable `ExecutionPlan` and atomically persists that plan with the receipt and outbox command. Every `Run` pins its plan hash and interpreter version. Non-core plan nodes additionally pin the plugin version and digest plus referenced resource metadata/spec snapshots; secret values remain runtime-only.
 
 The daemon owns triggers, receipts, the transactional outbox, run state, approvals, plugin lifecycle, workspaces, and artifacts. Plugins own only provider-specific trigger, task, or agent behavior. Public resources never expose go-workflows or go-plugin types.
 
