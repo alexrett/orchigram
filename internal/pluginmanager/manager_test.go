@@ -27,6 +27,8 @@ import (
 	"github.com/alexrett/orchigram/internal/resource"
 	"github.com/alexrett/orchigram/internal/store"
 	pluginsdk "github.com/alexrett/orchigram/sdk/plugin"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -481,6 +483,40 @@ func TestMalformedStreamIsRejected(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "did not end immediately") {
 		t.Fatalf("successful terminal transport failure=%v", err)
+	}
+	secret := []byte("terminal-secret-value")
+	_, err = manager.consume(context.Background(), runArtifact{runUID: "run", nodeID: "node", attempt: 1, redactions: [][]byte{secret}}, &fakeReceiver{
+		events: []*pluginv1alpha1.ExecuteEvent{valid(1, "agent.failed", `{}`)},
+		endErr: status.Error(codes.Internal, "authentication failed for terminal-secret-value"),
+	})
+	if err == nil || status.Code(err) != codes.Internal || strings.Contains(err.Error(), string(secret)) || !strings.Contains(err.Error(), "[REDACTED]") {
+		t.Fatalf("redacted terminal diagnostic=%v", err)
+	}
+	doctorErr := drainDoctor(&fakeReceiver{
+		events: []*pluginv1alpha1.ExecuteEvent{valid(1, "agent.failed", `{}`)},
+		endErr: status.Error(codes.Internal, "authentication failed for terminal-secret-value"),
+	}, [][]byte{secret})
+	if doctorErr == nil || status.Code(doctorErr) != codes.Internal || strings.Contains(doctorErr.Error(), string(secret)) || !strings.Contains(doctorErr.Error(), "[REDACTED]") {
+		t.Fatalf("redacted doctor diagnostic=%v", doctorErr)
+	}
+}
+
+func TestProviderBootstrapRequiresActivationFenceCapability(t *testing.T) {
+	t.Parallel()
+	activation := time.Date(2026, 8, 8, 10, 0, 0, 0, time.UTC)
+	oldRecord := store.PluginRecord{Name: "github", ManifestJSON: json.RawMessage(`{"capabilities":["trigger.github.issues"]}`)}
+	if err := validateProviderBootstrap(oldRecord, "", activation, map[string]any{}); err == nil || !strings.Contains(err.Error(), pluginsdk.ActivationFenceCapability) {
+		t.Fatalf("old provider bootstrap error=%v", err)
+	}
+	if err := validateProviderBootstrap(oldRecord, "77", activation, map[string]any{}); err != nil {
+		t.Fatalf("persisted cursor should not require activation fence: %v", err)
+	}
+	if err := validateProviderBootstrap(oldRecord, "", activation, map[string]any{"replayExisting": true}); err != nil {
+		t.Fatalf("explicit replay should allow an old provider: %v", err)
+	}
+	newRecord := store.PluginRecord{Name: "github", ManifestJSON: json.RawMessage(`{"capabilities":["trigger.github.issues","trigger.bootstrap.activation-fence"]}`)}
+	if err := validateProviderBootstrap(newRecord, "", activation, map[string]any{}); err != nil {
+		t.Fatalf("activation-fence provider bootstrap: %v", err)
 	}
 }
 

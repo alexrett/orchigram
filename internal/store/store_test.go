@@ -170,6 +170,90 @@ func TestTriggerReceiptAndOutboxAreDeduplicated(t *testing.T) {
 	}
 }
 
+func TestTriggerApplyPersistsActivationAndScopesProviderCursorToGeneration(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openTestStore(t)
+	firstActivation := time.Date(2026, 8, 8, 10, 0, 0, 123, time.UTC)
+	s.now = func() time.Time { return firstActivation }
+	document, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata: {name: ready-issues}
+spec:
+  flow: issue-to-pr
+  provider: {plugin: github, config: {repository: first}}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := s.Apply(ctx, document, ApplyOptions{RequestID: "create-trigger"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := s.TriggerState(ctx, created.Metadata.UID)
+	if err != nil || state.Generation != 1 || !state.CursorAt.Equal(firstActivation) {
+		t.Fatalf("initial trigger state=%+v err=%v", state, err)
+	}
+	if _, err := s.AcceptProviderTrigger(ctx, created.Metadata.UID, created.Metadata.Generation, "event-10", "issue-to-pr", "default", json.RawMessage(`{"issue":10}`), "10"); err != nil {
+		t.Fatal(err)
+	}
+
+	secondActivation := firstActivation.Add(time.Hour)
+	s.now = func() time.Time { return secondActivation }
+	updatedDocument, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata:
+  name: ready-issues
+  resourceVersion: 1
+spec:
+  flow: issue-to-pr
+  provider: {plugin: github, config: {repository: second}}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := s.Apply(ctx, updatedDocument, ApplyOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = s.TriggerState(ctx, created.Metadata.UID)
+	if err != nil || updated.Metadata.Generation != 2 || state.Generation != 2 || !state.CursorAt.Equal(secondActivation) {
+		t.Fatalf("updated trigger=%+v state=%+v err=%v", updated.Metadata, state, err)
+	}
+	cursor, eventID, err := s.ProviderCursor(ctx, created.Metadata.UID)
+	if err != nil || cursor != "" || eventID != "" {
+		t.Fatalf("generation retained provider cursor=%q event=%q err=%v", cursor, eventID, err)
+	}
+	if _, err := s.EnsureTriggerState(ctx, created.Metadata.UID, created.Metadata.Generation, true, secondActivation.Add(time.Minute)); err == nil {
+		t.Fatal("superseded controller watch rolled Trigger state backward")
+	} else {
+		var stale *StaleTriggerGenerationError
+		if !errors.As(err, &stale) || stale.Expected != 1 || stale.Current != 2 {
+			t.Fatalf("stale controller state error=%v", err)
+		}
+	}
+
+	if _, err := s.AcceptProviderTrigger(ctx, created.Metadata.UID, created.Metadata.Generation, "stale-event", "issue-to-pr", "default", json.RawMessage(`{"issue":19}`), "19"); err == nil {
+		t.Fatal("superseded provider watch mutated the new Trigger generation")
+	} else {
+		var stale *StaleTriggerGenerationError
+		if !errors.As(err, &stale) || stale.Expected != 1 || stale.Current != 2 {
+			t.Fatalf("stale provider error=%v", err)
+		}
+	}
+	if _, err := s.AcceptProviderTrigger(ctx, created.Metadata.UID, updated.Metadata.Generation, "event-20", "issue-to-pr", "default", json.RawMessage(`{"issue":20}`), "20"); err != nil {
+		t.Fatal(err)
+	}
+	noOp, err := s.Apply(ctx, updated, ApplyOptions{})
+	if err != nil || noOp.Metadata.Generation != 2 {
+		t.Fatalf("no-op trigger apply=%+v err=%v", noOp.Metadata, err)
+	}
+	cursor, eventID, err = s.ProviderCursor(ctx, created.Metadata.UID)
+	if err != nil || cursor != "20" || eventID != "event-20" {
+		t.Fatalf("no-op apply reset provider cursor=%q event=%q err=%v", cursor, eventID, err)
+	}
+}
+
 func TestPluginVersionsActivateAndRollbackWithoutOverwrite(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

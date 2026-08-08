@@ -58,7 +58,7 @@ spec:
 `)
 	controller := NewController(state, nil)
 	now := time.Date(2026, 8, 8, 10, 0, 30, 0, time.UTC)
-	if _, err := state.EnsureTriggerState(context.Background(), trigger.Metadata.UID, trigger.Metadata.Generation, true, now.Add(-2*time.Hour)); err != nil {
+	if err := state.AdvanceTriggerCursor(context.Background(), trigger.Metadata.UID, now.Add(-2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if err := controller.ReconcileSchedules(context.Background(), now); err != nil {
@@ -103,7 +103,7 @@ spec:
 `)
 	controller := NewController(state, nil)
 	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
-	if _, err := state.EnsureTriggerState(context.Background(), trigger.Metadata.UID, trigger.Metadata.Generation, true, now.Add(-24*time.Hour)); err != nil {
+	if err := state.AdvanceTriggerCursor(context.Background(), trigger.Metadata.UID, now.Add(-24*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if err := controller.ReconcileSchedules(context.Background(), now); err != nil {
@@ -147,10 +147,14 @@ spec:
   provider: {plugin: fake, config: {repository: example}}
 `)
 	ctx, cancel := context.WithCancel(context.Background())
-	activation := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	persistedState, err := state.TriggerState(context.Background(), trigger.Metadata.UID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activation := persistedState.CursorAt
 	provider := &fakeProvider{accepted: make(chan string, 1), activated: make(chan time.Time, 1), cancel: cancel}
 	controller := NewController(state, provider)
-	controller.now = func() time.Time { return activation }
+	controller.now = func() time.Time { return activation.Add(time.Hour) }
 	go controller.watchProvider(ctx, trigger)
 	select {
 	case activatedAt := <-provider.activated:

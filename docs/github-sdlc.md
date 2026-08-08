@@ -7,12 +7,18 @@ sorted by ID; a rate-limited GET is retried with bounded delay. The daemon
 persists the event receipt, outbox command, and cursor before acknowledging the
 plugin stream.
 
-A new subscription receives the Trigger generation's durable activation time.
-With the default `replayExisting: false`, the plugin ignores matching events
-older than that instant, so installing a trigger cannot unexpectedly execute a
-repository's entire label history. `replayExisting: true` is an explicit
-provider option for bounded operator-controlled backfills. After any event is
-acknowledged, its numeric cursor takes precedence and restart replay remains
+A new subscription receives the Trigger generation's activation time, which is
+persisted atomically with the resource apply. With the default
+`replayExisting: false`, the plugin ignores matching events outside a bounded
+one-minute safety overlap, so installing a trigger cannot unexpectedly execute
+a repository's entire label history while same-second provider timestamps and
+up to one minute of clock skew cannot lose a new event. The deliberate tradeoff
+is that a matching event from the preceding minute can be accepted once. Stable
+event IDs make overlap replay durable and idempotent. `replayExisting: true` is
+an explicit provider option for operator-controlled backfills. A Trigger
+generation change resets the provider cursor atomically and rejects late events
+from the superseded watch; after an event is acknowledged, the current
+generation's numeric cursor takes precedence and restart replay remains
 lossless.
 
 Current issue events are decoded from their embedded `issue` object without a

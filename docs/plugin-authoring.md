@@ -63,6 +63,13 @@ or `Config.Agent`. Trigger watches participate in the same shutdown admission,
 cancellation, and drain accounting. Daemon, resource, bundle, and
 workflow-engine internals are not public APIs.
 
+A provider that honors `WatchStart.activated_at` for safe empty-cursor
+bootstrap must declare `trigger.bootstrap.activation-fence`. The host fails
+closed without that capability unless a durable cursor already exists or the
+operator explicitly requests historical replay. Providers should use stable
+event identities and a bounded overlap when their source timestamps are less
+precise than the daemon clock.
+
 ## Build and pack
 
 Build each target directly and list its path relative to `plugin.yaml`. Author

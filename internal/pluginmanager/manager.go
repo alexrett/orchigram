@@ -23,6 +23,7 @@ import (
 	"github.com/alexrett/orchigram/internal/pluginhost"
 	"github.com/alexrett/orchigram/internal/resource"
 	"github.com/alexrett/orchigram/internal/store"
+	pluginsdk "github.com/alexrett/orchigram/sdk/plugin"
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -317,7 +318,7 @@ func (m *Manager) Doctor(ctx context.Context, name, version string) error {
 			if err != nil {
 				return fmt.Errorf("agent profile %s authentication: %w", profile.Metadata.Name, err)
 			}
-			if err := drainDoctor(stream); err != nil {
+			if err := drainDoctor(stream, secretValues(secrets)); err != nil {
 				return fmt.Errorf("agent profile %s authentication: %w", profile.Metadata.Name, err)
 			}
 		}
@@ -373,6 +374,9 @@ func (m *Manager) WatchTrigger(ctx context.Context, pluginName, triggerUID strin
 	configCopy := make(map[string]any, len(config))
 	for key, value := range config {
 		configCopy[key] = value
+	}
+	if err := validateProviderBootstrap(record, cursor, activatedAt, configCopy); err != nil {
+		return err
 	}
 	secrets, err := m.resolveNodeSecrets(ctx, configCopy)
 	if err != nil {
@@ -589,6 +593,7 @@ func (m *Manager) consume(ctx context.Context, artifact runArtifact, stream even
 		}
 		if err != nil {
 			if terminal != "" {
+				err = sanitizePluginError(err, artifact.redactions)
 				if strings.HasSuffix(terminal, ".failed") {
 					return nil, fmt.Errorf("plugin reported %s: %w", terminal, err)
 				}
@@ -597,7 +602,7 @@ func (m *Manager) consume(ctx context.Context, artifact runArtifact, stream even
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			return nil, err
+			return nil, sanitizePluginError(err, artifact.redactions)
 		}
 		if terminal != "" {
 			return nil, errors.New("plugin emitted an event after its terminal event")
@@ -1029,7 +1034,7 @@ func sameCapabilities(actual, expected []string) bool {
 	return strings.Join(actual, "\x00") == strings.Join(expected, "\x00")
 }
 
-func drainDoctor(stream eventReceiver) error {
+func drainDoctor(stream eventReceiver, redactions [][]byte) error {
 	var expected uint64 = 1
 	terminal := ""
 	for {
@@ -1045,12 +1050,13 @@ func drainDoctor(stream eventReceiver) error {
 		}
 		if err != nil {
 			if terminal != "" {
+				err = sanitizePluginError(err, redactions)
 				if strings.HasSuffix(terminal, ".failed") {
 					return fmt.Errorf("doctor command failed: %w", err)
 				}
 				return fmt.Errorf("doctor stream did not end immediately after completion: %w", err)
 			}
-			return err
+			return sanitizePluginError(err, redactions)
 		}
 		if terminal != "" {
 			return errors.New("doctor stream emitted an event after completion")
@@ -1063,6 +1069,34 @@ func drainDoctor(stream eventReceiver) error {
 			terminal = event.GetType()
 		}
 	}
+}
+
+func validateProviderBootstrap(record store.PluginRecord, cursor string, activatedAt time.Time, config map[string]any) error {
+	replayExisting, _ := config["replayExisting"].(bool)
+	if cursor != "" || activatedAt.IsZero() || replayExisting {
+		return nil
+	}
+	var manifest pluginbundle.Manifest
+	if err := json.Unmarshal(record.ManifestJSON, &manifest); err != nil {
+		return fmt.Errorf("decode plugin manifest: %w", err)
+	}
+	for _, capability := range manifest.Capabilities {
+		if capability == pluginsdk.ActivationFenceCapability {
+			return nil
+		}
+	}
+	return fmt.Errorf("plugin %q does not declare %s; refusing a non-replay provider bootstrap", record.Name, pluginsdk.ActivationFenceCapability)
+}
+
+func sanitizePluginError(err error, secrets [][]byte) error {
+	if err == nil {
+		return nil
+	}
+	if pluginStatus, ok := status.FromError(err); ok {
+		message := redact([]byte(pluginStatus.Message()), secrets)
+		return status.Error(pluginStatus.Code(), string(message))
+	}
+	return errors.New(string(redact([]byte(err.Error()), secrets)))
 }
 
 func secretValues(secrets map[string][]byte) [][]byte {

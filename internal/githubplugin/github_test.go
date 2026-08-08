@@ -114,6 +114,29 @@ func TestInitialSubscriptionFiltersEventsBeforeDurableActivation(t *testing.T) {
 	}
 }
 
+func TestInitialSubscriptionUsesBoundedOverlapForSecondPrecisionAndClockSkew(t *testing.T) {
+	t.Parallel()
+	activation := time.Date(2026, 8, 8, 10, 30, 0, 900_000_000, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`[
+          {"id":201,"event":"labeled","created_at":"2026-08-08T10:28:59Z","label":{"name":"orchigram:ready"},"issue":{"number":1,"title":"outside overlap","state":"open"}},
+          {"id":202,"event":"labeled","created_at":"2026-08-08T10:29:30Z","label":{"name":"orchigram:ready"},"issue":{"number":2,"title":"clock skew","state":"open"}},
+          {"id":203,"event":"labeled","created_at":"2026-08-08T10:30:00Z","label":{"name":"orchigram:ready"},"issue":{"number":3,"title":"same second","state":"open"}}
+        ]`))
+	}))
+	defer server.Close()
+	runtime := &Runtime{Client: server.Client()}
+	config := watchConfig{repositoryConfig: repositoryConfig{Owner: "acme", Repository: "widget", APIBase: server.URL, TokenSecret: "token"}, Label: "orchigram:ready"}
+	events, err := runtime.listReadyEvents(context.Background(), config, []byte("fixture-token"), 0, activation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].ID != 202 || events[1].ID != 203 {
+		t.Fatalf("overlap events=%+v", events)
+	}
+}
+
 func TestCommentAndPullRequestReconcileByIdempotencyMarker(t *testing.T) {
 	t.Parallel()
 	var mu sync.Mutex

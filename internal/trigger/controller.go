@@ -229,7 +229,7 @@ func (c *Controller) watchProvider(ctx context.Context, trigger resource.Trigger
 				if event.GetProviderEventId() == "" || event.GetCursor() == "" || !json.Valid(event.GetPayloadJson()) {
 					return errors.New("provider event identity, cursor, and JSON payload are required")
 				}
-				_, acceptErr := c.store.AcceptProviderTrigger(ctx, trigger.Metadata.UID, event.GetProviderEventId(), trigger.Spec.Flow, trigger.Metadata.Namespace, event.GetPayloadJson(), event.GetCursor())
+				_, acceptErr := c.store.AcceptProviderTrigger(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, event.GetProviderEventId(), trigger.Spec.Flow, trigger.Metadata.Namespace, event.GetPayloadJson(), event.GetCursor())
 				return acceptErr
 			})
 		}

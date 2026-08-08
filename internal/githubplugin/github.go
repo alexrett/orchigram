@@ -28,8 +28,9 @@ import (
 )
 
 const (
-	defaultAPIBase = "https://api.github.com"
-	maxResponse    = 4 << 20
+	defaultAPIBase    = "https://api.github.com"
+	maxResponse       = 4 << 20
+	activationOverlap = time.Minute
 )
 
 // Capabilities are declared by the first-party GitHub bundle.
@@ -272,6 +273,13 @@ type readyEvent struct {
 }
 
 func (r *Runtime) listReadyEvents(ctx context.Context, config watchConfig, token []byte, cursor int64, activatedAt time.Time) ([]readyEvent, error) {
+	if !activatedAt.IsZero() {
+		// GitHub issue-event timestamps are second-precision and originate on a
+		// different clock. A bounded overlap prevents same-second or ordinary
+		// clock-skew loss within the one-minute bound; stable event IDs keep
+		// restart replay deduplicated.
+		activatedAt = activatedAt.UTC().Truncate(time.Second).Add(-activationOverlap)
+	}
 	base := apiBase(config.APIBase)
 	next := fmt.Sprintf("%s/repos/%s/%s/issues/events?per_page=100", base, url.PathEscape(config.Owner), url.PathEscape(config.Repository))
 	result := []readyEvent{}

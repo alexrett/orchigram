@@ -12,6 +12,9 @@ import (
 const (
 	// ProtocolVersion is the current host/plugin bootstrap protocol.
 	ProtocolVersion = 1
+	// ActivationFenceCapability declares that a TriggerProvider understands
+	// WatchStart.activated_at and can safely bootstrap without historical replay.
+	ActivationFenceCapability = "trigger.bootstrap.activation-fence"
 	// DispenseName is the go-plugin capability containing Orchigram services.
 	DispenseName = "orchigram"
 )

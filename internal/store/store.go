@@ -26,6 +26,16 @@ import (
 // ErrNotFound is returned when an authoritative object does not exist.
 var ErrNotFound = errors.New("not found")
 
+// StaleTriggerGenerationError rejects events emitted by a superseded provider watch.
+type StaleTriggerGenerationError struct {
+	Expected uint64
+	Current  uint64
+}
+
+func (e *StaleTriggerGenerationError) Error() string {
+	return fmt.Sprintf("stale Trigger generation: watch=%d current=%d", e.Expected, e.Current)
+}
+
 // ConflictError reports a failed compare-and-swap operation.
 type ConflictError struct {
 	Expected uint64
@@ -191,7 +201,8 @@ func (s *Store) Apply(ctx context.Context, doc resource.Document, options ApplyO
 	labels, _ := json.Marshal(meta.Labels)
 	oldHash := digest(currentJSON)
 	newHash := digest(doc.JSON)
-	now := s.timestamp()
+	nowTime := s.now().UTC()
+	now := nowTime.Format(time.RFC3339Nano)
 	if exists {
 		_, err = tx.ExecContext(ctx, `UPDATE resources SET uid=?,resource_version=?,generation=?,labels_json=?,spec_json=?,status_json=?,updated_at=? WHERE kind=? AND namespace=? AND name=?`, meta.UID, revision, meta.Generation, labels, doc.JSON, doc.Status, now, doc.Kind, meta.Namespace, meta.Name)
 	} else {
@@ -199,6 +210,16 @@ func (s *Store) Apply(ctx context.Context, doc resource.Document, options ApplyO
 	}
 	if err != nil {
 		return resource.Document{}, fmt.Errorf("write resource: %w", err)
+	}
+	if doc.Kind == "Trigger" {
+		trigger, decodeErr := resource.DecodeTrigger(doc.JSON)
+		if decodeErr != nil {
+			return resource.Document{}, fmt.Errorf("decode applied Trigger: %w", decodeErr)
+		}
+		enabled := trigger.Spec.Enabled == nil || *trigger.Spec.Enabled
+		if _, err := ensureTriggerStateTx(ctx, tx, trigger.Metadata.UID, trigger.Metadata.Generation, enabled, nowTime, now); err != nil {
+			return resource.Document{}, fmt.Errorf("initialize Trigger state: %w", err)
+		}
 	}
 	eventType := "ADDED"
 	if exists {
@@ -419,15 +440,15 @@ type Receipt struct {
 
 // AcceptTrigger persists a receipt and outbox command in one transaction.
 func (s *Store) AcceptTrigger(ctx context.Context, triggerUID, occurrenceID, flowName, namespace string, input json.RawMessage, deduplicated bool) (Receipt, error) {
-	return s.acceptTrigger(ctx, triggerUID, occurrenceID, flowName, namespace, input, deduplicated, "", "")
+	return s.acceptTrigger(ctx, triggerUID, 0, occurrenceID, flowName, namespace, input, deduplicated, "", "")
 }
 
 // AcceptProviderTrigger persists receipt, outbox, and provider cursor atomically.
-func (s *Store) AcceptProviderTrigger(ctx context.Context, triggerUID, occurrenceID, flowName, namespace string, input json.RawMessage, cursor string) (Receipt, error) {
-	return s.acceptTrigger(ctx, triggerUID, occurrenceID, flowName, namespace, input, true, cursor, occurrenceID)
+func (s *Store) AcceptProviderTrigger(ctx context.Context, triggerUID string, triggerGeneration uint64, occurrenceID, flowName, namespace string, input json.RawMessage, cursor string) (Receipt, error) {
+	return s.acceptTrigger(ctx, triggerUID, triggerGeneration, occurrenceID, flowName, namespace, input, true, cursor, occurrenceID)
 }
 
-func (s *Store) acceptTrigger(ctx context.Context, triggerUID, occurrenceID, flowName, namespace string, input json.RawMessage, deduplicated bool, providerCursor, providerEventID string) (Receipt, error) {
+func (s *Store) acceptTrigger(ctx context.Context, triggerUID string, triggerGeneration uint64, occurrenceID, flowName, namespace string, input json.RawMessage, deduplicated bool, providerCursor, providerEventID string) (Receipt, error) {
 	if namespace == "" {
 		namespace = resource.DefaultNamespace
 	}
@@ -439,6 +460,18 @@ func (s *Store) acceptTrigger(ctx context.Context, triggerUID, occurrenceID, flo
 		return Receipt{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if providerCursor != "" {
+		var currentGeneration uint64
+		if err := tx.QueryRowContext(ctx, `SELECT generation FROM trigger_states WHERE trigger_uid=?`, triggerUID).Scan(&currentGeneration); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return Receipt{}, ErrNotFound
+			}
+			return Receipt{}, err
+		}
+		if currentGeneration != triggerGeneration {
+			return Receipt{}, &StaleTriggerGenerationError{Expected: triggerGeneration, Current: currentGeneration}
+		}
+	}
 	existing, err := receiptByOccurrence(ctx, tx, triggerUID, occurrenceID)
 	if err == nil {
 		existing.Existing = true
@@ -1030,17 +1063,24 @@ func (s *Store) EnsureTriggerState(ctx context.Context, triggerUID string, gener
 		return TriggerState{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	state, err := ensureTriggerStateTx(ctx, tx, triggerUID, generation, enabled, initialCursor, s.timestamp())
+	if err != nil {
+		return TriggerState{}, err
+	}
+	return state, tx.Commit()
+}
+
+func ensureTriggerStateTx(ctx context.Context, tx *sql.Tx, triggerUID string, generation uint64, enabled bool, initialCursor time.Time, updatedAt string) (TriggerState, error) {
 	var state TriggerState
 	var enabledValue int
 	var cursor string
-	err = tx.QueryRowContext(ctx, `SELECT trigger_uid,generation,enabled,cursor_at FROM trigger_states WHERE trigger_uid=?`, triggerUID).Scan(&state.TriggerUID, &state.Generation, &enabledValue, &cursor)
+	err := tx.QueryRowContext(ctx, `SELECT trigger_uid,generation,enabled,cursor_at FROM trigger_states WHERE trigger_uid=?`, triggerUID).Scan(&state.TriggerUID, &state.Generation, &enabledValue, &cursor)
 	if errors.Is(err, sql.ErrNoRows) {
-		now := s.timestamp()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO trigger_states(trigger_uid,generation,enabled,cursor_at,updated_at) VALUES(?,?,?,?,?)`, triggerUID, generation, boolInt(enabled), initialCursor.UTC().Format(time.RFC3339Nano), now); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO trigger_states(trigger_uid,generation,enabled,cursor_at,updated_at) VALUES(?,?,?,?,?)`, triggerUID, generation, boolInt(enabled), initialCursor.UTC().Format(time.RFC3339Nano), updatedAt); err != nil {
 			return TriggerState{}, err
 		}
 		state = TriggerState{TriggerUID: triggerUID, Generation: generation, Enabled: enabled, CursorAt: initialCursor.UTC()}
-		return state, tx.Commit()
+		return state, nil
 	}
 	if err != nil {
 		return TriggerState{}, err
@@ -1048,12 +1088,18 @@ func (s *Store) EnsureTriggerState(ctx context.Context, triggerUID string, gener
 	state.Enabled = enabledValue == 1
 	state.CursorAt, _ = time.Parse(time.RFC3339Nano, cursor)
 	if state.Generation != generation {
-		if _, err := tx.ExecContext(ctx, `UPDATE trigger_states SET generation=?,enabled=?,cursor_at=?,updated_at=? WHERE trigger_uid=?`, generation, boolInt(enabled), initialCursor.UTC().Format(time.RFC3339Nano), s.timestamp(), triggerUID); err != nil {
+		if state.Generation > generation {
+			return TriggerState{}, &StaleTriggerGenerationError{Expected: generation, Current: state.Generation}
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE trigger_states SET generation=?,enabled=?,cursor_at=?,updated_at=? WHERE trigger_uid=?`, generation, boolInt(enabled), initialCursor.UTC().Format(time.RFC3339Nano), updatedAt, triggerUID); err != nil {
+			return TriggerState{}, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM provider_cursors WHERE trigger_uid=?`, triggerUID); err != nil {
 			return TriggerState{}, err
 		}
 		state.Generation, state.Enabled, state.CursorAt = generation, enabled, initialCursor.UTC()
 	}
-	return state, tx.Commit()
+	return state, nil
 }
 
 // TriggerState returns the durable controller state for one trigger.
