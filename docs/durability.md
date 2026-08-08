@@ -87,6 +87,17 @@ state is not. On upgrade, an existing run remains pinned to its interpreter
 version or becomes visibly blocked; it is never silently reinterpreted by
 incompatible code.
 
+Plugin desired state is durable independently of plugin processes. A
+`PluginInstallation` status update checks the desired generation inside the
+same SQLite transaction that advances resourceVersion, stores status, and
+appends its watch and audit records. Status-only changes never increment
+generation. A daemon crash before commit leaves the previous complete status;
+a crash after commit replays the new complete revision. Activation conflicts do
+not switch versions, and restart reconciles the same selected immutable digest.
+Disabling an installation prevents new compilation/provider resolution, while
+already accepted plans retain their pinned version and can launch that
+immutable installation directly.
+
 The compiler collapses strongly connected components and rejects every cycle
 without a finite `loop.maxIterations` policy. The durable interpreter executes
 the resulting component DAG with a deterministic, bounded scheduler. A Flow's

@@ -20,3 +20,6 @@ Apply rejects unknown fields. `resourceVersion` is a compare-and-swap preconditi
 
 `SecretRef.spec` contains a backend and key/path/environment identifier, never a value. Its status is only `Configured`, `Missing`, or an error category with a redacted diagnostic.
 
+`PluginInstallation` selects one immutable installed name, version, and digest.
+Its controller-owned status records observed generation, activation, protocol
+and health diagnostics. See [Declarative plugin installations](plugin-installations.md).

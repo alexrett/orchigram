@@ -5,7 +5,7 @@ Current milestone: v0.1.0 First Real Release
 Current phase: 9 of 12
 Progress: 1/5 release phases
 Last activity: 2026-08-08
-Current focus: declarative PluginInstallation reconciliation and the complete live operator surface
+Current focus: complete public API/CLI behavior and the live watch-driven operator surface
 
 ## Reality check
 
@@ -39,6 +39,11 @@ runtime validation against the accepted immutable plan.
 The second Phase 9 gate now passes namespace-local resource resolution,
 provider config/event contracts, server-owned readiness conditions, and
 transactional Trigger/Flow generation checks at the durable acceptance boundary.
+
+The third Phase 9 gate now passes declarative PluginInstallation adoption,
+activation, rollback and deterministic conflict handling; persisted status-only
+revisions retain generation/CAS semantics and controller failures participate in
+aggregate health.
 
 ## Active phase gate
 
