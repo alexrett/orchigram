@@ -119,6 +119,21 @@ func TestControllerAdoptsActivatesRollsBackAndReportsRuntimeFailure(t *testing.T
 	}
 }
 
+func TestDesiredStateRequestIDDistinguishesResourceRevisionAndAction(t *testing.T) {
+	t.Parallel()
+	installation := resource.PluginInstallation{Metadata: resource.ObjectMeta{UID: "plugin-uid", ResourceVersion: 7}}
+	if got := desiredStateRequestID(installation, true); got != "plugin-cli:plugin-uid:7:true" {
+		t.Fatalf("enable request ID=%q", got)
+	}
+	if desiredStateRequestID(installation, false) == desiredStateRequestID(installation, true) {
+		t.Fatal("enable and disable share a request ID")
+	}
+	installation.Metadata.ResourceVersion++
+	if desiredStateRequestID(installation, true) == "plugin-cli:plugin-uid:7:true" {
+		t.Fatal("distinct CAS revisions share a request ID")
+	}
+}
+
 func TestConflictingEnabledVersionsDoNotSwitchActivation(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

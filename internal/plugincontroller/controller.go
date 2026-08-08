@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -280,13 +281,17 @@ func (c *Controller) SetEnabled(ctx context.Context, plugin, version string, ena
 		if err != nil {
 			return err
 		}
-		if _, err := c.store.Apply(ctx, document, store.ApplyOptions{ExpectedResourceVersion: installation.Metadata.ResourceVersion, RequestID: "plugin-cli-desired-state", Actor: "unix-peer"}); err != nil {
+		if _, err := c.store.Apply(ctx, document, store.ApplyOptions{ExpectedResourceVersion: installation.Metadata.ResourceVersion, RequestID: desiredStateRequestID(installation, desired), Actor: "unix-peer"}); err != nil {
 			return err
 		}
 	}
 	err = c.reconcileLocked(ctx)
 	c.observe(err)
 	return err
+}
+
+func desiredStateRequestID(installation resource.PluginInstallation, enabled bool) string {
+	return fmt.Sprintf("plugin-cli:%s:%d:%t", installation.Metadata.UID, installation.Metadata.ResourceVersion, enabled)
 }
 
 func (c *Controller) ensureProjections(ctx context.Context, records []store.PluginRecord) error {
