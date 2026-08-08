@@ -59,6 +59,12 @@ func Open(ctx context.Context, cfg config.Config, executor engine.TaskExecutor) 
 		return nil, err
 	}
 	plugins := pluginmanager.New(state, cfg.StateDir)
+	pluginsOwnedByDaemon := false
+	defer func() {
+		if !pluginsOwnedByDaemon {
+			plugins.Close()
+		}
+	}()
 	if err := plugins.ReconcileArtifacts(ctx); err != nil {
 		_ = state.Close()
 		return nil, fmt.Errorf("reconcile plugin artifacts: %w", err)
@@ -68,7 +74,6 @@ func Open(ctx context.Context, cfg config.Config, executor engine.TaskExecutor) 
 	}
 	pluginState := plugincontroller.New(state, plugins)
 	if err := pluginState.Reconcile(ctx); err != nil {
-		plugins.Close()
 		_ = state.Close()
 		return nil, fmt.Errorf("reconcile plugin installations: %w", err)
 	}
@@ -102,10 +107,10 @@ func Open(ctx context.Context, cfg config.Config, executor engine.TaskExecutor) 
 	if err != nil {
 		_ = listener.Close()
 		_ = durable.Close()
-		plugins.Close()
 		_ = state.Close()
 		return nil, err
 	}
+	pluginsOwnedByDaemon = true
 	return &Daemon{config: cfg, store: state, engine: durable, orchestrator: control, plugins: plugins, pluginState: pluginState, triggers: triggers, httpIngress: ingress, grpc: grpcServer, listener: listener}, nil
 }
 

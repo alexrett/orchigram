@@ -31,6 +31,7 @@ import (
 	"github.com/alexrett/orchigram/internal/firstparty"
 	"github.com/alexrett/orchigram/internal/githubplugin"
 	"github.com/alexrett/orchigram/internal/pluginbundle"
+	"github.com/alexrett/orchigram/internal/pluginmanager"
 	"github.com/alexrett/orchigram/internal/pluginruntime"
 	"github.com/alexrett/orchigram/internal/process"
 	"github.com/alexrett/orchigram/internal/resource"
@@ -45,6 +46,7 @@ import (
 func TestMain(m *testing.M) {
 	if os.Getenv(pluginsdk.Handshake.MagicCookieKey) == pluginsdk.Handshake.MagicCookieValue {
 		executable, _ := os.Executable()
+		_ = os.WriteFile(filepath.Join(filepath.Dir(executable), "process.pid"), []byte(strconv.Itoa(os.Getpid())), 0o600)
 		name := filepath.Base(filepath.Dir(filepath.Dir(executable)))
 		catalogPlugin, _ := firstparty.Find(name)
 		config := pluginsdk.Config{Metadata: pluginsdk.Metadata{
@@ -69,6 +71,69 @@ func TestMain(m *testing.M) {
 		return
 	}
 	os.Exit(m.Run())
+}
+
+func TestOpenClosesActivatedPluginsWhenLateInitializationFails(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "orchigram-open-cleanup-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	cfg := config.Development(filepath.Join(root, "state"))
+	if err := os.MkdirAll(cfg.StateDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.Open(filepath.Join(cfg.StateDir, "orchigram.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := pluginmanager.New(state, cfg.StateDir)
+	record, err := manager.Install(context.Background(), daemonPluginBundle(t, "exec", []string{"task.exec.run"}))
+	if err != nil {
+		manager.Close()
+		_ = state.Close()
+		t.Fatal(err)
+	}
+	if err := state.ActivatePlugin(context.Background(), record.Name, record.Version); err != nil {
+		manager.Close()
+		_ = state.Close()
+		t.Fatal(err)
+	}
+	manager.Close()
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(cfg.StateDir, "workflows.sqlite"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	instance, err := Open(context.Background(), cfg, nil)
+	if err == nil {
+		_ = instance.Close()
+		t.Fatal("expected workflow database initialization to fail")
+	}
+	pidFile := filepath.Join(cfg.StateDir, "plugins", "exec", record.Version, "process.pid")
+	data, readErr := os.ReadFile(pidFile) //nolint:gosec // The test owns the temporary path.
+	if readErr != nil {
+		t.Fatalf("activated plugin did not report its pid: %v", readErr)
+	}
+	pid, parseErr := strconv.Atoi(string(data))
+	if parseErr != nil {
+		t.Fatalf("parse plugin pid %q: %v", data, parseErr)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		signalErr := syscall.Kill(pid, 0)
+		if errors.Is(signalErr, syscall.ESRCH) {
+			break
+		}
+		if signalErr != nil {
+			t.Fatalf("probe plugin process %d: %v", pid, signalErr)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("plugin process %d survived failed daemon initialization", pid)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func TestSlackWeekdayFlowAcceptance(t *testing.T) {

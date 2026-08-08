@@ -102,11 +102,10 @@ type Adapter struct {
 
 // Open starts the go-workflows worker against its private SQLite history database.
 func Open(ctx context.Context, workflowDBPath string, state *store.Store, executor TaskExecutor) (*Adapter, error) {
-	b := workflowSqlite.NewSqliteBackend(workflowDBPath, workflowSqlite.WithBackendOptions(
-		backend.WithWorkflowLockTimeout(2*time.Second),
-		backend.WithActivityLockTimeout(2*time.Second),
-		backend.WithStickyTimeout(0),
-	))
+	b, err := openWorkflowBackend(workflowDBPath)
+	if err != nil {
+		return nil, err
+	}
 	workerOptions := worker.DefaultOptions
 	workerOptions.WorkflowHeartbeatInterval = 500 * time.Millisecond
 	workerOptions.ActivityHeartbeatInterval = 500 * time.Millisecond
@@ -141,6 +140,25 @@ func Open(ctx context.Context, workflowDBPath string, state *store.Store, execut
 	adapter.runs, _ = executor.(runCanceler)
 	go func() { adapter.done <- w.WaitForCompletion() }()
 	return adapter, nil
+}
+
+func openWorkflowBackend(workflowDBPath string) (result backend.Backend, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if recoveredErr, ok := recovered.(error); ok {
+				err = fmt.Errorf("initialize workflow SQLite backend: %w", recoveredErr)
+			} else {
+				err = fmt.Errorf("initialize workflow SQLite backend: %v", recovered)
+			}
+			result = nil
+		}
+	}()
+	result = workflowSqlite.NewSqliteBackend(workflowDBPath, workflowSqlite.WithBackendOptions(
+		backend.WithWorkflowLockTimeout(2*time.Second),
+		backend.WithActivityLockTimeout(2*time.Second),
+		backend.WithStickyTimeout(0),
+	))
+	return result, nil
 }
 
 // Start idempotently starts a pinned interpreter instance.

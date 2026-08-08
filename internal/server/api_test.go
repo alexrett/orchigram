@@ -6,16 +6,43 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 
 	controlv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/control/v1alpha1"
 	"github.com/alexrett/orchigram/internal/engine"
 	"github.com/alexrett/orchigram/internal/flow"
+	"github.com/alexrett/orchigram/internal/plugincontroller"
 	"github.com/alexrett/orchigram/internal/resource"
 	"github.com/alexrett/orchigram/internal/store"
 	"google.golang.org/grpc/metadata"
 )
+
+func TestInfoAdvertisesDeclarativePluginsOnlyWithController(t *testing.T) {
+	t.Parallel()
+	state, err := store.Open(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	without := NewAPI(state, flow.NewCompiler(nil), nil, missingWorkflowEngine{}, nil, nil, t.TempDir())
+	info, err := without.Info(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(info.GetCapabilities(), "plugins.declarative.v1") {
+		t.Fatalf("capabilities without controller=%v", info.GetCapabilities())
+	}
+	with := NewAPI(state, flow.NewCompiler(nil), nil, missingWorkflowEngine{}, nil, nil, t.TempDir(), plugincontroller.New(state, nil))
+	info, err = with.Info(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(info.GetCapabilities(), "plugins.declarative.v1") {
+		t.Fatalf("capabilities with controller=%v", info.GetCapabilities())
+	}
+}
 
 func TestSecureArtifactPathRejectsEscapes(t *testing.T) {
 	t.Parallel()

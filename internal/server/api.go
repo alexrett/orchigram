@@ -537,7 +537,12 @@ func (a *API) Reconcile(ctx context.Context, request *controlv1alpha1.ReconcileR
 // Info reports protocol negotiation and process identity.
 func (a *API) Info(context.Context, *emptypb.Empty) (*controlv1alpha1.SystemInfo, error) {
 	hostname, _ := os.Hostname()
-	return &controlv1alpha1.SystemInfo{Version: version.Version, ProtocolVersion: "v1alpha1", Hostname: hostname, Os: runtime.GOOS, Architecture: runtime.GOARCH, ProcessId: int64(os.Getpid()), StartedAt: timestamppb.New(a.startedAt), Capabilities: []string{"resources.v1alpha1", "flows.compile", "runs.approval", "plugins.grpc.v1", "plugins.automtls", "plugins.declarative.v1", "transport.uds"}}, nil
+	capabilities := []string{"resources.v1alpha1", "flows.compile", "runs.approval", "plugins.grpc.v1", "plugins.automtls", "transport.uds"}
+	if a.pluginState != nil {
+		capabilities = append(capabilities, "plugins.declarative.v1")
+	}
+	sort.Strings(capabilities)
+	return &controlv1alpha1.SystemInfo{Version: version.Version, ProtocolVersion: "v1alpha1", Hostname: hostname, Os: runtime.GOOS, Architecture: runtime.GOARCH, ProcessId: int64(os.Getpid()), StartedAt: timestamppb.New(a.startedAt), Capabilities: capabilities}, nil
 }
 
 // Health aggregates required control-plane components without leaking
