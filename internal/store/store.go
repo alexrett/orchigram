@@ -291,6 +291,10 @@ func (s *Store) List(ctx context.Context, kind, namespace string, limit int) ([]
 
 // Delete performs a CAS delete and appends event and audit state.
 func (s *Store) Delete(ctx context.Context, kind, namespace, name string, expected uint64, requestID string) error {
+	return s.delete(ctx, kind, namespace, name, expected, requestID, nil)
+}
+
+func (s *Store) delete(ctx context.Context, kind, namespace, name string, expected uint64, requestID string, afterCommit func()) error {
 	if namespace == "" {
 		namespace = resource.DefaultNamespace
 	}
@@ -333,7 +337,13 @@ func (s *Store) Delete(ctx context.Context, kind, namespace, name string, expect
 	if _, err := tx.ExecContext(ctx, `INSERT INTO audit_records(revision,request_id,actor,context_name,operation,resource_uid,old_hash,new_hash,occurred_at) VALUES(?,?,?,?,?,?,?,?,?)`, revision, valueOr(requestID, uuid.NewString()), "unix-peer", "", "deleted", uid, digest(data), "", now); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if afterCommit != nil {
+		afterCommit()
+	}
+	return nil
 }
 
 // ResourceEvent is one global revision in the watch log.
@@ -451,15 +461,19 @@ type Receipt struct {
 
 // AcceptTrigger persists a receipt and outbox command in one transaction.
 func (s *Store) AcceptTrigger(ctx context.Context, triggerUID, occurrenceID, flowName, namespace string, input json.RawMessage, deduplicated bool) (Receipt, error) {
-	return s.acceptTrigger(ctx, triggerUID, 0, occurrenceID, flowName, namespace, input, deduplicated, "", "")
+	return s.acceptTrigger(ctx, triggerUID, 0, occurrenceID, flowName, namespace, input, deduplicated, "", "", nil)
 }
 
 // AcceptProviderTrigger persists receipt, outbox, and provider cursor atomically.
 func (s *Store) AcceptProviderTrigger(ctx context.Context, triggerUID string, triggerGeneration uint64, occurrenceID, flowName, namespace string, input json.RawMessage, cursor string) (Receipt, error) {
-	return s.acceptTrigger(ctx, triggerUID, triggerGeneration, occurrenceID, flowName, namespace, input, true, cursor, occurrenceID)
+	return s.acceptProviderTrigger(ctx, triggerUID, triggerGeneration, occurrenceID, flowName, namespace, input, cursor, nil)
 }
 
-func (s *Store) acceptTrigger(ctx context.Context, triggerUID string, triggerGeneration uint64, occurrenceID, flowName, namespace string, input json.RawMessage, deduplicated bool, providerCursor, providerEventID string) (Receipt, error) {
+func (s *Store) acceptProviderTrigger(ctx context.Context, triggerUID string, triggerGeneration uint64, occurrenceID, flowName, namespace string, input json.RawMessage, cursor string, afterValidation func()) (Receipt, error) {
+	return s.acceptTrigger(ctx, triggerUID, triggerGeneration, occurrenceID, flowName, namespace, input, true, cursor, occurrenceID, afterValidation)
+}
+
+func (s *Store) acceptTrigger(ctx context.Context, triggerUID string, triggerGeneration uint64, occurrenceID, flowName, namespace string, input json.RawMessage, deduplicated bool, providerCursor, providerEventID string, afterProviderValidation func()) (Receipt, error) {
 	if namespace == "" {
 		namespace = resource.DefaultNamespace
 	}
@@ -490,6 +504,9 @@ func (s *Store) acceptTrigger(ctx context.Context, triggerUID string, triggerGen
 		}
 		if enabled == 0 {
 			return Receipt{}, ErrTriggerDisabled
+		}
+		if afterProviderValidation != nil {
+			afterProviderValidation()
 		}
 	}
 	existing, err := receiptByOccurrence(ctx, tx, triggerUID, occurrenceID)
@@ -1153,6 +1170,10 @@ func (s *Store) AdvanceTriggerCursor(ctx context.Context, triggerUID string, cur
 
 // SetTriggerEnabled applies an operator override without modifying resource spec.
 func (s *Store) SetTriggerEnabled(ctx context.Context, triggerUID string, enabled bool) error {
+	return s.setTriggerEnabled(ctx, triggerUID, enabled, nil)
+}
+
+func (s *Store) setTriggerEnabled(ctx context.Context, triggerUID string, enabled bool, afterCommit func()) error {
 	result, err := s.db.ExecContext(ctx, `UPDATE trigger_states SET enabled=?,updated_at=? WHERE trigger_uid=?`, boolInt(enabled), s.timestamp(), triggerUID)
 	if err != nil {
 		return err
@@ -1160,6 +1181,9 @@ func (s *Store) SetTriggerEnabled(ctx context.Context, triggerUID string, enable
 	changed, _ := result.RowsAffected()
 	if changed == 0 {
 		return ErrNotFound
+	}
+	if afterCommit != nil {
+		afterCommit()
 	}
 	return nil
 }

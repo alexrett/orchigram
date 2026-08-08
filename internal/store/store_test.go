@@ -303,6 +303,122 @@ func TestProviderAcceptanceRequiresExistingEnabledTrigger(t *testing.T) {
 	}
 }
 
+func TestProviderAcceptanceLinearizesWithTriggerMutations(t *testing.T) {
+	t.Parallel()
+	for _, mutation := range []string{"disable", "delete"} {
+		mutation := mutation
+		t.Run(mutation+"/acceptance-first", func(t *testing.T) {
+			s := openTestStore(t)
+			trigger := applyStoreTrigger(t, s, "race-acceptance-first-"+mutation)
+			validated, releaseAcceptance := make(chan struct{}), make(chan struct{})
+			acceptDone := make(chan error, 1)
+			go func() {
+				_, err := s.acceptProviderTrigger(context.Background(), trigger.Metadata.UID, trigger.Metadata.Generation, "race-event", "target", "default", json.RawMessage(`{"issue":1}`), "1", func() {
+					close(validated)
+					<-releaseAcceptance
+				})
+				acceptDone <- err
+			}()
+			<-validated
+
+			waitCount := s.db.Stats().WaitCount
+			mutationDone := make(chan error, 1)
+			go func() { mutationDone <- mutateTriggerForTest(s, trigger, mutation, nil) }()
+			waitForDatabaseWaiter(t, s, waitCount, mutationDone)
+			close(releaseAcceptance)
+			if err := <-acceptDone; err != nil {
+				t.Fatalf("acceptance-first event: %v", err)
+			}
+			if err := <-mutationDone; err != nil {
+				t.Fatalf("acceptance-first %s: %v", mutation, err)
+			}
+			assertProviderRaceState(t, s, trigger.Metadata.UID, mutation, true)
+		})
+
+		t.Run(mutation+"/mutation-first", func(t *testing.T) {
+			s := openTestStore(t)
+			trigger := applyStoreTrigger(t, s, "race-mutation-first-"+mutation)
+			mutated, releaseMutation := make(chan struct{}), make(chan struct{})
+			mutationDone := make(chan error, 1)
+			go func() {
+				mutationDone <- mutateTriggerForTest(s, trigger, mutation, func() {
+					close(mutated)
+					<-releaseMutation
+				})
+			}()
+			<-mutated
+
+			_, err := s.AcceptProviderTrigger(context.Background(), trigger.Metadata.UID, trigger.Metadata.Generation, "race-event", "target", "default", json.RawMessage(`{"issue":1}`), "1")
+			if mutation == "disable" && !errors.Is(err, ErrTriggerDisabled) {
+				t.Fatalf("mutation-first disabled Trigger acceptance error=%v", err)
+			}
+			if mutation == "delete" && !errors.Is(err, ErrNotFound) {
+				t.Fatalf("mutation-first deleted Trigger acceptance error=%v", err)
+			}
+			close(releaseMutation)
+			if err := <-mutationDone; err != nil {
+				t.Fatalf("mutation-first %s: %v", mutation, err)
+			}
+			assertProviderRaceState(t, s, trigger.Metadata.UID, mutation, false)
+		})
+	}
+}
+
+func mutateTriggerForTest(s *Store, trigger resource.Document, mutation string, afterCommit func()) error {
+	if mutation == "disable" {
+		return s.setTriggerEnabled(context.Background(), trigger.Metadata.UID, false, afterCommit)
+	}
+	return s.delete(context.Background(), "Trigger", trigger.Metadata.Namespace, trigger.Metadata.Name, trigger.Metadata.ResourceVersion, "race-delete", afterCommit)
+}
+
+func waitForDatabaseWaiter(t *testing.T, s *Store, previous int64, operationDone <-chan error) {
+	t.Helper()
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if s.db.Stats().WaitCount > previous {
+			return
+		}
+		select {
+		case err := <-operationDone:
+			t.Fatalf("Trigger mutation crossed the uncommitted provider acceptance: %v", err)
+		case <-deadline.C:
+			t.Fatal("Trigger mutation did not contend on the provider acceptance transaction")
+		case <-ticker.C:
+		}
+	}
+}
+
+func assertProviderRaceState(t *testing.T, s *Store, triggerUID, mutation string, accepted bool) {
+	t.Helper()
+	receipts, err := s.TriggerReceipts(context.Background(), triggerUID, 10)
+	if err != nil || len(receipts) != boolIntTest(accepted) {
+		t.Fatalf("%s accepted=%t receipts=%+v err=%v", mutation, accepted, receipts, err)
+	}
+	cursor, eventID, err := s.ProviderCursor(context.Background(), triggerUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mutation == "delete" || !accepted {
+		if cursor != "" || eventID != "" {
+			t.Fatalf("%s accepted=%t cursor=%q event=%q", mutation, accepted, cursor, eventID)
+		}
+		return
+	}
+	if cursor != "1" || eventID != "race-event" {
+		t.Fatalf("%s accepted=%t cursor=%q event=%q", mutation, accepted, cursor, eventID)
+	}
+}
+
+func boolIntTest(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
 func applyStoreTrigger(t *testing.T, s *Store, name string) resource.Document {
 	t.Helper()
 	document, err := resource.DecodeStrict([]byte(fmt.Sprintf(`apiVersion: orchigram.dev/v1alpha1
