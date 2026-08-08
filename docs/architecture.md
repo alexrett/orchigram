@@ -26,6 +26,14 @@ types; only advanced trigger and agent implementations use the public generated
 protobuf package. Arbitrary plugin streams are still validated independently by
 the daemon before their output is trusted.
 
+The interpreter schedules the compiled component DAG, not individual plugin
+processes. `maxParallel` bounds active components; stable topological admission
+makes the choice of the next ready component replay-safe. Strongly connected
+components remain serial inside one slot, and fan-in waits for all predecessor
+components, including skipped branches. On the first failed component, the
+scheduler stops admission and propagates a durable run-scoped cancellation to
+active plugin or agent calls before committing the final Run failure.
+
 ## Repository layout
 
 - `api/`: versioned protobuf sources.
