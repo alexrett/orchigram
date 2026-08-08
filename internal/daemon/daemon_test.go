@@ -45,8 +45,15 @@ import (
 
 func TestMain(m *testing.M) {
 	if os.Getenv(pluginsdk.Handshake.MagicCookieKey) == pluginsdk.Handshake.MagicCookieValue {
-		executable, _ := os.Executable()
-		_ = os.WriteFile(filepath.Join(filepath.Dir(executable), "process.pid"), []byte(strconv.Itoa(os.Getpid())), 0o600)
+		executable, err := os.Executable()
+		if err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, "resolve plugin test executable:", err)
+			os.Exit(3)
+		}
+		if err := os.WriteFile(filepath.Join(filepath.Dir(executable), "process.pid"), []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, "write plugin test pid marker:", err)
+			os.Exit(3)
+		}
 		name := filepath.Base(filepath.Dir(filepath.Dir(executable)))
 		catalogPlugin, _ := firstparty.Find(name)
 		config := pluginsdk.Config{Metadata: pluginsdk.Metadata{

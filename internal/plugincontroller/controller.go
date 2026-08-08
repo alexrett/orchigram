@@ -428,11 +428,11 @@ func installationStatus(installation resource.PluginInstallation, group []resour
 		phase, ready, reason, message = "Error", false, "ActivationPending", "the selected immutable plugin version is not active"
 	}
 	if !ready {
-		diagnostic = &health.Diagnostic{Path: "controllers/plugins/" + installation.Spec.Plugin + "@" + installation.Spec.Version, Code: strings.ToLower(reason), Message: message}
+		diagnostic = &health.Diagnostic{Path: "controllers/plugins/" + installation.Spec.Plugin + "@" + installation.Spec.Version, Code: reasonCode(reason), Message: message}
 	}
 	diagnostics := []map[string]any{}
 	if !ready {
-		diagnostics = append(diagnostics, map[string]any{"code": strings.ToLower(reason), "message": message})
+		diagnostics = append(diagnostics, map[string]any{"code": reasonCode(reason), "message": message})
 	}
 	return map[string]any{
 		"observedGeneration": installation.Metadata.Generation,
@@ -448,6 +448,17 @@ func installationStatus(installation resource.PluginInstallation, group []resour
 		}},
 		"diagnostics": diagnostics,
 	}, diagnostic
+}
+
+func reasonCode(reason string) string {
+	var result strings.Builder
+	for index, character := range reason {
+		if unicode.IsUpper(character) && index > 0 {
+			result.WriteByte('_')
+		}
+		result.WriteRune(unicode.ToLower(character))
+	}
+	return result.String()
 }
 
 func (c *Controller) replaceIssues(next map[string]health.Diagnostic) {

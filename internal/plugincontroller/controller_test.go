@@ -178,7 +178,7 @@ func TestConflictingEnabledVersionsDoNotSwitchActivation(t *testing.T) {
 			t.Fatalf("conflict status=%+v", installation.Status)
 		}
 	}
-	if diagnostics := controller.HealthDiagnostics(); len(diagnostics) != 2 || diagnostics[0].Code != "multipleenabledversions" {
+	if diagnostics := controller.HealthDiagnostics(); len(diagnostics) != 2 || diagnostics[0].Code != "multiple_enabled_versions" {
 		t.Fatalf("health=%+v", diagnostics)
 	}
 }
@@ -246,11 +246,11 @@ func TestControllerReportsDigestAndProtocolMismatchWithoutDuplicateProjection(t 
 	for _, installation := range installations {
 		switch installation.Spec.Plugin {
 		case "exec":
-			if installation.Status["phase"] != "Error" || firstStatusDiagnosticCode(installation.Status) != "digestmismatch" {
+			if installation.Status["phase"] != "Error" || firstStatusDiagnosticCode(installation.Status) != "digest_mismatch" {
 				t.Fatalf("digest status=%+v", installation.Status)
 			}
 		case "github":
-			if installation.Status["phase"] != "Error" || firstStatusDiagnosticCode(installation.Status) != "protocolincompatible" {
+			if installation.Status["phase"] != "Error" || firstStatusDiagnosticCode(installation.Status) != "protocol_incompatible" {
 				t.Fatalf("protocol status=%+v", installation.Status)
 			}
 		}
