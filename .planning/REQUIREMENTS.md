@@ -41,5 +41,5 @@
 ## Publication
 
 - [ ] PUB-01: Tests, secret scan, license inventory, SBOM, reproducible artifacts and attestations.
-- [ ] PUB-02: Backup/restore, active-run upgrade, plugin rollback, clean Ubuntu installation.
+- [x] PUB-02: Backup/restore, active-run upgrade, plugin rollback, clean Ubuntu installation.
 - [ ] PUB-03: Documentation reproduces both end-to-end tracers before public v0.1.0.

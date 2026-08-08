@@ -5,7 +5,7 @@ Current phase: 7 of 7
 Current plan: 07-01
 Progress: 6/7 plans
 Last activity: 2026-08-08
-Current focus: v0.1 publication and reproducibility gates
+Current focus: live tracer checkpoints and the v0.1.0 release tag
 
 ## Decisions
 
@@ -18,6 +18,7 @@ Current focus: v0.1 publication and reproducibility gates
 - Phase 4 fixed native schedule identities, durable webhook/provider acknowledgements, and declarative output mappings.
 - Phase 5 fixed GitHub issue-event cursors, run-isolated git workspaces, deterministic branches, and mutation reconciliation.
 - Phase 6 fixed pinned-plan graph replay, reconnecting OpenSSH StreamLocal contexts, CAS resource forms, and the hardened single-node install/upgrade path.
+- The source repository and terminal-first Pages site were published after explicit user authorization; the v0.1.0 tag remains gated on live external effects and release attestations.
 
 ## Blockers
 
