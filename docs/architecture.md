@@ -10,6 +10,12 @@ CLI / TUI ── gRPC/UDS ── daemon ── SQLite WAL
 
 Resources use `orchigram.dev/v1alpha1`, strict decoding, Kubernetes-style metadata, revisions, generations, labels, status, events, and optimistic concurrency. Before acknowledging a trigger, the daemon compiles a `Flow` into an immutable `ExecutionPlan` and atomically persists that plan with the receipt and outbox command. Every `Run` pins its plan hash and interpreter version. Non-core plan nodes additionally pin the plugin version and digest, canonical action schemas and contract digest, plus referenced resource metadata/spec snapshots; secret values remain runtime-only.
 
+Resource list pagination is keyset-based and bound to one global revision. A
+changed collection aborts continuation rather than returning a mixed snapshot;
+watch resumes from the same durable revision space. Exports are multi-document
+desired-state YAML with server status removed. See [Query and watch
+contracts](query-contracts.md).
+
 One namespace-aware resolver validates desired-resource dependencies for apply,
 GET/LIST/WATCH readiness projection, Flow compilation, webhook/provider setup,
 and runtime binding. Trigger acceptance rechecks the current Trigger generation,

@@ -77,3 +77,24 @@ func TestWithServerStatusRemovesClientProjection(t *testing.T) {
 		t.Fatalf("client status survived normalization: %s", doc.JSON)
 	}
 }
+
+func TestWithServerStatusPreservesUint64MetadataExactly(t *testing.T) {
+	t.Parallel()
+	doc, err := DecodeStrict([]byte(strings.Replace(validFlow, "metadata:\n  name: approval-demo", "metadata:\n  name: approval-demo\n  resourceVersion: 18446744073709551615", 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err = doc.WithServerStatus(map[string]any{"phase": "Ready"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var projection struct {
+		Metadata ObjectMeta `json:"metadata"`
+	}
+	if err := json.Unmarshal(doc.JSON, &projection); err != nil {
+		t.Fatal(err)
+	}
+	if projection.Metadata.ResourceVersion != ^uint64(0) {
+		t.Fatalf("resourceVersion=%d json=%s", projection.Metadata.ResourceVersion, doc.JSON)
+	}
+}

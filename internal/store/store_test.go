@@ -161,6 +161,77 @@ status: {observedGeneration: 999, phase: Active}
 	}
 }
 
+func TestResourcePageUsesLabelANDKeysetAndStableRevision(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openTestStore(t)
+	for _, fixture := range []struct {
+		name   string
+		labels string
+	}{{"alpha", "{environment: production, team: platform}"}, {"beta", "{environment: production, team: platform}"}, {"gamma", "{environment: production, team: product}"}, {"omega", "{environment: staging, team: platform}"}} {
+		document, err := resource.DecodeStrict([]byte(fmt.Sprintf(`apiVersion: orchigram.dev/v1alpha1
+kind: AgentProfile
+metadata:
+  name: %s
+  labels: %s
+spec: {type: command, executable: fake-agent}
+`, fixture.name, fixture.labels)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Apply(ctx, document, ApplyOptions{RequestID: "create-" + fixture.name}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	repository, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Repository
+metadata: {name: platform-repo, namespace: team-a, labels: {environment: production, team: platform}}
+spec: {cloneURL: "https://example.invalid/repo.git"}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Apply(ctx, repository, ApplyOptions{RequestID: "create-platform-repo"}); err != nil {
+		t.Fatal(err)
+	}
+	allKinds, _, more, err := s.ListResourcePage(ctx, ResourcePageOptions{Labels: map[string]string{"environment": "production", "team": "platform"}, Limit: 10})
+	if err != nil || len(allKinds) != 3 || more || allKinds[2].Kind != "Repository" || allKinds[2].Metadata.Namespace != "team-a" {
+		t.Fatalf("cross-kind page=%+v more=%v err=%v", allKinds, more, err)
+	}
+	first, revision, more, err := s.ListResourcePage(ctx, ResourcePageOptions{
+		Kind: "AgentProfile", Namespace: resource.DefaultNamespace,
+		Labels: map[string]string{"environment": "production", "team": "platform"}, Limit: 1,
+	})
+	if err != nil || len(first) != 1 || first[0].Metadata.Name != "alpha" || !more {
+		t.Fatalf("first=%+v revision=%d more=%v err=%v", first, revision, more, err)
+	}
+	second, secondRevision, more, err := s.ListResourcePage(ctx, ResourcePageOptions{
+		Kind: "AgentProfile", Namespace: resource.DefaultNamespace,
+		Labels:    map[string]string{"environment": "production", "team": "platform"},
+		AfterKind: first[0].Kind, AfterNamespace: first[0].Metadata.Namespace, AfterName: first[0].Metadata.Name,
+		ExpectedRevision: revision, Limit: 1,
+	})
+	if err != nil || secondRevision != revision || len(second) != 1 || second[0].Metadata.Name != "beta" || more {
+		t.Fatalf("second=%+v revision=%d more=%v err=%v", second, secondRevision, more, err)
+	}
+	changed, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: AgentProfile
+metadata: {name: later, labels: {environment: production, team: platform}}
+spec: {type: command, executable: fake-agent}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Apply(ctx, changed, ApplyOptions{RequestID: "create-later"}); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, err = s.ListResourcePage(ctx, ResourcePageOptions{Kind: "AgentProfile", Namespace: resource.DefaultNamespace, ExpectedRevision: revision, Limit: 1})
+	var changedRevision *SnapshotRevisionError
+	if !errors.As(err, &changedRevision) || changedRevision.Current == revision {
+		t.Fatalf("snapshot error=%v", err)
+	}
+}
+
 func TestTerminalRunTransitionsAreImmutable(t *testing.T) {
 	t.Parallel()
 	for _, terminal := range []string{"succeeded", "failed", "rejected", "cancelled"} {

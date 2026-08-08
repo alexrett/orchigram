@@ -79,6 +79,17 @@ type StaleObservedGenerationError struct {
 	Current  uint64
 }
 
+// SnapshotRevisionError rejects a pagination continuation after the resource
+// collection changed, preventing a silently inconsistent traversal.
+type SnapshotRevisionError struct {
+	Expected uint64
+	Current  uint64
+}
+
+func (e *SnapshotRevisionError) Error() string {
+	return fmt.Sprintf("resource snapshot revision changed: expected %d, current %d", e.Expected, e.Current)
+}
+
 func (e *StaleObservedGenerationError) Error() string {
 	return fmt.Sprintf("stale observed generation: expected %d, current %d", e.Expected, e.Current)
 }
@@ -436,6 +447,95 @@ func (s *Store) List(ctx context.Context, kind, namespace string, limit int) ([]
 		return nil, 0, err
 	}
 	return result, revision, rows.Err()
+}
+
+// ResourcePageOptions defines one stable keyset page. Labels use exact-match
+// AND semantics. ExpectedRevision zero starts a traversal; a continuation must
+// pass the revision returned by the first page.
+type ResourcePageOptions struct {
+	Kind             string
+	Namespace        string
+	Labels           map[string]string
+	AfterKind        string
+	AfterNamespace   string
+	AfterName        string
+	ExpectedRevision uint64
+	Limit            int
+}
+
+// ListResourcePage returns one deterministic resource page and whether another
+// matching key exists in the same unchanged snapshot.
+func (s *Store) ListResourcePage(ctx context.Context, options ResourcePageOptions) ([]resource.Document, uint64, bool, error) {
+	if options.Limit <= 0 || options.Limit > 1000 {
+		options.Limit = 100
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, 0, false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var revision uint64
+	if err := tx.QueryRowContext(ctx, "SELECT value FROM revisions WHERE singleton=1").Scan(&revision); err != nil {
+		return nil, 0, false, err
+	}
+	if options.ExpectedRevision != 0 && options.ExpectedRevision != revision {
+		return nil, revision, false, &SnapshotRevisionError{Expected: options.ExpectedRevision, Current: revision}
+	}
+	afterSet := options.AfterKind != "" || options.AfterNamespace != "" || options.AfterName != ""
+	rows, err := tx.QueryContext(ctx, `SELECT spec_json,labels_json FROM resources
+		WHERE (?='' OR kind=?) AND (?='' OR namespace=?)
+		AND (?=0 OR kind>? OR (kind=? AND namespace>?) OR (kind=? AND namespace=? AND name>?))
+		ORDER BY kind,namespace,name`,
+		options.Kind, options.Kind, options.Namespace, options.Namespace,
+		boolInt(afterSet), options.AfterKind, options.AfterKind, options.AfterNamespace,
+		options.AfterKind, options.AfterNamespace, options.AfterName)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	defer func() { _ = rows.Close() }()
+	result := make([]resource.Document, 0, options.Limit)
+	more := false
+	for rows.Next() {
+		var data, labelsJSON []byte
+		if err := rows.Scan(&data, &labelsJSON); err != nil {
+			return nil, 0, false, err
+		}
+		if len(options.Labels) > 0 {
+			var labels map[string]string
+			if err := json.Unmarshal(labelsJSON, &labels); err != nil {
+				return nil, 0, false, fmt.Errorf("decode stored resource labels: %w", err)
+			}
+			if !labelsMatch(labels, options.Labels) {
+				continue
+			}
+		}
+		if len(result) == options.Limit {
+			more = true
+			break
+		}
+		doc, err := resource.DecodeStrict(data)
+		if err != nil {
+			return nil, 0, false, fmt.Errorf("decode stored resource: %w", err)
+		}
+		result = append(result, doc)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, 0, false, err
+	}
+	return result, revision, more, nil
+}
+
+func labelsMatch(actual, required map[string]string) bool {
+	for key, value := range required {
+		actualValue, exists := actual[key]
+		if !exists || actualValue != value {
+			return false
+		}
+	}
+	return true
 }
 
 // Delete performs a CAS delete and appends event and audit state.
@@ -928,10 +1028,16 @@ func (s *Store) GetRun(ctx context.Context, uid string) (Run, error) {
 
 // ListRuns returns newest runs first.
 func (s *Store) ListRuns(ctx context.Context, limit int) ([]Run, error) {
+	return s.ListRunsFiltered(ctx, "", "", limit)
+}
+
+// ListRunsFiltered returns newest runs first after composing optional pinned
+// Flow UID and phase filters.
+func (s *Store) ListRunsFiltered(ctx context.Context, flowUID, phase string, limit int) ([]Run, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT uid,flow_uid,plan_hash,interpreter_version,phase,created_at,updated_at FROM runs ORDER BY created_at DESC LIMIT ?`, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT uid,flow_uid,plan_hash,interpreter_version,phase,created_at,updated_at FROM runs WHERE (?='' OR flow_uid=?) AND (?='' OR phase=?) ORDER BY created_at DESC,uid DESC LIMIT ?`, flowUID, flowUID, phase, phase, limit)
 	if err != nil {
 		return nil, err
 	}

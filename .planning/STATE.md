@@ -5,7 +5,7 @@ Current milestone: v0.1.0 First Real Release
 Current phase: 9 of 12
 Progress: 1/5 release phases
 Last activity: 2026-08-08
-Current focus: complete public API/CLI behavior and the live watch-driven operator surface
+Current focus: complete CLI coverage and the live watch-driven operator surface
 
 ## Reality check
 
@@ -44,6 +44,10 @@ The third Phase 9 gate now passes declarative PluginInstallation adoption,
 activation, rollback and deterministic conflict handling; persisted status-only
 revisions retain generation/CAS semantics and controller failures participate in
 aggregate health.
+
+The fourth Phase 9 gate now passes exact label selection, revision-bound keyset
+pagination, durable watch replay, desired-state YAML export, and composed Run
+filters through the public gRPC API.
 
 ## Active phase gate
 
