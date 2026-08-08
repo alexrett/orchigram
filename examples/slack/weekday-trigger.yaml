@@ -1,0 +1,14 @@
+apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata:
+  name: weekday-engineering-reminder
+  labels:
+    orchigram.dev/example: slack-tracer
+spec:
+  flow: weekday-engineering-reminder
+  schedule:
+    cron: "0 9 * * 1-5"
+    timezone: Europe/Berlin
+    misfirePolicy: fireOnce
+    startingDeadline: 1h
+    concurrencyPolicy: forbid

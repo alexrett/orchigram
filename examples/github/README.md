@@ -6,6 +6,10 @@ run/node marker, waits for durable TUI approval, implements and tests the
 change, pushes a deterministic branch, and creates or reconciles a pull
 request. It never merges and never pushes the default branch.
 
+Human reviewers request revisions through ordinary GitHub controls. Revisions
+reuse the deterministic issue branch and existing pull request; only normal
+GitHub review and merge controls can merge it.
+
 The example names the dedicated `alexrett/orchigram-e2e` repository from the
 v0.1 acceptance plan. Create it as a private test repository before running a
 real gate. Set `ORCHIGRAM_GITHUB_TOKEN` only in the daemon service environment;

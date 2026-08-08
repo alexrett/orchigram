@@ -587,6 +587,9 @@ func (m *Manager) consume(ctx context.Context, artifact runArtifact, stream even
 				return nil, errors.New("plugin stream ended without a completion event")
 			}
 			if strings.HasSuffix(terminal, ".failed") {
+				if diagnostic := terminalFailureDiagnostic(output); diagnostic != "" {
+					return nil, fmt.Errorf("plugin reported %s: %s", terminal, diagnostic)
+				}
 				return nil, fmt.Errorf("plugin reported %s", terminal)
 			}
 			return output, nil
@@ -625,6 +628,16 @@ func (m *Manager) consume(ctx context.Context, artifact runArtifact, stream even
 			output = append(output[:0], payload...)
 		}
 	}
+}
+
+func terminalFailureDiagnostic(payload json.RawMessage) string {
+	var failure struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(payload, &failure); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(failure.Error)
 }
 
 func (m *Manager) activeProcess(ctx context.Context, name string) (*pluginhost.Process, store.PluginRecord, error) {

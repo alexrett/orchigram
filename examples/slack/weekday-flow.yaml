@@ -1,0 +1,52 @@
+apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata:
+  name: weekday-engineering-reminder
+  labels:
+    orchigram.dev/example: slack-tracer
+spec:
+  policies:
+    timeout: 10m
+    maxParallel: 1
+  nodes:
+    - id: compose
+      name: Compose weekday reminder
+      uses: agent-command.run
+      timeout: 5m
+      retry:
+        limit: 1
+        backoff: 5s
+      with:
+        profile: weekday-reminder-writer
+        prompt: >-
+          Write one concise plain-text engineering reminder for the team in no
+          more than 500 characters. Return only the reminder, without Markdown,
+          a heading, quotation marks, or commentary.
+    - id: notify
+      name: Post Slack message
+      uses: http.request
+      timeout: 30s
+      retry:
+        limit: 3
+        backoff: 1s
+      with:
+        urlSecret: webhook
+        secretRefs:
+          webhook: slack-webhook-url
+        method: POST
+        body:
+          text: pending
+          blocks:
+            - type: section
+              text:
+                type: plain_text
+                text: pending
+                emoji: true
+        mappings:
+          - from: nodes.compose.text
+            to: /body/text
+          - from: nodes.compose.text
+            to: /body/blocks/0/text/text
+  edges:
+    - from: compose
+      to: notify

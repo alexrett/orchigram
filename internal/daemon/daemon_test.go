@@ -1,17 +1,20 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -19,6 +22,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	controlv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/control/v1alpha1"
 	"github.com/alexrett/orchigram/internal/backup"
@@ -53,6 +57,9 @@ func TestMain(m *testing.M) {
 			githubRuntime := &githubplugin.Runtime{Runner: process.NewRunner()}
 			config.Task = githubRuntime
 			config.Trigger = githubRuntime
+		case "http":
+			config.Metadata.Capabilities = []string{"task.http.request"}
+			config.Task = &pluginruntime.HTTP{}
 		default:
 			os.Exit(2)
 		}
@@ -60,6 +67,291 @@ func TestMain(m *testing.M) {
 		return
 	}
 	os.Exit(m.Run())
+}
+
+func TestSlackWeekdayFlowAcceptance(t *testing.T) {
+	tests := []struct {
+		name              string
+		statuses          []int
+		wantPhase         string
+		wantRequests      int
+		wantFailureStatus int
+	}{
+		{name: "200 ok", statuses: []int{http.StatusOK}, wantPhase: "succeeded", wantRequests: 1},
+		{name: "503 then 200", statuses: []int{http.StatusServiceUnavailable, http.StatusOK}, wantPhase: "succeeded", wantRequests: 2},
+		{name: "permanent non-2xx", statuses: []int{http.StatusBadGateway}, wantPhase: "failed", wantRequests: 4, wantFailureStatus: http.StatusBadGateway},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runSlackWeekdayFlowCase(t, test.statuses, test.wantPhase, test.wantRequests, test.wantFailureStatus)
+		})
+	}
+}
+
+type slackHTTPRequest struct {
+	body           []byte
+	contentType    string
+	idempotencyKey string
+}
+
+func runSlackWeekdayFlowCase(t *testing.T, statuses []int, wantPhase string, wantRequests, wantFailureStatus int) {
+	t.Helper()
+	const (
+		reminder = "Review one risky assumption before you ship today."
+	)
+	sentinel := strings.Join([]string{"slack", "webhook", "credential", "sentinel"}, "-")
+	var mu sync.Mutex
+	requests := []slackHTTPRequest{}
+	receiver := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Errorf("read receiver body: %v", err)
+			writer.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		mu.Lock()
+		requests = append(requests, slackHTTPRequest{body: append([]byte(nil), body...), contentType: request.Header.Get("Content-Type"), idempotencyKey: request.Header.Get("Idempotency-Key")})
+		attempt := len(requests)
+		statusCode := statuses[min(attempt-1, len(statuses)-1)]
+		mu.Unlock()
+		writer.WriteHeader(statusCode)
+		if statusCode == http.StatusOK {
+			_, _ = writer.Write([]byte("ok"))
+		} else {
+			_, _ = writer.Write([]byte(http.StatusText(statusCode)))
+		}
+	}))
+	defer receiver.Close()
+	webhookURL := receiver.URL + "/" + sentinel
+	t.Setenv("ORCHIGRAM_SLACK_WEBHOOK_URL", webhookURL)
+
+	root, err := os.MkdirTemp("/tmp", "orchigram-slack-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	cfg := config.Development(filepath.Join(root, "state"))
+	stop := serveTestDaemon(t, cfg)
+	stopped := false
+	defer func() {
+		if !stopped {
+			stop()
+		}
+	}()
+	client := dialReadyClient(t, cfg.SocketPath)
+	defer func() { _ = client.Close() }()
+	installDaemonPlugin(t, client, daemonPluginBundle(t, "agent-command", []string{"agent.codex", "agent.claude", "agent.command"}), "agent-command")
+	installDaemonPlugin(t, client, daemonPluginBundle(t, "http", []string{"task.http.request"}), "http")
+
+	projections := [][]byte{}
+	apply := func(source string) {
+		resourceDocument := applyClientResource(t, client, source)
+		projections = append(projections, append([]byte(nil), resourceDocument.GetJson()...))
+	}
+	apply(`apiVersion: orchigram.dev/v1alpha1
+kind: SecretRef
+metadata: {name: slack-webhook-url}
+spec: {backend: env, key: ORCHIGRAM_SLACK_WEBHOOK_URL}
+`)
+	apply(fmt.Sprintf(`apiVersion: orchigram.dev/v1alpha1
+kind: AgentProfile
+metadata: {name: weekday-reminder-writer}
+spec:
+  type: command
+  executable: /bin/sh
+  args:
+    - -c
+    - %q
+    - orchigram-slack-fixture
+    - "{prompt}"
+`, `printf '%s\n' '{"type":"result","result":"`+reminder+`"}'`))
+	flowYAML, err := os.ReadFile(filepath.Join("..", "..", "examples", "slack", "weekday-flow.yaml")) //nolint:gosec // Test loads the shipped Flow.
+	if err != nil {
+		t.Fatal(err)
+	}
+	apply(string(flowYAML))
+	for _, projection := range projections {
+		assertSecretAbsent(t, "resource projection", projection, sentinel, webhookURL)
+	}
+
+	run, err := client.Runs.Start(context.Background(), &controlv1alpha1.StartRunRequest{Flow: "weekday-engineering-reminder", InputJson: []byte(`{}`), IdempotencyKey: "slack-daemon-acceptance"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := collectRunEventsUntil(t, client, run.GetUid(), "run."+wantPhase)
+	summary, err := client.Runs.Reconcile(context.Background(), &controlv1alpha1.ReconcileRequest{RunUid: run.GetUid()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.GetPhase() != wantPhase {
+		t.Fatalf("run phase=%q want=%q", summary.GetPhase(), wantPhase)
+	}
+	for _, event := range events {
+		assertSecretAbsent(t, "run event", event.GetPayloadJson(), sentinel, webhookURL)
+	}
+
+	mu.Lock()
+	gotRequests := append([]slackHTTPRequest(nil), requests...)
+	mu.Unlock()
+	if len(gotRequests) != wantRequests {
+		t.Fatalf("requests=%d want=%d", len(gotRequests), wantRequests)
+	}
+	var expectedPayload any
+	if err := json.Unmarshal([]byte(`{"text":"`+reminder+`","blocks":[{"type":"section","text":{"type":"plain_text","text":"`+reminder+`","emoji":true}}]}`), &expectedPayload); err != nil {
+		t.Fatal(err)
+	}
+	for index, request := range gotRequests {
+		if request.contentType != "application/json" {
+			t.Errorf("request %d Content-Type=%q", index+1, request.contentType)
+		}
+		if request.idempotencyKey == "" {
+			t.Errorf("request %d has empty Idempotency-Key", index+1)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(request.body, &payload); err != nil {
+			t.Fatalf("request %d JSON: %v", index+1, err)
+		}
+		validateSlackPayload(t, payload)
+		if !reflect.DeepEqual(any(payload), expectedPayload) {
+			t.Errorf("request %d payload=%s", index+1, request.body)
+		}
+		if index > 0 {
+			if !bytes.Equal(request.body, gotRequests[0].body) {
+				t.Errorf("request %d payload differs from first attempt", index+1)
+			}
+			if request.idempotencyKey != gotRequests[0].idempotencyKey {
+				t.Errorf("request %d idempotency key differs from first attempt", index+1)
+			}
+		}
+	}
+
+	failedIndex := -1
+	succeededIndex := -1
+	foundHTTPOutput := false
+	failurePayloads := []byte{}
+	for index, event := range events {
+		if event.GetNodeId() == "notify" && event.GetType() == "node.failed" {
+			if failedIndex == -1 {
+				failedIndex = index
+			}
+			failurePayloads = append(failurePayloads, event.GetPayloadJson()...)
+		}
+		if event.GetType() == "run.succeeded" {
+			succeededIndex = index
+		}
+		if event.GetNodeId() == "notify" && event.GetType() == "node.completed" {
+			var output struct {
+				Status int    `json:"status"`
+				Body   string `json:"body"`
+			}
+			if err := json.Unmarshal(event.GetPayloadJson(), &output); err != nil {
+				t.Fatal(err)
+			}
+			if output.Status != http.StatusOK || output.Body != "ok" {
+				t.Errorf("HTTP output=%+v", output)
+			}
+			foundHTTPOutput = true
+		}
+	}
+	if wantPhase == "succeeded" && !foundHTTPOutput {
+		t.Error("successful run did not expose HTTP 200 ok output")
+	}
+	if len(statuses) > 1 && statuses[0] != http.StatusOK {
+		if failedIndex == -1 || succeededIndex == -1 || failedIndex >= succeededIndex {
+			t.Fatalf("retry event order failed=%d succeeded=%d", failedIndex, succeededIndex)
+		}
+	}
+	if wantFailureStatus != 0 {
+		statusText := strconv.Itoa(wantFailureStatus)
+		if !bytes.Contains(failurePayloads, []byte(statusText)) {
+			t.Errorf("failure diagnostics do not contain HTTP status %s: %s", statusText, failurePayloads)
+		}
+		if len(failurePayloads) == 0 {
+			t.Error("permanent failure emitted no node diagnostics")
+		}
+	}
+
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stop()
+	stopped = true
+	assertFilesDoNotContainSecret(t, root, sentinel, webhookURL)
+}
+
+func validateSlackPayload(t *testing.T, payload map[string]any) {
+	t.Helper()
+	fallback, ok := payload["text"].(string)
+	if !ok || strings.TrimSpace(fallback) == "" || utf8.RuneCountInString(fallback) > 4000 {
+		t.Fatalf("invalid Slack fallback text %#v", payload["text"])
+	}
+	blocks, ok := payload["blocks"].([]any)
+	if !ok || len(blocks) != 1 {
+		t.Fatalf("invalid Slack blocks %#v", payload["blocks"])
+	}
+	section, ok := blocks[0].(map[string]any)
+	if !ok || section["type"] != "section" {
+		t.Fatalf("invalid Slack section %#v", blocks[0])
+	}
+	textObject, ok := section["text"].(map[string]any)
+	if !ok || textObject["type"] != "plain_text" || textObject["emoji"] != true {
+		t.Fatalf("invalid Slack plain-text object %#v", section["text"])
+	}
+	text, ok := textObject["text"].(string)
+	if !ok || strings.TrimSpace(text) == "" || utf8.RuneCountInString(text) > 3000 {
+		t.Fatalf("invalid Slack section text %#v", textObject["text"])
+	}
+}
+
+func collectRunEventsUntil(t *testing.T, client *clientpkg.Client, runUID, terminalType string) []*controlv1alpha1.RunEvent {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	stream, err := client.Runs.WatchEvents(ctx, &controlv1alpha1.WatchRunRequest{Uid: runUID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := []*controlv1alpha1.RunEvent{}
+	for {
+		event, receiveErr := stream.Recv()
+		if receiveErr != nil {
+			t.Fatalf("watch run events: %v", receiveErr)
+		}
+		events = append(events, event)
+		if event.GetType() == terminalType {
+			return events
+		}
+	}
+}
+
+func assertSecretAbsent(t *testing.T, surface string, data []byte, secrets ...string) {
+	t.Helper()
+	for _, secret := range secrets {
+		if secret != "" && bytes.Contains(data, []byte(secret)) {
+			t.Errorf("%s contains test webhook sentinel", surface)
+		}
+	}
+}
+
+func assertFilesDoNotContainSecret(t *testing.T, root string, secrets ...string) {
+	t.Helper()
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		data, readErr := os.ReadFile(path) //nolint:gosec // Test scans its own state, logs, and artifacts.
+		if readErr != nil {
+			return readErr
+		}
+		assertSecretAbsent(t, path, data, secrets...)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestInstalledPluginExecutesThroughDurableDaemon(t *testing.T) {
@@ -499,9 +791,7 @@ func TestGitHubIssueApprovalToPullRequestTracer(t *testing.T) {
 	t.Setenv("ORCHIGRAM_TEST_GITHUB_TOKEN", "fixture-token")
 	cfg := config.Development(filepath.Join(root, "state"))
 	stop := serveTestDaemon(t, cfg)
-	defer stop()
 	client := dialReadyClient(t, cfg.SocketPath)
-	defer func() { _ = client.Close() }()
 	for name, capabilities := range map[string][]string{
 		"exec": {"task.exec.run"}, "agent-command": {"agent.codex", "agent.claude", "agent.command"}, "github": githubplugin.Capabilities,
 	} {
@@ -578,6 +868,7 @@ spec:
         mappings: [{from: nodes.checkout.workspace, to: /workspace}]
     - id: publish
       uses: github.issue.comment
+      retry: {limit: 1, backoff: 10ms}
       with:
         owner: acme
         repository: widget
@@ -614,6 +905,7 @@ spec:
           - {from: nodes.checkout.branch, to: /branch}
     - id: pr
       uses: github.pr.ensure
+      retry: {limit: 1, backoff: 10ms}
       with:
         owner: acme
         repository: widget
@@ -626,6 +918,7 @@ spec:
         mappings: [{from: nodes.checkout.branch, to: /head}]
     - id: final
       uses: github.issue.comment
+      retry: {limit: 1, backoff: 10ms}
       with:
         owner: acme
         repository: widget
@@ -647,46 +940,145 @@ spec:
     - {from: pr, to: final}
 `, fixture.server.URL, fixture.server.URL, fixture.server.URL, fixture.server.URL)
 	applyClientResource(t, client, flowSource)
-
-	approved, err := client.Runs.Start(context.Background(), &controlv1alpha1.StartRunRequest{Flow: "github-fixture", InputJson: []byte(`{"issue":{"number":42,"title":"Implement tracer","body":"fixture"}}`), IdempotencyKey: "github-approved"})
-	if err != nil {
+	trigger := applyClientResource(t, client, fmt.Sprintf(`apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata: {name: github-fixture-ready}
+spec:
+  flow: github-fixture
+  provider:
+    plugin: github
+    config:
+      owner: acme
+      repository: widget
+      apiBase: %q
+      label: orchigram:ready
+      pollInterval: 10ms
+      replayExisting: true
+      tokenSecret: token
+      secretRefs: {token: github-token}
+`, fixture.server.URL))
+	receipt := waitForTriggerReceipt(t, client, trigger.GetKey().GetUid())
+	if receipt.GetOccurrenceId() != "github:acme/widget:issue-label-event:7001" {
+		t.Fatalf("provider occurrence=%q", receipt.GetOccurrenceId())
+	}
+	waitForRunEvent(t, client, receipt.GetRunUid(), 0, "approval.waiting")
+	workspace := filepath.Join(cfg.StateDir, "workspaces", receipt.GetRunUid())
+	if _, err := os.Stat(filepath.Join(workspace, "implemented.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("implementation ran before approval: %v", err)
+	}
+	branch := "orchigram/issue-42-" + strings.ReplaceAll(receipt.GetRunUid(), "-", "")[:8]
+	if output := runDaemonGit(t, "", "--git-dir", origin, "for-each-ref", "--format=%(refname)", "refs/heads/"+branch); strings.TrimSpace(output) != "" {
+		t.Fatalf("branch was pushed before approval: %s", output)
+	}
+	if _, err := client.Runs.Approve(context.Background(), &controlv1alpha1.ApprovalRequest{RunUid: receipt.GetRunUid(), NodeId: "approval", Reason: "fixture approval"}); err != nil {
 		t.Fatal(err)
 	}
-	waitForRunEvent(t, client, approved.GetUid(), 0, "approval.waiting")
-	if _, err := client.Runs.Approve(context.Background(), &controlv1alpha1.ApprovalRequest{RunUid: approved.GetUid(), NodeId: "approval", Reason: "fixture approval"}); err != nil {
-		t.Fatal(err)
-	}
-	waitForRunEvent(t, client, approved.GetUid(), 0, "run.succeeded")
-	branch := "orchigram/issue-42-" + strings.ReplaceAll(approved.GetUid(), "-", "")[:8]
+	events := collectRunEventsUntil(t, client, receipt.GetRunUid(), "run.succeeded")
 	if head := strings.TrimSpace(runDaemonGit(t, "", "--git-dir", origin, "rev-parse", "refs/heads/"+branch)); head == "" {
 		t.Fatal("approved run did not push its deterministic branch")
 	}
+	assertNodeCompletedBefore(t, events, "tests", "push")
+	for _, nodeID := range []string{"publish", "pr", "final"} {
+		if !nodeCompletedWithReconciled(t, events, nodeID) {
+			t.Errorf("%s did not reconcile its hidden marker after an ambiguous remote success", nodeID)
+		}
+	}
 	fixture.mu.Lock()
 	commentCount, pullCount := len(fixture.comments[42]), len(fixture.pulls)
+	pullHead := ""
+	if pullCount == 1 {
+		head, _ := fixture.pulls[0]["head"].(map[string]any)
+		pullHead, _ = head["ref"].(string)
+	}
 	fixture.mu.Unlock()
-	if commentCount != 2 || pullCount != 1 {
-		t.Fatalf("approved GitHub effects: comments=%d pulls=%d", commentCount, pullCount)
+	if commentCount != 2 || pullCount != 1 || pullHead != branch {
+		t.Fatalf("approved GitHub effects: comments=%d pulls=%d head=%q", commentCount, pullCount, pullHead)
 	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stop()
 
-	rejected, err := client.Runs.Start(context.Background(), &controlv1alpha1.StartRunRequest{Flow: "github-fixture", InputJson: []byte(`{"issue":{"number":43,"title":"Reject tracer","body":"fixture"}}`), IdempotencyKey: "github-rejected"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	waitForRunEvent(t, client, rejected.GetUid(), 0, "approval.waiting")
-	if _, err := client.Runs.Reject(context.Background(), &controlv1alpha1.ApprovalRequest{RunUid: rejected.GetUid(), NodeId: "approval", Reason: "fixture rejection"}); err != nil {
-		t.Fatal(err)
-	}
-	waitForRunEvent(t, client, rejected.GetUid(), 0, "run.rejected")
-	rejectedBranch := "orchigram/issue-43-" + strings.ReplaceAll(rejected.GetUid(), "-", "")[:8]
-	if output := runDaemonGit(t, "", "--git-dir", origin, "for-each-ref", "--format=%(refname)", "refs/heads/"+rejectedBranch); strings.TrimSpace(output) != "" {
-		t.Fatalf("rejected run pushed branch: %s", output)
+	stopRestarted := serveTestDaemon(t, cfg)
+	defer stopRestarted()
+	restarted := dialReadyClient(t, cfg.SocketPath)
+	defer func() { _ = restarted.Close() }()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		receipts, err := restarted.Triggers.Receipts(context.Background(), &controlv1alpha1.ReceiptRequest{TriggerUid: trigger.GetKey().GetUid(), Limit: 10})
+		if err != nil {
+			t.Fatal(err)
+		}
+		runs, err := restarted.Runs.List(context.Background(), &controlv1alpha1.ListRunsRequest{Limit: 10})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(receipts.GetReceipts()) != 1 || receipts.GetReceipts()[0].GetRunUid() != receipt.GetRunUid() || len(runs.GetRuns()) != 1 {
+			t.Fatalf("provider replay created duplicate state: receipts=%d runs=%d", len(receipts.GetReceipts()), len(runs.GetRuns()))
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 	fixture.mu.Lock()
-	rejectedPulls := len(fixture.pulls)
+	restartedPulls := len(fixture.pulls)
 	fixture.mu.Unlock()
-	if rejectedPulls != 1 {
-		t.Fatalf("rejected run created a PR: pulls=%d", rejectedPulls)
+	if restartedPulls != 1 {
+		t.Fatalf("provider restart created another PR: pulls=%d", restartedPulls)
 	}
+}
+
+func waitForTriggerReceipt(t *testing.T, client *clientpkg.Client, triggerUID string) *controlv1alpha1.TriggerReceipt {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		response, err := client.Triggers.Receipts(context.Background(), &controlv1alpha1.ReceiptRequest{TriggerUid: triggerUID, Limit: 10})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(response.GetReceipts()) == 1 {
+			return response.GetReceipts()[0]
+		}
+		if len(response.GetReceipts()) > 1 {
+			t.Fatalf("provider created %d receipts", len(response.GetReceipts()))
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("provider event did not create a receipt")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func assertNodeCompletedBefore(t *testing.T, events []*controlv1alpha1.RunEvent, first, second string) {
+	t.Helper()
+	firstIndex, secondIndex := -1, -1
+	for index, event := range events {
+		if event.GetType() != "node.completed" {
+			continue
+		}
+		if event.GetNodeId() == first {
+			firstIndex = index
+		}
+		if event.GetNodeId() == second {
+			secondIndex = index
+		}
+	}
+	if firstIndex == -1 || secondIndex == -1 || firstIndex >= secondIndex {
+		t.Fatalf("node completion order %s=%d %s=%d", first, firstIndex, second, secondIndex)
+	}
+}
+
+func nodeCompletedWithReconciled(t *testing.T, events []*controlv1alpha1.RunEvent, nodeID string) bool {
+	t.Helper()
+	for _, event := range events {
+		if event.GetNodeId() != nodeID || event.GetType() != "node.completed" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(event.GetPayloadJson(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		return payload["reconciled"] == true && strings.Contains(fmt.Sprint(payload["marker"]), "<!-- orchigram:run=")
+	}
+	return false
 }
 
 func applyDaemonResource(t *testing.T, daemon *Daemon, source string) resource.Document {
@@ -860,11 +1252,19 @@ type githubFixture struct {
 	mu       sync.Mutex
 	comments map[int][]map[string]any
 	pulls    []map[string]any
+	events   []map[string]any
 }
 
 func newGitHubFixture(t *testing.T) *githubFixture {
 	t.Helper()
-	fixture := &githubFixture{comments: map[int][]map[string]any{}}
+	fixture := &githubFixture{
+		comments: map[int][]map[string]any{},
+		events: []map[string]any{{
+			"id": 7001, "event": "labeled", "created_at": time.Now().UTC().Add(-time.Second).Format(time.RFC3339),
+			"label": map[string]any{"name": "orchigram:ready"},
+			"issue": map[string]any{"number": 42, "title": "Implement tracer", "body": "fixture", "html_url": "https://example.invalid/issues/42", "state": "open"},
+		}},
+	}
 	fixture.server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Header.Get("Authorization") != "Bearer fixture-token" {
 			http.Error(writer, `{"message":"unauthorized"}`, http.StatusUnauthorized)
@@ -873,6 +1273,10 @@ func newGitHubFixture(t *testing.T) *githubFixture {
 		fixture.mu.Lock()
 		defer fixture.mu.Unlock()
 		writer.Header().Set("Content-Type", "application/json")
+		if request.URL.Path == "/repos/acme/widget/issues/events" {
+			_ = json.NewEncoder(writer).Encode(fixture.events)
+			return
+		}
 		var issueNumber int
 		if _, err := fmt.Sscanf(request.URL.Path, "/repos/acme/widget/issues/%d", &issueNumber); err == nil && !strings.HasSuffix(request.URL.Path, "/comments") {
 			_ = json.NewEncoder(writer).Encode(map[string]any{"number": issueNumber, "title": fmt.Sprintf("Issue %d", issueNumber), "body": "fixture", "html_url": fmt.Sprintf("https://example.invalid/issues/%d", issueNumber), "state": "open"})
@@ -887,8 +1291,8 @@ func newGitHubFixture(t *testing.T) *githubFixture {
 				_ = json.NewDecoder(request.Body).Decode(&payload)
 				created := map[string]any{"id": len(fixture.comments[issueNumber]) + 1, "html_url": fmt.Sprintf("https://example.invalid/comments/%d/%d", issueNumber, len(fixture.comments[issueNumber])+1), "body": payload["body"]}
 				fixture.comments[issueNumber] = append(fixture.comments[issueNumber], created)
-				writer.WriteHeader(http.StatusCreated)
-				_ = json.NewEncoder(writer).Encode(created)
+				writer.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(writer).Encode(map[string]any{"message": "ambiguous fixture response after storing comment"})
 			default:
 				writer.WriteHeader(http.StatusMethodNotAllowed)
 			}
@@ -903,8 +1307,8 @@ func newGitHubFixture(t *testing.T) *githubFixture {
 				_ = json.NewDecoder(request.Body).Decode(&payload)
 				created := map[string]any{"number": len(fixture.pulls) + 1, "html_url": fmt.Sprintf("https://example.invalid/pulls/%d", len(fixture.pulls)+1), "body": payload["body"], "head": map[string]any{"ref": payload["head"]}}
 				fixture.pulls = append(fixture.pulls, created)
-				writer.WriteHeader(http.StatusCreated)
-				_ = json.NewEncoder(writer).Encode(created)
+				writer.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(writer).Encode(map[string]any{"message": "ambiguous fixture response after storing pull request"})
 			default:
 				writer.WriteHeader(http.StatusMethodNotAllowed)
 			}

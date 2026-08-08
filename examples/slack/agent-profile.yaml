@@ -1,0 +1,10 @@
+apiVersion: orchigram.dev/v1alpha1
+kind: AgentProfile
+metadata:
+  name: weekday-reminder-writer
+  labels:
+    orchigram.dev/example: slack-tracer
+spec:
+  type: codex
+  effort: low
+  sandbox: read-only

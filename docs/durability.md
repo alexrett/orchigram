@@ -4,6 +4,18 @@ Orchigram guarantees that an acknowledged trigger has a durable `TriggerReceipt`
 
 External activities are at-least-once. The unavoidable crash window is after a remote side effect succeeds and before its completion is recorded locally. Every plugin call therefore receives a stable idempotency key derived from run, node, logical iteration, and operation. Providers that cannot enforce it must reconcile with deterministic remote identifiers or hidden markers and expose the residual risk to the operator.
 
+The Slack Incoming Webhook tracer demonstrates the residual case. Orchigram
+keeps its `Idempotency-Key` stable across HTTP retries, but Incoming Webhooks
+expose no documented deduplication identifier. If Slack accepts a message and
+the daemon crashes before recording completion, replay can post a duplicate.
+This is an inference from the Incoming Webhook contract, not a Slack delivery
+guarantee. Successful calls normally return `HTTP 200` and `ok`; every other
+status is a failed attempt. Incoming Webhooks are limited to approximately one
+message per second with short bursts tolerated, and `429` responses include
+`Retry-After`. See Slack's [Incoming Webhook
+contract](https://api.slack.com/incoming-webhooks) and [rate-limit
+documentation](https://docs.slack.dev/apis/web-api/rate-limits/).
+
 Workflow and activity workers heartbeat every 500 milliseconds, comfortably
 inside the two-second SQLite task leases. Long-running activities renew
 ownership instead of becoming eligible for concurrent redispatch.
