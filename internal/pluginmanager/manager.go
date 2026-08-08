@@ -1488,7 +1488,7 @@ func firstBindings(bindingSets [][]flow.ResourceBinding) []flow.ResourceBinding 
 
 func (m *Manager) boundAgentProfile(ctx context.Context, namespace string, bindings []flow.ResourceBinding, name string) (resource.AgentProfileSpec, error) {
 	for _, binding := range bindings {
-		if binding.Kind == "AgentProfile" && binding.Name == name {
+		if binding.Kind == "AgentProfile" && binding.Name == name && (namespace == "" || binding.Namespace == namespace) {
 			var spec resource.AgentProfileSpec
 			if err := json.Unmarshal(binding.Spec, &spec); err != nil {
 				return resource.AgentProfileSpec{}, fmt.Errorf("decode pinned AgentProfile %q: %w", name, err)
@@ -1516,7 +1516,7 @@ func (m *Manager) boundAgentProfile(ctx context.Context, namespace string, bindi
 
 func (m *Manager) resolveBoundSecret(ctx context.Context, namespace, name string, bindings []flow.ResourceBinding) ([]byte, error) {
 	for _, binding := range bindings {
-		if binding.Kind != "SecretRef" || binding.Name != name {
+		if binding.Kind != "SecretRef" || binding.Name != name || (namespace != "" && binding.Namespace != namespace) {
 			continue
 		}
 		var spec resource.SecretRefSpec

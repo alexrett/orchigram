@@ -388,6 +388,20 @@ spec: {type: command, executable: fake-agent, secretRefs: [TOKEN=token]}
 	if err != nil || profile.Executable != "fake-agent" {
 		t.Fatalf("team AgentProfile=%+v err=%v", profile, err)
 	}
+	wrongNamespaceBindings := []flow.ResourceBinding{
+		{Kind: "AgentProfile", Namespace: "team-b", Name: "worker", Spec: json.RawMessage(`{"type":"command","executable":"wrong-agent"}`)},
+		{Kind: "SecretRef", Namespace: "team-b", Name: "token", Spec: json.RawMessage(`{"backend":"env","key":"ORCHIGRAM_TEAM_TOKEN"}`)},
+	}
+	if _, err := manager.boundAgentProfile(ctx, "team-a", wrongNamespaceBindings, "worker"); err == nil || !strings.Contains(err.Error(), "pinned AgentProfile") {
+		t.Fatalf("cross-namespace AgentProfile binding error=%v", err)
+	}
+	if _, err := manager.resolveBoundSecret(ctx, "team-a", "token", wrongNamespaceBindings); err == nil || !strings.Contains(err.Error(), "pinned SecretRef") {
+		t.Fatalf("cross-namespace SecretRef binding error=%v", err)
+	}
+	legacyProfile, err := manager.boundAgentProfile(ctx, "", wrongNamespaceBindings, "worker")
+	if err != nil || legacyProfile.Executable != "wrong-agent" {
+		t.Fatalf("legacy pinned AgentProfile=%+v err=%v", legacyProfile, err)
+	}
 }
 
 func TestActivePluginHealthReportsProcessLossThenRestarts(t *testing.T) {
