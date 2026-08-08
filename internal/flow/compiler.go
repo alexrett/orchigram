@@ -53,7 +53,9 @@ type Diagnostic struct {
 }
 
 const (
-	SeverityError   = "error"
+	// SeverityError marks a diagnostic that prevents Flow storage.
+	SeverityError = "error"
+	// SeverityWarning marks a diagnostic that remains runtime-validated.
 	SeverityWarning = "warning"
 )
 
@@ -341,12 +343,18 @@ func (c *Compiler) Compile(input resource.Flow) (ExecutionPlan, []Diagnostic) {
 		}
 		if edge.When != "" {
 			ast, issues := celEnv.Compile(edge.When)
-			if issues != nil && issues.Err() != nil {
+			switch {
+			case issues != nil && issues.Err() != nil:
 				diagnostics = append(diagnostics, Diagnostic{Path: path + ".when", Code: "invalid_cel", Message: issues.Err().Error()})
-			} else if ast.OutputType() != cel.BoolType && ast.OutputType() != cel.DynType {
+			case ast.OutputType() != cel.BoolType && ast.OutputType() != cel.DynType:
 				diagnostics = append(diagnostics, Diagnostic{Path: path + ".when", Code: "cel_not_boolean", Message: "condition must produce bool"})
-			} else if ast.OutputType() == cel.DynType {
-				diagnostics = append(diagnostics, typedCELDiagnostics(path+".when", ast.Expr(), edge.From, compiledInput, nodeContracts)...)
+			default:
+				checked, checkedErr := cel.AstToCheckedExpr(ast)
+				if checkedErr != nil {
+					diagnostics = append(diagnostics, Diagnostic{Path: path + ".when", Code: "invalid_cel", Message: "condition could not be converted to a checked expression"})
+				} else {
+					diagnostics = append(diagnostics, typedCELDiagnostics(path+".when", checked.GetExpr(), edge.From, compiledInput, nodeContracts)...)
+				}
 			}
 		}
 		if _, fromOK := nodes[edge.From]; fromOK {
@@ -667,15 +675,62 @@ func outputSchema(contract ActionContract) *actioncontract.Schema {
 }
 
 func coreActionContract(node resource.FlowNode) ActionContract {
-	if node.Uses != "core.approval" {
+	switch node.Uses {
+	case "core.approval":
+		return ActionContract{
+			Digest:       "core.approval/v1",
+			ConfigSchema: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
+			InputSchema:  json.RawMessage(`{"type":"object","additionalProperties":true}`),
+			OutputSchema: json.RawMessage(`{"type":"object","properties":{"approved":{"type":"boolean"},"state":{"type":"string"},"reason":{"type":"string"}},"required":["approved","state","reason"],"additionalProperties":false}`),
+		}
+	case "core.noop":
+		output := any(map[string]any{"ok": true})
+		if configured, exists := node.With["result"]; exists {
+			output = configured
+		}
+		return ActionContract{Digest: "core.noop/v1", OutputSchema: schemaFromValue(output)}
+	default:
 		return ActionContract{}
 	}
-	return ActionContract{
-		Digest:       "core.approval/v1",
-		ConfigSchema: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
-		InputSchema:  json.RawMessage(`{"type":"object","additionalProperties":true}`),
-		OutputSchema: json.RawMessage(`{"type":"object","properties":{"approved":{"type":"boolean"},"state":{"type":"string"},"reason":{"type":"string"}},"required":["approved","state","reason"],"additionalProperties":false}`),
+}
+
+func schemaFromValue(value any) json.RawMessage {
+	var schema any
+	switch typed := value.(type) {
+	case nil:
+		schema = map[string]any{"type": "null"}
+	case bool:
+		schema = map[string]any{"type": "boolean"}
+	case string:
+		schema = map[string]any{"type": "string"}
+	case float64:
+		kind := "number"
+		if typed == float64(int64(typed)) {
+			kind = "integer"
+		}
+		schema = map[string]any{"type": kind}
+	case map[string]any:
+		properties := make(map[string]any, len(typed))
+		required := make([]string, 0, len(typed))
+		for key, child := range typed {
+			var childSchema any
+			_ = json.Unmarshal(schemaFromValue(child), &childSchema)
+			properties[key] = childSchema
+			required = append(required, key)
+		}
+		sort.Strings(required)
+		schema = map[string]any{"type": "object", "properties": properties, "required": required, "additionalProperties": false}
+	case []any:
+		items := any(map[string]any{})
+		if len(typed) > 0 {
+			_ = json.Unmarshal(schemaFromValue(typed[0]), &items)
+		}
+		schema = map[string]any{"type": "array", "items": items}
+	default:
+		schema = map[string]any{}
 	}
+	encoded, _ := json.Marshal(schema)
+	return encoded
 }
 
 func schemaDiagnostic(base string, violation actioncontract.Violation) Diagnostic {

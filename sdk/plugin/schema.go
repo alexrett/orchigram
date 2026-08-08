@@ -31,7 +31,6 @@ func ValidateDescription(description *pluginv1alpha1.DescribeResponse) (Contract
 	}
 	metadata := Metadata{
 		Name: description.GetName(), Version: description.GetVersion(), Capabilities: append([]string(nil), description.GetCapabilities()...),
-		InputSchema: append(json.RawMessage(nil), description.GetInputSchemaJson()...), OutputSchema: append(json.RawMessage(nil), description.GetOutputSchemaJson()...),
 	}
 	for _, action := range description.GetActions() {
 		if action == nil {

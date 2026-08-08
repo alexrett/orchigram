@@ -20,13 +20,21 @@ import (
 type Type uint16
 
 const (
+	// TypeUnknown identifies an explicitly open or otherwise non-inferable schema region.
 	TypeUnknown Type = 0
-	TypeNull    Type = 1 << iota
+	// TypeNull identifies JSON null.
+	TypeNull Type = 1 << iota
+	// TypeBoolean identifies a JSON boolean.
 	TypeBoolean
+	// TypeInteger identifies an integral JSON number.
 	TypeInteger
+	// TypeNumber identifies any JSON number.
 	TypeNumber
+	// TypeString identifies a JSON string.
 	TypeString
+	// TypeObject identifies a JSON object.
 	TypeObject
+	// TypeArray identifies a JSON array.
 	TypeArray
 )
 
