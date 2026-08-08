@@ -341,6 +341,23 @@ spec: {backend: env, key: ORCHIGRAM_TEST_GITHUB_PROVIDER_TOKEN}
 	}
 }
 
+func TestProviderEventContractRejectsMalformedPayloadBeforeAcceptance(t *testing.T) {
+	t.Parallel()
+	catalog, ok := firstparty.Find("github")
+	if !ok || len(catalog.Triggers) != 1 {
+		t.Fatalf("GitHub trigger contract=%+v found=%t", catalog.Triggers, ok)
+	}
+	invalid := []byte(`{"repository":{"owner":"acme","name":"widget"},"issue":{"number":"not-an-integer"}}`)
+	validation := validateTriggerContractJSON(catalog.Triggers[0].EventSchema, "event", invalid)
+	if validation == nil || validation.code != "required" && validation.code != "type_mismatch" || !strings.HasPrefix(validation.path, "event.issue") {
+		t.Fatalf("invalid event validation=%+v", validation)
+	}
+	valid := []byte(`{"repository":{"owner":"acme","name":"widget"},"issue":{"number":42,"title":"title","body":"body","html_url":"https://example.invalid/42","state":"open"}}`)
+	if validation := validateTriggerContractJSON(catalog.Triggers[0].EventSchema, "event", valid); validation != nil {
+		t.Fatalf("valid event validation=%+v", validation)
+	}
+}
+
 func TestActivePluginHealthReportsProcessLossThenRestarts(t *testing.T) {
 	state, err := store.Open(filepath.Join(t.TempDir(), "state.sqlite"))
 	if err != nil {
