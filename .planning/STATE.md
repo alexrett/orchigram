@@ -5,7 +5,7 @@ Current milestone: v0.1.0 First Real Release
 Current phase: 9 of 12
 Progress: 1/5 release phases
 Last activity: 2026-08-08
-Current focus: complete CLI coverage and the live watch-driven operator surface
+Current focus: complete the live watch-driven TUI operator surface after the real-UDS CLI gate
 
 ## Reality check
 

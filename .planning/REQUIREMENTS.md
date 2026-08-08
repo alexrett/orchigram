@@ -20,7 +20,7 @@ The existing code is a prototype baseline. A checked requirement below means its
 - [x] CTL-02: Cross-resource references are resolved consistently and rejected or surfaced as explicit status conditions; a Trigger cannot durably accept work for a missing Flow.
 - [x] CTL-03: PluginInstallation resources drive an actual reconciliation controller with observed generation, immutable version status, activation state, and diagnostics.
 - [x] CTL-04: Resource label selectors, pagination, run filters, watches, and export behave as declared by the public protobuf API.
-- [ ] CLI-01: CLI coverage includes resource watch/export, flow graph, run list/describe/reconcile, trigger receipts, plugin describe, and system health; apply accepts stdin and multi-document YAML.
+- [x] CLI-01: CLI coverage includes resource watch/export, flow graph, run list/describe/reconcile, trigger receipts, plugin describe, and system health; apply accepts stdin and multi-document YAML.
 - [ ] TUI-01: Resource and run screens consume watches, reconnect without stale snapshots, and show controller/status changes live.
 - [ ] TUI-02: Keyboard-only TUI operations can create, edit with CAS, delete, start, approve/reject/cancel, install/activate/rollback plugins, and switch contexts.
 - [ ] TUI-03: The ASCII graph is interactive at 80x24 and larger: nodes and edges are selectable by keyboard or mouse, Enter opens schema-derived settings, and validated changes update the same declarative Flow projection.

@@ -282,6 +282,7 @@ func (a *API) Export(ctx context.Context, request *controlv1alpha1.ExportRequest
 		if err := yaml.Unmarshal(doc.JSON, &value); err != nil {
 			return nil, status.Error(codes.Internal, "decode stored resource for export")
 		}
+		clearYAMLNodeStyles(&value)
 		if err := encoder.Encode(&value); err != nil {
 			return nil, status.Error(codes.Internal, "encode resource export")
 		}
@@ -290,6 +291,16 @@ func (a *API) Export(ctx context.Context, request *controlv1alpha1.ExportRequest
 		return nil, status.Error(codes.Internal, "close resource export")
 	}
 	return &controlv1alpha1.ExportResponse{Yaml: output.Bytes()}, nil
+}
+
+func clearYAMLNodeStyles(node *yaml.Node) {
+	if node == nil {
+		return
+	}
+	node.Style = 0
+	for _, child := range node.Content {
+		clearYAMLNodeStyles(child)
+	}
 }
 
 // Compile compiles a strict Flow without storing it.
@@ -379,6 +390,18 @@ func (a *API) ListRuns(ctx context.Context, request *controlv1alpha1.ListRunsReq
 		result.Runs = append(result.Runs, runPB(run))
 	}
 	return result, nil
+}
+
+// GetRun returns one run projection without reconciling or mutating it.
+func (a *API) GetRun(ctx context.Context, request *controlv1alpha1.RunRequest) (*controlv1alpha1.RunSummary, error) {
+	if request.GetUid() == "" {
+		return nil, status.Error(codes.InvalidArgument, "uid is required")
+	}
+	run, err := a.store.GetRun(ctx, request.GetUid())
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	return runPB(run), nil
 }
 
 func validRunPhase(phase string) bool {
@@ -904,6 +927,9 @@ type runService struct {
 
 func (s *runService) Start(ctx context.Context, request *controlv1alpha1.StartRunRequest) (*controlv1alpha1.RunRef, error) {
 	return s.api.Start(ctx, request)
+}
+func (s *runService) Get(ctx context.Context, request *controlv1alpha1.RunRequest) (*controlv1alpha1.RunSummary, error) {
+	return s.api.GetRun(ctx, request)
 }
 func (s *runService) List(ctx context.Context, request *controlv1alpha1.ListRunsRequest) (*controlv1alpha1.ListRunsResponse, error) {
 	return s.api.ListRuns(ctx, request)
