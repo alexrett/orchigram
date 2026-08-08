@@ -9,7 +9,7 @@ before:
     - sh -c 'rm -rf .release && mkdir -p .release'
     - go run ./cmd/orchigram-release plugins --output .release/plugin-bundles --version {{ .Version }} --commit {{ .Commit }} --date {{ .CommitDate }}
     - make dependency-licenses
-    - make plugin-sboms
+    - sh -c 'ORCHIGRAM_SBOM_DATE="{{ .CommitDate }}" make plugin-sboms'
 
 builds:
   - id: orchigram
@@ -111,6 +111,8 @@ checksum:
 
 sboms:
   - artifacts: archive
+    cmd: ../scripts/reproducible-sbom.sh
+    args: ["$artifact", "$document", "{{ .CommitDate }}"]
 
 changelog:
   use: git

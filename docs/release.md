@@ -29,6 +29,12 @@ Plugin tar/gzip headers are normalized to the Unix epoch. GoReleaser runs with
 one packaging worker so archive member ordering is stable; the release packager
 also has a byte-for-byte reproducibility test.
 
+Syft's package inventory is preserved, while its invocation-specific SPDX
+metadata is normalized after cataloging. `documentNamespace` is derived from
+the SHA-256 of the exact cataloged artifact and `creationInfo.created` uses the
+source commit timestamp. Core archives and independent plugin bundles use the
+same normalizer, so two builds of one commit produce identical SPDX documents.
+
 First-party release packaging and `orchigram plugin pack` share the canonical
 bundle builder: sorted capabilities/platforms and archive members, fixed modes,
 IDs, names, timestamps, tar format, and gzip headers. Community outputs are
