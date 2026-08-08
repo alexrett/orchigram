@@ -2,6 +2,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -34,6 +35,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"gopkg.in/yaml.v3"
 )
 
 const maxArtifactDownload = 64 << 20
@@ -132,13 +134,37 @@ func (a *API) Get(ctx context.Context, request *controlv1alpha1.GetRequest) (*co
 
 // List returns a stable resource page.
 func (a *API) List(ctx context.Context, request *controlv1alpha1.ListRequest) (*controlv1alpha1.ListResponse, error) {
-	docs, revision, err := a.store.List(ctx, request.GetKind(), request.GetNamespace(), int(request.GetLimit()))
+	if request.GetKind() != "" && !validResourceKind(request.GetKind()) {
+		return nil, status.Error(codes.InvalidArgument, "kind filter is invalid")
+	}
+	if request.GetNamespace() != "" {
+		if err := resource.ValidateMetadata(resource.ObjectMeta{Name: "list", Namespace: request.GetNamespace()}); err != nil {
+			return nil, status.Error(codes.InvalidArgument, "namespace filter is invalid")
+		}
+	}
+	if request.GetLimit() > 1000 {
+		return nil, status.Error(codes.InvalidArgument, "limit must not exceed 1000")
+	}
+	token, err := decodeResourcePageToken(request)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	docs, revision, more, err := a.store.ListResourcePage(ctx, store.ResourcePageOptions{
+		Kind: request.GetKind(), Namespace: request.GetNamespace(), Labels: request.GetLabels(), Limit: int(request.GetLimit()),
+		AfterKind: token.Kind, AfterNamespace: token.Namespace, AfterName: token.Name, ExpectedRevision: token.Revision,
+	})
 	if err != nil {
 		return nil, rpcError(err)
 	}
 	result := &controlv1alpha1.ListResponse{Revision: revision, Resources: make([]*controlv1alpha1.ResourceDocument, 0, len(docs))}
 	for _, doc := range docs {
 		result.Resources = append(result.Resources, a.projectResource(ctx, doc))
+	}
+	if more && len(docs) > 0 {
+		result.ContinueToken, err = encodeResourcePageToken(request, revision, docs[len(docs)-1])
+		if err != nil {
+			return nil, status.Error(codes.Internal, "encode resource continue token")
+		}
 	}
 	return result, nil
 }
@@ -240,19 +266,30 @@ func (a *API) Watch(request *controlv1alpha1.WatchRequest, stream grpc.ServerStr
 
 // Export returns canonical JSON in the YAML-compatible response envelope.
 func (a *API) Export(ctx context.Context, request *controlv1alpha1.ExportRequest) (*controlv1alpha1.ExportResponse, error) {
-	documents := make([]json.RawMessage, 0, len(request.GetKeys()))
+	var output bytes.Buffer
+	encoder := yaml.NewEncoder(&output)
+	encoder.SetIndent(2)
 	for _, key := range request.GetKeys() {
 		doc, err := a.store.Get(ctx, key.GetKind(), key.GetNamespace(), key.GetName())
 		if err != nil {
 			return nil, rpcError(err)
 		}
-		documents = append(documents, doc.JSON)
+		doc, err = doc.WithServerStatus(nil)
+		if err != nil {
+			return nil, status.Error(codes.Internal, "strip server-owned status for export")
+		}
+		var value any
+		if err := json.Unmarshal(doc.JSON, &value); err != nil {
+			return nil, status.Error(codes.Internal, "decode stored resource for export")
+		}
+		if err := encoder.Encode(value); err != nil {
+			return nil, status.Error(codes.Internal, "encode resource export")
+		}
 	}
-	data, err := json.MarshalIndent(documents, "", "  ")
-	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+	if err := encoder.Close(); err != nil {
+		return nil, status.Error(codes.Internal, "close resource export")
 	}
-	return &controlv1alpha1.ExportResponse{Yaml: data}, nil
+	return &controlv1alpha1.ExportResponse{Yaml: output.Bytes()}, nil
 }
 
 // Compile compiles a strict Flow without storing it.
@@ -319,7 +356,21 @@ func (a *API) Start(ctx context.Context, request *controlv1alpha1.StartRunReques
 
 // ListRuns returns newest runs first.
 func (a *API) ListRuns(ctx context.Context, request *controlv1alpha1.ListRunsRequest) (*controlv1alpha1.ListRunsResponse, error) {
-	runs, err := a.store.ListRuns(ctx, int(request.GetLimit()))
+	if request.GetLimit() > 1000 {
+		return nil, status.Error(codes.InvalidArgument, "limit must not exceed 1000")
+	}
+	if phase := request.GetPhase(); phase != "" && !validRunPhase(phase) {
+		return nil, status.Error(codes.InvalidArgument, "phase filter is invalid")
+	}
+	flowUID := request.GetFlow()
+	if flowUID != "" {
+		if document, getErr := a.store.Get(ctx, "Flow", resource.DefaultNamespace, flowUID); getErr == nil {
+			flowUID = document.Metadata.UID
+		} else if !errors.Is(getErr, store.ErrNotFound) {
+			return nil, rpcError(getErr)
+		}
+	}
+	runs, err := a.store.ListRunsFiltered(ctx, flowUID, request.GetPhase(), int(request.GetLimit()))
 	if err != nil {
 		return nil, rpcError(err)
 	}
@@ -328,6 +379,15 @@ func (a *API) ListRuns(ctx context.Context, request *controlv1alpha1.ListRunsReq
 		result.Runs = append(result.Runs, runPB(run))
 	}
 	return result, nil
+}
+
+func validRunPhase(phase string) bool {
+	switch phase {
+	case "pending", "running", "waiting", "succeeded", "failed", "rejected", "cancelled":
+		return true
+	default:
+		return false
+	}
 }
 
 // RunPlan returns the exact immutable plan pinned by a run.
@@ -781,11 +841,14 @@ func rpcError(err error) error {
 	var staleTrigger *store.StaleTriggerGenerationError
 	var changedReference *store.TriggerReferenceChangedError
 	var staleObserved *store.StaleObservedGenerationError
+	var changedSnapshot *store.SnapshotRevisionError
 	switch {
 	case errors.As(err, &conflict):
 		return status.Error(codes.Aborted, conflict.Error())
 	case errors.As(err, &staleFlow), errors.As(err, &staleTrigger), errors.As(err, &changedReference), errors.As(err, &staleObserved):
 		return status.Error(codes.Aborted, err.Error())
+	case errors.As(err, &changedSnapshot):
+		return status.Error(codes.Aborted, "resource collection changed; restart pagination")
 	case errors.Is(err, store.ErrTriggerDisabled):
 		return status.Error(codes.FailedPrecondition, err.Error())
 	case errors.Is(err, store.ErrNotFound):
