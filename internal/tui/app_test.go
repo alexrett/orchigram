@@ -201,6 +201,14 @@ spec:
 	}
 }
 
+func TestRunInspectorEscapesDynamicColorMarkup(t *testing.T) {
+	t.Parallel()
+	text := runInspectorText(&controlv1alpha1.RunSummary{Uid: "[red]", Flow: "[red]", Phase: "[red]", PlanHash: "[red]", InterpreterVersion: "[red]"})
+	if strings.Count(text, "[red[]") != 5 {
+		t.Fatalf("run fields were not escaped for a dynamic-color view: %q", text)
+	}
+}
+
 func postTUIEvent(t *testing.T, screen tcell.SimulationScreen, event tcell.Event) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)

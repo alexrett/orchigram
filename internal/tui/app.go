@@ -203,7 +203,7 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 			key := "run/" + run.GetUid()
 			add(key, fmt.Sprintf("  %s  [%s]", short(run.GetUid()), run.GetPhase()), func() {
 				currentRun, currentResource = run.GetUid(), nil
-				inspector.SetText(fmt.Sprintf("[yellow::b]Run %s[-:-:-]\n\nFlow: %s\nPhase: %s\nPlan: %s\nInterpreter: %s", run.GetUid(), run.GetFlow(), run.GetPhase(), run.GetPlanHash(), run.GetInterpreterVersion()))
+				inspector.SetText(runInspectorText(run))
 				planContext, cancel := context.WithTimeout(ctx, 10*time.Second)
 				defer cancel()
 				planResponse, planErr := client.Runs.Plan(planContext, &controlv1alpha1.RunRequest{Uid: run.GetUid()})
@@ -514,6 +514,10 @@ func openSystemDetail(ctx context.Context, application *tview.Application, pages
 
 func showResourceInspector(inspector *tview.TextView, document *controlv1alpha1.ResourceDocument) {
 	inspector.SetText(fmt.Sprintf("[yellow::b]%s %s[-:-:-]\n\n[gray]UID[-]              %s\n[gray]Resource version[-] %d\n[gray]Generation[-]       %d\n\nPress Enter for schema fields or y for the read-only YAML projection.", escape(document.GetKey().GetKind()), escape(document.GetKey().GetName()), escape(document.GetKey().GetUid()), document.GetResourceVersion(), document.GetGeneration()))
+}
+
+func runInspectorText(run *controlv1alpha1.RunSummary) string {
+	return fmt.Sprintf("[yellow::b]Run %s[-:-:-]\n\nFlow: %s\nPhase: %s\nPlan: %s\nInterpreter: %s", escape(run.GetUid()), escape(run.GetFlow()), escape(run.GetPhase()), escape(run.GetPlanHash()), escape(run.GetInterpreterVersion()))
 }
 
 func openResourceDetail(application *tview.Application, pages *tview.Pages, client *clientpkg.Client, document *controlv1alpha1.ResourceDocument, inspector, events *tview.TextView, returnFocus tview.Primitive) {
