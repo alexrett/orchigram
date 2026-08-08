@@ -290,6 +290,10 @@ spec: {type: command, executable: fake-agent}
 	if decoded != 2 {
 		t.Fatalf("decoded export documents=%d", decoded)
 	}
+	repeated, err := api.Export(ctx, &controlv1alpha1.ExportRequest{Keys: []*controlv1alpha1.ResourceKey{resources["alpha"].GetKey(), resources["beta"].GetKey()}})
+	if err != nil || !bytes.Equal(exported.GetYaml(), repeated.GetYaml()) {
+		t.Fatalf("export is not deterministic: err=%v\nfirst=%s\nsecond=%s", err, exported.GetYaml(), repeated.GetYaml())
+	}
 
 	baseline, err := api.List(ctx, &controlv1alpha1.ListRequest{Kind: "AgentProfile", Namespace: resource.DefaultNamespace, Limit: 100})
 	if err != nil {

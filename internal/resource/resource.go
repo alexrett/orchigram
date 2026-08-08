@@ -396,7 +396,7 @@ func (d Document) WithServerMetadata(meta ObjectMeta) (Document, error) {
 // round-trip a projected resource, but status is never accepted as desired
 // configuration.
 func (d Document) WithServerStatus(status map[string]any) (Document, error) {
-	var value map[string]any
+	var value map[string]json.RawMessage
 	if err := json.Unmarshal(d.JSON, &value); err != nil {
 		return Document{}, fmt.Errorf("decode canonical resource: %w", err)
 	}
@@ -404,11 +404,11 @@ func (d Document) WithServerStatus(status map[string]any) (Document, error) {
 		delete(value, "status")
 		d.Status = []byte("{}")
 	} else {
-		value["status"] = status
 		encoded, err := json.Marshal(status)
 		if err != nil {
 			return Document{}, err
 		}
+		value["status"] = encoded
 		d.Status = encoded
 	}
 	encoded, err := json.Marshal(value)
@@ -420,7 +420,7 @@ func (d Document) WithServerStatus(status map[string]any) (Document, error) {
 }
 
 func setMetadata(data []byte, meta ObjectMeta) ([]byte, error) {
-	var value map[string]any
+	var value map[string]json.RawMessage
 	if err := json.Unmarshal(data, &value); err != nil {
 		return nil, fmt.Errorf("decode canonical resource: %w", err)
 	}
@@ -428,11 +428,7 @@ func setMetadata(data []byte, meta ObjectMeta) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	var metadata any
-	if err := json.Unmarshal(encoded, &metadata); err != nil {
-		return nil, err
-	}
-	value["metadata"] = metadata
+	value["metadata"] = encoded
 	return json.Marshal(value)
 }
 

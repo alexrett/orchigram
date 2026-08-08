@@ -278,11 +278,11 @@ func (a *API) Export(ctx context.Context, request *controlv1alpha1.ExportRequest
 		if err != nil {
 			return nil, status.Error(codes.Internal, "strip server-owned status for export")
 		}
-		var value any
-		if err := json.Unmarshal(doc.JSON, &value); err != nil {
+		var value yaml.Node
+		if err := yaml.Unmarshal(doc.JSON, &value); err != nil {
 			return nil, status.Error(codes.Internal, "decode stored resource for export")
 		}
-		if err := encoder.Encode(value); err != nil {
+		if err := encoder.Encode(&value); err != nil {
 			return nil, status.Error(codes.Internal, "encode resource export")
 		}
 	}

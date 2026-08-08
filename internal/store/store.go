@@ -500,12 +500,14 @@ func (s *Store) ListResourcePage(ctx context.Context, options ResourcePageOption
 		if err := rows.Scan(&data, &labelsJSON); err != nil {
 			return nil, 0, false, err
 		}
-		var labels map[string]string
-		if err := json.Unmarshal(labelsJSON, &labels); err != nil {
-			return nil, 0, false, fmt.Errorf("decode stored resource labels: %w", err)
-		}
-		if !labelsMatch(labels, options.Labels) {
-			continue
+		if len(options.Labels) > 0 {
+			var labels map[string]string
+			if err := json.Unmarshal(labelsJSON, &labels); err != nil {
+				return nil, 0, false, fmt.Errorf("decode stored resource labels: %w", err)
+			}
+			if !labelsMatch(labels, options.Labels) {
+				continue
+			}
 		}
 		if len(result) == options.Limit {
 			more = true
