@@ -396,7 +396,15 @@ func openSystemDetail(ctx context.Context, application *tview.Application, pages
 			var health *controlv1alpha1.HealthResponse
 			health, err = client.System.Health(operationContext, &emptypb.Empty{})
 			if err == nil {
-				events.SetText(fmt.Sprintf("[green]System healthy[-] ready=%t", health.GetReady()))
+				if health.GetReady() {
+					events.SetText("[green]System healthy[-] ready=true")
+				} else {
+					lines := []string{"[red]System degraded[-] ready=false"}
+					for _, diagnostic := range health.GetDiagnostics() {
+						lines = append(lines, fmt.Sprintf("%s  %s: %s", escape(diagnostic.GetPath()), escape(diagnostic.GetCode()), escape(diagnostic.GetMessage())))
+					}
+					events.SetText(strings.Join(lines, "\n"))
+				}
 			}
 		case 1:
 			var result *controlv1alpha1.BackupResponse

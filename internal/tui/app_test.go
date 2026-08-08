@@ -127,7 +127,8 @@ func waitForTUIHealth(t *testing.T, client *clientpkg.Client) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	for {
-		if _, err := client.System.Health(ctx, &emptypb.Empty{}); err == nil {
+		health, err := client.System.Health(ctx, &emptypb.Empty{})
+		if err == nil && health.GetReady() {
 			return
 		}
 		if ctx.Err() != nil {

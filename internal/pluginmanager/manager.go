@@ -22,6 +22,7 @@ import (
 	pluginv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/plugin/v1alpha1"
 	"github.com/alexrett/orchigram/internal/engine"
 	"github.com/alexrett/orchigram/internal/flow"
+	"github.com/alexrett/orchigram/internal/health"
 	"github.com/alexrett/orchigram/internal/pluginbundle"
 	"github.com/alexrett/orchigram/internal/pluginhost"
 	"github.com/alexrett/orchigram/internal/resource"
@@ -216,6 +217,90 @@ func (m *Manager) Disable(ctx context.Context, name string) error {
 // List returns every installed immutable version.
 func (m *Manager) List(ctx context.Context) ([]store.PluginRecord, error) {
 	return m.store.ListPlugins(ctx)
+}
+
+// HealthDiagnostics checks every active immutable plugin with one bounded,
+// secret-free aggregate probe. A process observed as exited is reported once
+// before a later probe is allowed to restart it.
+func (m *Manager) HealthDiagnostics(ctx context.Context) []health.Diagnostic {
+	records, err := m.store.ListPlugins(ctx)
+	if err != nil {
+		return []health.Diagnostic{{Path: "plugins", Code: "state_unavailable", Message: "plugin activation state is unavailable; inspect daemon logs"}}
+	}
+	active := make([]store.PluginRecord, 0, len(records))
+	for _, record := range records {
+		if record.Active {
+			active = append(active, record)
+		}
+	}
+	if len(active) == 0 {
+		return nil
+	}
+	probeContext, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	results := make(chan *health.Diagnostic, len(active))
+	for _, record := range active {
+		go func() {
+			diagnostic := m.checkActivePlugin(probeContext, record)
+			results <- diagnostic
+		}()
+	}
+	diagnostics := make([]health.Diagnostic, 0, len(active))
+	for range active {
+		select {
+		case diagnostic := <-results:
+			if diagnostic != nil {
+				diagnostics = append(diagnostics, *diagnostic)
+			}
+		case <-probeContext.Done():
+			diagnostics = append(diagnostics, health.Diagnostic{Path: "plugins", Code: "probe_timeout", Message: "active plugin health checks exceeded their bounded deadline"})
+			sortHealthDiagnostics(diagnostics)
+			return diagnostics
+		}
+	}
+	sortHealthDiagnostics(diagnostics)
+	return diagnostics
+}
+
+func (m *Manager) checkActivePlugin(ctx context.Context, record store.PluginRecord) *health.Diagnostic {
+	path := "plugins/" + record.Name + "@" + record.Version
+	key := installationKey(record.Name, record.Version)
+	if exited := m.removeExitedProcess(key); exited != nil {
+		exited.Close()
+		return &health.Diagnostic{Path: path, Code: "process_exited", Message: "active plugin process exited; the next health probe will attempt restart"}
+	}
+	process, _, err := m.processForRecord(ctx, record)
+	if err != nil {
+		return &health.Diagnostic{Path: path, Code: "unavailable", Message: "active plugin is unavailable; inspect daemon logs"}
+	}
+	response, err := process.Clients().Control.Health(ctx, &emptypb.Empty{})
+	if err != nil {
+		return &health.Diagnostic{Path: path, Code: "rpc_failed", Message: "active plugin health RPC failed; inspect daemon logs"}
+	}
+	if !response.GetReady() {
+		return &health.Diagnostic{Path: path, Code: "not_ready", Message: "active plugin reported that it is not ready"}
+	}
+	return nil
+}
+
+func (m *Manager) removeExitedProcess(key string) *pluginhost.Process {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	process := m.processes[key]
+	if process == nil || !process.Exited() {
+		return nil
+	}
+	delete(m.processes, key)
+	return process
+}
+
+func sortHealthDiagnostics(diagnostics []health.Diagnostic) {
+	sort.Slice(diagnostics, func(i, j int) bool {
+		if diagnostics[i].Path != diagnostics[j].Path {
+			return diagnostics[i].Path < diagnostics[j].Path
+		}
+		return diagnostics[i].Code < diagnostics[j].Code
+	})
 }
 
 // HasAction implements flow.CapabilityResolver against active installations.

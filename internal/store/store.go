@@ -98,6 +98,12 @@ func (s *Store) migrate(ctx context.Context) error {
 		return fmt.Errorf("read migrations: %w", err)
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	type migration struct {
+		name    string
+		version int
+	}
+	migrations := make([]migration, 0, len(entries))
+	maximumSupported := 0
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
 			continue
@@ -106,23 +112,40 @@ func (s *Store) migrate(ctx context.Context) error {
 		if _, err := fmt.Sscanf(entry.Name(), "%d_", &version); err != nil {
 			return fmt.Errorf("migration filename %q: %w", entry.Name(), err)
 		}
-		var exists int
-		err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'").Scan(&exists)
-		if err != nil {
-			return fmt.Errorf("inspect migration table: %w", err)
+		migrations = append(migrations, migration{name: entry.Name(), version: version})
+		if version > maximumSupported {
+			maximumSupported = version
 		}
+	}
+	if len(migrations) == 0 {
+		return errors.New("no embedded schema migrations")
+	}
+	var exists int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'").Scan(&exists); err != nil {
+		return fmt.Errorf("inspect migration table: %w", err)
+	}
+	if exists == 1 {
+		var appliedVersion int
+		if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&appliedVersion); err != nil {
+			return fmt.Errorf("inspect schema migration version: %w", err)
+		}
+		if appliedVersion > maximumSupported {
+			return fmt.Errorf("database schema version %d is newer than supported version %d", appliedVersion, maximumSupported)
+		}
+	}
+	for _, migration := range migrations {
 		if exists == 1 {
 			var applied int
-			if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations WHERE version = ?", version).Scan(&applied); err != nil {
-				return fmt.Errorf("check migration %d: %w", version, err)
+			if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations WHERE version = ?", migration.version).Scan(&applied); err != nil {
+				return fmt.Errorf("check migration %d: %w", migration.version, err)
 			}
 			if applied == 1 {
 				continue
 			}
 		}
-		body, err := fs.ReadFile(Migrations, "migrations/"+entry.Name())
+		body, err := fs.ReadFile(Migrations, "migrations/"+migration.name)
 		if err != nil {
-			return fmt.Errorf("read migration %d: %w", version, err)
+			return fmt.Errorf("read migration %d: %w", migration.version, err)
 		}
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
@@ -130,15 +153,16 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 		if _, err := tx.ExecContext(ctx, string(body)); err != nil {
 			_ = tx.Rollback()
-			return fmt.Errorf("apply migration %d: %w", version, err)
+			return fmt.Errorf("apply migration %d: %w", migration.version, err)
 		}
-		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)", version, s.timestamp()); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)", migration.version, s.timestamp()); err != nil {
 			_ = tx.Rollback()
-			return fmt.Errorf("record migration %d: %w", version, err)
+			return fmt.Errorf("record migration %d: %w", migration.version, err)
 		}
 		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit migration %d: %w", version, err)
+			return fmt.Errorf("commit migration %d: %w", migration.version, err)
 		}
+		exists = 1
 	}
 	return nil
 }
@@ -618,6 +642,20 @@ type OutboxCommand struct {
 	ID       int64
 	Payload  StartPayload
 	Attempts int
+}
+
+// OutboxStatus is the secret-free readiness projection for durable dispatch.
+type OutboxStatus struct {
+	Active int
+	Failed int
+}
+
+// InspectOutboxStatus reports unresolved commands and retry failures without
+// exposing command payloads or their dependency error text.
+func (s *Store) InspectOutboxStatus(ctx context.Context) (OutboxStatus, error) {
+	var result OutboxStatus
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(CASE WHEN last_error!='' THEN 1 ELSE 0 END),0) FROM outbox WHERE state!='completed'`).Scan(&result.Active, &result.Failed)
+	return result, err
 }
 
 // ClaimStart claims one pending or stale start command.

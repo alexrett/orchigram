@@ -12,6 +12,7 @@ import (
 	"time"
 
 	pluginv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/plugin/v1alpha1"
+	"github.com/alexrett/orchigram/internal/health"
 	"github.com/alexrett/orchigram/internal/resource"
 	"github.com/alexrett/orchigram/internal/store"
 	"github.com/robfig/cron/v3"
@@ -45,6 +46,7 @@ type Controller struct {
 	now           func() time.Time
 	mu            sync.Mutex
 	subscriptions map[string]subscription
+	health        *health.Tracker
 }
 
 // NewController creates a controller with the real wall clock.
@@ -53,8 +55,14 @@ func NewController(state *store.Store, provider Provider, acceptors ...Acceptor)
 	if len(acceptors) > 0 && acceptors[0] != nil {
 		acceptor = acceptors[0]
 	}
-	return &Controller{store: state, acceptor: acceptor, provider: provider, now: time.Now, subscriptions: map[string]subscription{}}
+	tracker := health.NewTracker()
+	tracker.Set("providers", health.Diagnostic{Path: "controllers/providers", Code: "starting", Message: "provider reconciliation has not completed"})
+	tracker.Set("schedules", health.Diagnostic{Path: "controllers/schedules", Code: "starting", Message: "schedule reconciliation has not completed"})
+	return &Controller{store: state, acceptor: acceptor, provider: provider, now: time.Now, subscriptions: map[string]subscription{}, health: tracker}
 }
+
+// HealthDiagnostics returns unresolved controller failures in stable order.
+func (c *Controller) HealthDiagnostics() []health.Diagnostic { return c.health.Snapshot() }
 
 // Start runs bounded schedule and provider reconciliation loops.
 func (c *Controller) Start(ctx context.Context) {
@@ -63,20 +71,40 @@ func (c *Controller) Start(ctx context.Context) {
 		providerTicker := time.NewTicker(5 * time.Second)
 		defer scheduleTicker.Stop()
 		defer providerTicker.Stop()
-		_ = c.ReconcileSchedules(ctx, c.now())
-		c.syncProviders(ctx)
+		c.observeSchedule(c.ReconcileSchedules(ctx, c.now()))
+		c.observeProviders(c.syncProviders(ctx))
 		for {
 			select {
 			case <-ctx.Done():
 				c.stopProviders()
 				return
 			case now := <-scheduleTicker.C:
-				_ = c.ReconcileSchedules(ctx, now)
+				c.observeSchedule(c.ReconcileSchedules(ctx, now))
 			case <-providerTicker.C:
-				c.syncProviders(ctx)
+				c.observeProviders(c.syncProviders(ctx))
 			}
 		}
 	}()
+}
+
+func (c *Controller) observeSchedule(err error) {
+	if err == nil {
+		c.health.Clear("schedules")
+		return
+	}
+	if !errors.Is(err, context.Canceled) {
+		c.health.Set("schedules", health.Diagnostic{Path: "controllers/schedules", Code: "reconcile_failed", Message: "schedule reconciliation failed; inspect daemon logs"})
+	}
+}
+
+func (c *Controller) observeProviders(err error) {
+	if err == nil {
+		c.health.Clear("providers")
+		return
+	}
+	if !errors.Is(err, context.Canceled) {
+		c.health.Set("providers", health.Diagnostic{Path: "controllers/providers", Code: "reconcile_failed", Message: "provider reconciliation failed; inspect daemon logs"})
+	}
 }
 
 // ReconcileSchedules evaluates every schedule with at-most-one misfire catch-up.
@@ -191,23 +219,29 @@ func (c *Controller) reconcileSchedule(ctx context.Context, trigger resource.Tri
 	return c.store.AdvanceTriggerCursor(ctx, trigger.Metadata.UID, last)
 }
 
-func (c *Controller) syncProviders(ctx context.Context) {
+func (c *Controller) syncProviders(ctx context.Context) error {
 	if c.provider == nil {
-		return
+		return nil
 	}
 	documents, _, err := c.store.List(ctx, "Trigger", resource.DefaultNamespace, 1000)
 	if err != nil {
-		return
+		return err
 	}
 	wanted := map[string]resource.Trigger{}
 	for _, document := range documents {
 		trigger, decodeErr := resource.DecodeTrigger(document.JSON)
-		if decodeErr != nil || trigger.Spec.Provider == nil {
+		if decodeErr != nil {
+			return decodeErr
+		}
+		if trigger.Spec.Provider == nil {
 			continue
 		}
 		enabled := trigger.Spec.Enabled == nil || *trigger.Spec.Enabled
 		state, stateErr := c.store.EnsureTriggerState(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, enabled, c.now())
-		if stateErr == nil && state.Enabled {
+		if stateErr != nil {
+			return stateErr
+		}
+		if state.Enabled {
 			wanted[trigger.Metadata.UID] = trigger
 		}
 	}
@@ -217,6 +251,7 @@ func (c *Controller) syncProviders(ctx context.Context) {
 		if !exists || trigger.Metadata.Generation != running.generation {
 			running.cancel()
 			delete(c.subscriptions, uid)
+			c.health.Clear(providerHealthKey(uid))
 		}
 	}
 	for uid, trigger := range wanted {
@@ -228,6 +263,7 @@ func (c *Controller) syncProviders(ctx context.Context) {
 		go c.watchProvider(watchContext, trigger)
 	}
 	c.mu.Unlock()
+	return nil
 }
 
 func (c *Controller) watchProvider(ctx context.Context, trigger resource.Trigger) {
@@ -235,18 +271,26 @@ func (c *Controller) watchProvider(ctx context.Context, trigger resource.Trigger
 	for ctx.Err() == nil {
 		state, stateErr := c.store.EnsureTriggerState(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, true, c.now())
 		cursor, _, err := c.store.ProviderCursor(ctx, trigger.Metadata.UID)
+		watchCode := "watch_failed"
+		watchMessage := "provider subscription failed and is waiting to retry"
 		if stateErr == nil && err == nil {
-			_ = c.provider.WatchTrigger(ctx, trigger.Spec.Provider.Plugin, trigger.Metadata.UID, trigger.Spec.Provider.Config, cursor, state.CursorAt, func(event *pluginv1alpha1.TriggerEvent) error {
+			c.health.Clear(providerHealthKey(trigger.Metadata.UID))
+			watchErr := c.provider.WatchTrigger(ctx, trigger.Spec.Provider.Plugin, trigger.Metadata.UID, trigger.Spec.Provider.Config, cursor, state.CursorAt, func(event *pluginv1alpha1.TriggerEvent) error {
 				if event.GetProviderEventId() == "" || event.GetCursor() == "" || !json.Valid(event.GetPayloadJson()) {
 					return errors.New("provider event identity, cursor, and JSON payload are required")
 				}
 				_, acceptErr := c.acceptor.AcceptProviderTrigger(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, event.GetProviderEventId(), trigger.Spec.Flow, trigger.Metadata.Namespace, event.GetPayloadJson(), event.GetCursor())
 				return acceptErr
 			})
+			if watchErr == nil {
+				watchCode = "watch_ended"
+				watchMessage = "provider subscription ended unexpectedly and is waiting to restart"
+			}
 		}
 		if ctx.Err() != nil {
 			return
 		}
+		c.health.Set(providerHealthKey(trigger.Metadata.UID), health.Diagnostic{Path: "controllers/providers/" + trigger.Metadata.UID, Code: watchCode, Message: watchMessage})
 		timer := time.NewTimer(backoff)
 		select {
 		case <-ctx.Done():
@@ -266,8 +310,11 @@ func (c *Controller) stopProviders() {
 	for uid, running := range c.subscriptions {
 		running.cancel()
 		delete(c.subscriptions, uid)
+		c.health.Clear(providerHealthKey(uid))
 	}
 }
+
+func providerHealthKey(triggerUID string) string { return "provider/" + triggerUID }
 
 func parseSchedule(spec resource.ScheduleTrigger) (cron.Schedule, *time.Location, error) {
 	if len(strings.Fields(spec.Cron)) != 5 {

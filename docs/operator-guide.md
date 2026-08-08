@@ -94,9 +94,23 @@ Useful server checks are:
 systemctl status orchigram.service
 journalctl -u orchigram.service
 systemd-analyze security orchigram.service
+orchigram system health
 orchigram plugin list
 orchigram plugin doctor agent-command
 ```
+
+`system health` exits unsuccessfully when any required component is degraded
+and prints deterministic diagnostics for outbox and durable-engine
+reconciliation, schedule/provider controllers, and every active plugin. An
+accepted outbox failure remains degraded until that delivery succeeds; it is
+not cleared merely by an empty polling cycle. The TUI System → Health action
+shows the same projection. Diagnostics deliberately omit dependency errors,
+payloads, secret values, server paths, and provider coordinates; use the
+service journal for privileged detail.
+
+A database created by a newer Orchigram schema version is rejected during
+startup. The daemon never serves an apparently healthy control socket after a
+configuration, migration, artifact-reconciliation, or listener failure.
 
 The repository's `scripts/verify-ssh-context.sh` performs the manual exec plus
 durable-approval tracer through an SSH context. It requires

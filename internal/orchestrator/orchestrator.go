@@ -11,6 +11,7 @@ import (
 
 	"github.com/alexrett/orchigram/internal/engine"
 	"github.com/alexrett/orchigram/internal/flow"
+	"github.com/alexrett/orchigram/internal/health"
 	"github.com/alexrett/orchigram/internal/resource"
 	"github.com/alexrett/orchigram/internal/store"
 	"github.com/google/uuid"
@@ -40,11 +41,15 @@ type Orchestrator struct {
 	wake            chan struct{}
 	done            chan struct{}
 	claimStaleAfter time.Duration
+	health          *health.Tracker
 }
 
 // New constructs a control loop from product-owned interfaces.
 func New(state *store.Store, compiler *flow.Compiler, durable engine.DurableEngine) *Orchestrator {
-	return &Orchestrator{store: state, compiler: compiler, engine: durable, wake: make(chan struct{}, 1), done: make(chan struct{}), claimStaleAfter: 5 * time.Second}
+	tracker := health.NewTracker()
+	tracker.Set("engine", health.Diagnostic{Path: "engine", Code: "starting", Message: "durable engine reconciliation has not completed"})
+	tracker.Set("outbox", health.Diagnostic{Path: "outbox", Code: "starting", Message: "outbox reconciliation has not completed"})
+	return &Orchestrator{store: state, compiler: compiler, engine: durable, wake: make(chan struct{}, 1), done: make(chan struct{}), claimStaleAfter: 5 * time.Second, health: tracker}
 }
 
 // SetFaultHook installs a deterministic test-only boundary hook.
@@ -57,6 +62,10 @@ func (o *Orchestrator) Start(ctx context.Context) {
 
 // Wait blocks until the reconciliation loop stops.
 func (o *Orchestrator) Wait() { <-o.done }
+
+// HealthDiagnostics returns unresolved runtime reconciliation failures without
+// forwarding dependency errors or command payloads to the public API.
+func (o *Orchestrator) HealthDiagnostics() []health.Diagnostic { return o.health.Snapshot() }
 
 // StartManual durably accepts a manual trigger before returning its Run UID.
 func (o *Orchestrator) StartManual(ctx context.Context, flowName, namespace string, input json.RawMessage, idempotencyKey string) (store.Receipt, error) {
@@ -188,16 +197,48 @@ func (o *Orchestrator) loop(ctx context.Context) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if err := o.ReconcileOne(ctx); err != nil && !errors.Is(err, store.ErrNotFound) && !errors.Is(err, context.Canceled) {
-			slog.Debug("outbox reconciliation deferred", "error", err)
+		outboxErr := o.ReconcileOne(ctx)
+		o.observeOutbox(ctx, outboxErr)
+		if outboxErr != nil && !errors.Is(outboxErr, store.ErrNotFound) && !errors.Is(outboxErr, context.Canceled) {
+			slog.Debug("outbox reconciliation deferred", "error", outboxErr)
 		}
-		_ = o.engine.Reconcile(ctx)
+		engineErr := o.engine.Reconcile(ctx)
+		if engineErr == nil {
+			o.health.Clear("engine")
+		} else if !errors.Is(engineErr, context.Canceled) {
+			o.health.Set("engine", health.Diagnostic{Path: "engine", Code: "reconcile_failed", Message: "durable engine reconciliation failed; inspect daemon logs"})
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 		case <-o.wake:
 		}
+	}
+}
+
+func (o *Orchestrator) observeOutbox(ctx context.Context, reconcileErr error) {
+	switch {
+	case reconcileErr == nil:
+		o.health.Clear("outbox")
+		return
+	case !errors.Is(reconcileErr, store.ErrNotFound):
+		if !errors.Is(reconcileErr, context.Canceled) {
+			o.health.Set("outbox", health.Diagnostic{Path: "outbox", Code: "reconcile_failed", Message: "outbox reconciliation failed; inspect daemon logs"})
+		}
+		return
+	}
+	status, err := o.store.InspectOutboxStatus(ctx)
+	if err != nil {
+		o.health.Set("outbox", health.Diagnostic{Path: "outbox", Code: "state_unavailable", Message: "outbox state is unavailable; inspect daemon logs"})
+		return
+	}
+	if status.Failed > 0 {
+		o.health.Set("outbox", health.Diagnostic{Path: "outbox", Code: "retry_pending", Message: "one or more outbox commands are waiting after a failed delivery"})
+		return
+	}
+	if status.Active == 0 || !o.health.Has("outbox") {
+		o.health.Clear("outbox")
 	}
 }
 

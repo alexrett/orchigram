@@ -214,10 +214,10 @@ func bootstrapPlugins(ctx context.Context, socket string, binaries map[string]st
 	for {
 		client, err := clientpkg.DialUnix(ctx, socket)
 		if err == nil {
-			healthContext, cancel := context.WithTimeout(ctx, time.Second)
-			_, healthErr := client.System.Health(healthContext, &emptypb.Empty{})
+			healthContext, cancel := context.WithTimeout(ctx, 5*time.Second)
+			health, healthErr := client.System.Health(healthContext, &emptypb.Empty{})
 			cancel()
-			if healthErr == nil {
+			if healthErr == nil && health.GetReady() {
 				connection = client
 				break
 			}

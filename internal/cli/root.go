@@ -97,6 +97,29 @@ func newSystemCommand(opts *options) *cobra.Command {
 			return err
 		})
 	}}
+	healthCommand := &cobra.Command{Use: "health", Short: "Show aggregated daemon readiness", RunE: func(cmd *cobra.Command, _ []string) error {
+		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error {
+			response, err := client.System.Health(cmd.Context(), &emptypb.Empty{})
+			if err != nil {
+				return err
+			}
+			diagnostics := make([]map[string]string, 0, len(response.GetDiagnostics()))
+			for _, diagnostic := range response.GetDiagnostics() {
+				diagnostics = append(diagnostics, map[string]string{"severity": "error", "path": diagnostic.GetPath(), "code": diagnostic.GetCode(), "message": diagnostic.GetMessage()})
+			}
+			encoded, err := json.Marshal(map[string]any{"ready": response.GetReady(), "diagnostics": diagnostics})
+			if err != nil {
+				return err
+			}
+			if err := printDocument(cmd.OutOrStdout(), encoded, opts.output); err != nil {
+				return err
+			}
+			if !response.GetReady() {
+				return errors.New("daemon health is degraded")
+			}
+			return nil
+		})
+	}}
 	var destination string
 	backupCommand := &cobra.Command{Use: "backup", Short: "Create an online state backup", RunE: func(cmd *cobra.Command, _ []string) error {
 		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error {
@@ -129,7 +152,7 @@ func newSystemCommand(opts *options) *cobra.Command {
 		return err
 	}}
 	restoreCommand.Flags().StringVar(&restoreDestination, "destination", "", "new state directory; it must not already exist")
-	command.AddCommand(info, backupCommand, restoreCommand)
+	command.AddCommand(info, healthCommand, backupCommand, restoreCommand)
 	return command
 }
 
