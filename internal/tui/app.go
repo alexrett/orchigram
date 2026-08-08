@@ -239,6 +239,7 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 	add("System", func() {
 		currentResource = nil
 		inspector.SetText(fmt.Sprintf("[yellow::b]Orchigram %s[-:-:-]\n\nHost: %s\nOS/Arch: %s/%s\nPID: %d\nProtocol: %s\nCapabilities: %s", escape(info.GetVersion()), escape(info.GetHostname()), escape(info.GetOs()), escape(info.GetArchitecture()), info.GetProcessId(), escape(info.GetProtocolVersion()), escape(strings.Join(info.GetCapabilities(), ", "))))
+		openSystemDetail(ctx, application, pages, client, info, events, navigation)
 	})
 	rebuild("")
 	if len(flows.GetResources()) > 0 {
@@ -381,6 +382,40 @@ func openPluginDetail(ctx context.Context, application *tview.Application, pages
 		application.SetFocus(returnFocus)
 	})
 	pages.AddPage("plugin-detail", centered(modal, 82, 18), true, true)
+	application.SetFocus(modal)
+}
+
+func openSystemDetail(ctx context.Context, application *tview.Application, pages *tview.Pages, client *clientpkg.Client, info *controlv1alpha1.SystemInfo, events *tview.TextView, returnFocus tview.Primitive) {
+	modal := tview.NewModal().SetText(fmt.Sprintf("Orchigram %s\n\nHost: %s\nOS/Arch: %s/%s\nProtocol: %s", info.GetVersion(), info.GetHostname(), info.GetOs(), info.GetArchitecture(), info.GetProtocolVersion())).AddButtons([]string{"Health", "Backup", "Close"})
+	modal.SetDoneFunc(func(buttonIndex int, _ string) {
+		operationContext, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		defer cancel()
+		var err error
+		switch buttonIndex {
+		case 0:
+			var health *controlv1alpha1.HealthResponse
+			health, err = client.System.Health(operationContext, &emptypb.Empty{})
+			if err == nil {
+				events.SetText(fmt.Sprintf("[green]System healthy[-] ready=%t", health.GetReady()))
+			}
+		case 1:
+			var result *controlv1alpha1.BackupResponse
+			result, err = client.System.Backup(operationContext, &controlv1alpha1.BackupRequest{})
+			if err == nil {
+				events.SetText(fmt.Sprintf("[green]Backup created[-] %s\nsha256 %s", escape(result.GetPath()), escape(result.GetSha256())))
+			}
+		default:
+			pages.RemovePage("system-detail")
+			application.SetFocus(returnFocus)
+			return
+		}
+		if err != nil {
+			events.SetText("[red]" + escape(err.Error()))
+		}
+		pages.RemovePage("system-detail")
+		application.SetFocus(returnFocus)
+	})
+	pages.AddPage("system-detail", centered(modal, 72, 16), true, true)
 	application.SetFocus(modal)
 }
 

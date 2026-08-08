@@ -101,3 +101,30 @@ orchigram plugin doctor agent-command
 The repository's `scripts/verify-ssh-context.sh` performs the manual exec plus
 durable-approval tracer through an SSH context. It requires
 `ORCHIGRAM_TEST_SSH_DESTINATION` and never embeds a test host address.
+
+## Backup and offline restore
+
+Create an online snapshot while the daemon continues to serve requests:
+
+```console
+orchigram system backup
+```
+
+The daemon uses SQLite `VACUUM INTO` for both databases, includes immutable
+plugin installations, stores the archive below `/var/lib/orchigram/backups`,
+and returns its SHA-256. A custom destination is accepted only when it remains
+inside the configured state directory.
+
+Restore is deliberately offline and never overwrites an existing directory:
+
+```console
+sudo systemctl stop orchigram
+sudo orchigram system restore /var/lib/orchigram/backups/BACKUP.tar.gz \
+  --destination /var/lib/orchigram-restored
+```
+
+The command rejects traversal, links, duplicate entries, oversized files, and
+unknown archive members. Both restored databases must pass SQLite
+`integrity_check` before the temporary tree is atomically renamed. Inspect the
+new directory before swapping it into service; preserve the old state tree as
+the rollback point.

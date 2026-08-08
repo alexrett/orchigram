@@ -20,6 +20,7 @@ import (
 	controlv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/control/v1alpha1"
 	clientpkg "github.com/alexrett/orchigram/internal/client"
 	"github.com/alexrett/orchigram/internal/config"
+	"github.com/alexrett/orchigram/internal/firstparty"
 	"github.com/alexrett/orchigram/internal/pluginbundle"
 	"github.com/alexrett/orchigram/internal/version"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -88,16 +89,6 @@ logging:
   format: json
 `
 
-var firstPartyCapabilities = map[string][]string{
-	"agent-command": {"agent.codex", "agent.claude", "agent.command"},
-	"exec":          {"task.exec.run"},
-	"http":          {"task.http.request"},
-	"github": {
-		"trigger.github.issues", "task.github.issue.get", "task.github.issue.comment",
-		"task.github.workspace.checkout", "task.github.workspace.commit-push", "task.github.pr.ensure",
-	},
-}
-
 // Options select sources and make filesystem-only tests possible under Root.
 type Options struct {
 	Root      string
@@ -158,14 +149,14 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		return Result{}, err
 	}
 	pluginTargets := map[string]string{}
-	for name := range firstPartyCapabilities {
-		filename := "orchigram-plugin-" + name
+	for _, plugin := range firstparty.All() {
+		filename := plugin.Command
 		sourcePath := filepath.Join(options.PluginDir, filename)
 		targetPath := filepath.Join(paths.pluginDir, filename)
 		if err := copyFile(sourcePath, targetPath, 0o755); err != nil {
-			return Result{}, fmt.Errorf("install bundled plugin %s: %w", name, err)
+			return Result{}, fmt.Errorf("install bundled plugin %s: %w", plugin.Name, err)
 		}
-		pluginTargets[name] = targetPath
+		pluginTargets[plugin.Name] = targetPath
 	}
 	if _, err := os.Stat(paths.config); errors.Is(err, os.ErrNotExist) {
 		if err := writeAtomic(paths.config, []byte(defaultConfig), 0o640); err != nil {
@@ -244,9 +235,13 @@ func bootstrapPlugins(ctx context.Context, socket string, binaries map[string]st
 			return err
 		}
 		digest := sha256.Sum256(binary)
+		plugin, exists := firstparty.Find(name)
+		if !exists {
+			return fmt.Errorf("unknown bundled plugin %q", name)
+		}
 		manifest := pluginbundle.Manifest{
 			APIVersion: pluginbundle.APIVersion, Name: name, Version: version.Semver(),
-			Protocol: pluginbundle.ProtocolRange{Minimum: 1, Maximum: 1}, Capabilities: firstPartyCapabilities[name],
+			Protocol: pluginbundle.ProtocolRange{Minimum: 1, Maximum: 1}, Capabilities: plugin.Capabilities,
 			Platforms: []pluginbundle.Platform{{OS: runtime.GOOS, Arch: runtime.GOARCH, Path: "bin/plugin", SHA256: hex.EncodeToString(digest[:])}},
 		}
 		bundle, err := pluginbundle.Build(manifest, map[string][]byte{"bin/plugin": binary})

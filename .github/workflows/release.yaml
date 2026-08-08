@@ -26,6 +26,9 @@ jobs:
         with:
           version: "33.4"
       - run: make check
+      - uses: anchore/sbom-action/download-syft@v0.24.0
+        with:
+          syft-version: v1.50.0
       - uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
@@ -36,4 +39,3 @@ jobs:
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: "dist/*"
-

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	pluginv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/plugin/v1alpha1"
+	"github.com/alexrett/orchigram/internal/firstparty"
 	"github.com/alexrett/orchigram/internal/process"
 	"github.com/alexrett/orchigram/internal/workspace"
 	"google.golang.org/grpc/codes"
@@ -31,10 +32,10 @@ const (
 )
 
 // Capabilities are declared by the first-party GitHub bundle.
-var Capabilities = []string{
-	"trigger.github.issues", "task.github.issue.get", "task.github.issue.comment",
-	"task.github.workspace.checkout", "task.github.workspace.commit-push", "task.github.pr.ensure",
-}
+var Capabilities = func() []string {
+	plugin, _ := firstparty.Find("github")
+	return plugin.Capabilities
+}()
 
 // Runtime serves both task actions and issue-label subscriptions.
 type Runtime struct {

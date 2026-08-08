@@ -9,5 +9,10 @@ Orchigram v0.1 is single-node, single-operator software for trusted plugins.
 - Plugin calls receive only the secrets required for that one operation and a minimal allowlisted environment.
 - Commands are direct argv arrays. User payloads never become shell strings.
 - Workspaces isolate repositories from each other but are not a hostile-code sandbox.
+- Online backups may be written only below the configured state directory;
+  offline restore validates paths, entry types, size limits, and SQLite
+  integrity before exposing the restored tree.
+- Every release includes SHA-256 checksums, SPDX JSON SBOMs, a dependency
+  license inventory, and independent digest-pinned plugin bundles.
 
 Threats deferred beyond v0.1 include hostile multi-tenancy, RBAC, high availability, and container-per-run isolation.

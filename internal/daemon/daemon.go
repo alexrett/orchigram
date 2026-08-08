@@ -85,7 +85,7 @@ func Open(ctx context.Context, cfg config.Config, executor engine.TaskExecutor) 
 		grpc.MaxRecvMsgSize(2<<20),
 		grpc.MaxSendMsgSize(8<<20),
 	)
-	server.NewAPI(state, compiler, control, durable, plugins, triggers).Register(grpcServer)
+	server.NewAPI(state, compiler, control, durable, plugins, triggers, cfg.StateDir).Register(grpcServer)
 	ingress, err := httpingress.Listen(ctx, cfg.HTTP.Listen, state, plugins)
 	if err != nil {
 		_ = listener.Close()

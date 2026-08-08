@@ -6,14 +6,16 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/alexrett/orchigram/internal/firstparty"
 )
 
 func TestFilesystemInstallContainsHardenedNetworkClosedService(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	plugins := t.TempDir()
-	for name := range firstPartyCapabilities {
-		if err := os.WriteFile(filepath.Join(plugins, "orchigram-plugin-"+name), []byte("fixture "+name), 0o600); err != nil {
+	for _, plugin := range firstparty.All() {
+		if err := os.WriteFile(filepath.Join(plugins, plugin.Command), []byte("fixture "+plugin.Name), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -43,13 +45,13 @@ func TestFilesystemInstallContainsHardenedNetworkClosedService(t *testing.T) {
 	if strings.Contains(string(configData), "listen:") {
 		t.Fatalf("default config opened a listener: %s", configData)
 	}
-	for name := range firstPartyCapabilities {
-		info, err := os.Stat(rootPath(root, "/usr/local/lib/orchigram/plugins/orchigram-plugin-"+name))
+	for _, plugin := range firstparty.All() {
+		info, err := os.Stat(rootPath(root, "/usr/local/lib/orchigram/plugins/"+plugin.Command))
 		if err != nil {
-			t.Fatalf("plugin %s: %v", name, err)
+			t.Fatalf("plugin %s: %v", plugin.Name, err)
 		}
 		if info.Mode().Perm() != 0o755 {
-			t.Fatalf("plugin %s mode=%v", name, info.Mode().Perm())
+			t.Fatalf("plugin %s mode=%v", plugin.Name, info.Mode().Perm())
 		}
 	}
 }

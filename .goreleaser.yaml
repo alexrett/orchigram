@@ -6,6 +6,10 @@ before:
   hooks:
     - go mod tidy
     - make generate
+    - sh -c 'rm -rf .release && mkdir -p .release'
+    - go run ./cmd/orchigram-release plugins --output .release/plugin-bundles --version {{ .Version }} --commit {{ .Commit }} --date {{ .CommitDate }}
+    - make dependency-licenses
+    - make plugin-sboms
 
 builds:
   - id: orchigram
@@ -14,53 +18,96 @@ builds:
     env: [CGO_ENABLED=0]
     goos: [linux, darwin]
     goarch: [amd64, arm64]
-    flags: [-trimpath]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags: [-trimpath, -buildvcs=false]
     ldflags:
-      - -s -w
+      - -s -w -buildid=
       - -X github.com/alexrett/orchigram/internal/version.Version={{.Version}}
       - -X github.com/alexrett/orchigram/internal/version.Commit={{.Commit}}
-      - -X github.com/alexrett/orchigram/internal/version.Date={{.Date}}
+      - -X github.com/alexrett/orchigram/internal/version.Date={{.CommitDate}}
   - id: agent-command
     main: ./cmd/orchigram-plugin-agent-command
     binary: orchigram-plugin-agent-command
     env: [CGO_ENABLED=0]
     goos: [linux, darwin]
     goarch: [amd64, arm64]
-    flags: [-trimpath]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags: [-trimpath, -buildvcs=false]
+    ldflags:
+      - -s -w -buildid=
+      - -X github.com/alexrett/orchigram/internal/version.Version={{.Version}}
+      - -X github.com/alexrett/orchigram/internal/version.Commit={{.Commit}}
+      - -X github.com/alexrett/orchigram/internal/version.Date={{.CommitDate}}
   - id: exec
     main: ./cmd/orchigram-plugin-exec
     binary: orchigram-plugin-exec
     env: [CGO_ENABLED=0]
     goos: [linux, darwin]
     goarch: [amd64, arm64]
-    flags: [-trimpath]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags: [-trimpath, -buildvcs=false]
+    ldflags:
+      - -s -w -buildid=
+      - -X github.com/alexrett/orchigram/internal/version.Version={{.Version}}
+      - -X github.com/alexrett/orchigram/internal/version.Commit={{.Commit}}
+      - -X github.com/alexrett/orchigram/internal/version.Date={{.CommitDate}}
   - id: http
     main: ./cmd/orchigram-plugin-http
     binary: orchigram-plugin-http
     env: [CGO_ENABLED=0]
     goos: [linux, darwin]
     goarch: [amd64, arm64]
-    flags: [-trimpath]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags: [-trimpath, -buildvcs=false]
+    ldflags:
+      - -s -w -buildid=
+      - -X github.com/alexrett/orchigram/internal/version.Version={{.Version}}
+      - -X github.com/alexrett/orchigram/internal/version.Commit={{.Commit}}
+      - -X github.com/alexrett/orchigram/internal/version.Date={{.CommitDate}}
   - id: github
     main: ./cmd/orchigram-plugin-github
     binary: orchigram-plugin-github
     env: [CGO_ENABLED=0]
     goos: [linux, darwin]
     goarch: [amd64, arm64]
-    flags: [-trimpath]
-
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags: [-trimpath, -buildvcs=false]
+    ldflags:
+      - -s -w -buildid=
+      - -X github.com/alexrett/orchigram/internal/version.Version={{.Version}}
+      - -X github.com/alexrett/orchigram/internal/version.Commit={{.Commit}}
+      - -X github.com/alexrett/orchigram/internal/version.Date={{.CommitDate}}
 archives:
   - id: core
-    ids: [orchigram]
+    ids: [orchigram, agent-command, exec, http, github]
     formats: [tar.gz]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-  - id: plugins
-    ids: [agent-command, exec, http, github]
-    formats: [tar.gz]
-    name_template: "{{ .Binary }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    builds_info:
+      owner: root
+      group: root
+      mode: 0755
+      mtime: "{{ .CommitDate }}"
+    files:
+      - src: LICENSE
+        info: &archive_file_info
+          owner: root
+          group: root
+          mode: 0644
+          mtime: "{{ .CommitDate }}"
+      - src: README.md
+        info: *archive_file_info
+      - src: docs/**/*
+        info: *archive_file_info
+      - src: examples/**/*
+        info: *archive_file_info
 
 checksum:
   name_template: checksums.txt
+  extra_files:
+    - glob: ./.release/plugin-bundles/*.tar.gz
+    - glob: ./.release/plugin-bundles/*.spdx.json
+    - glob: ./.release/dependency-licenses.csv
+    - glob: ./dist/*.sbom.json
 
 sboms:
   - artifacts: archive
@@ -70,4 +117,9 @@ changelog:
 
 release:
   draft: true
-
+  extra_files:
+    - glob: ./.release/plugin-bundles/*.tar.gz
+    - glob: ./.release/plugin-bundles/*.spdx.json
+    - glob: ./.release/dependency-licenses.csv
+    - glob: ./dist/*.sbom.json
+  include_meta: true

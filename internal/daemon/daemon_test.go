@@ -18,6 +18,7 @@ import (
 	"time"
 
 	controlv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/control/v1alpha1"
+	"github.com/alexrett/orchigram/internal/backup"
 	clientpkg "github.com/alexrett/orchigram/internal/client"
 	"github.com/alexrett/orchigram/internal/config"
 	"github.com/alexrett/orchigram/internal/githubplugin"
@@ -191,6 +192,125 @@ spec:
 		t.Fatal(err)
 	}
 	waitForRunEvent(t, second, started.GetUid(), 0, "run.succeeded")
+}
+
+func TestBackupRestoreReconcilesWaitingApproval(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "orchigram-backup-restore-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	state := filepath.Join(root, "state")
+	cfg := config.Development(state)
+	stopFirst := serveTestDaemon(t, cfg)
+	first := dialReadyClient(t, cfg.SocketPath)
+	flowDocument := []byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: backup-approval}
+spec:
+  nodes:
+    - {id: prepare, uses: core.noop}
+    - {id: approval, uses: core.approval, timeout: 1m}
+    - {id: finish, uses: core.noop}
+  edges:
+    - {from: prepare, to: approval}
+    - {from: approval, to: finish, when: result.approved}
+`)
+	if response, err := first.Resources.Apply(context.Background(), &controlv1alpha1.ApplyRequest{Document: flowDocument}); err != nil || len(response.GetDiagnostics()) != 0 {
+		t.Fatalf("apply response=%+v err=%v", response, err)
+	}
+	run, err := first.Runs.Start(context.Background(), &controlv1alpha1.StartRunRequest{Flow: "backup-approval", InputJson: []byte(`{}`), IdempotencyKey: "backup-approval"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRunEvent(t, first, run.GetUid(), 0, "approval.waiting")
+	backupResponse, err := first.System.Backup(context.Background(), &controlv1alpha1.BackupRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backupResponse.GetPath() == "" || len(backupResponse.GetSha256()) != 64 {
+		t.Fatalf("backup response=%+v", backupResponse)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stopFirst()
+
+	restoredState := filepath.Join(root, "restored")
+	if err := backup.Restore(context.Background(), backupResponse.GetPath(), restoredState); err != nil {
+		t.Fatal(err)
+	}
+	restoredConfig := config.Development(restoredState)
+	stopSecond := serveTestDaemon(t, restoredConfig)
+	defer stopSecond()
+	second := dialReadyClient(t, restoredConfig.SocketPath)
+	defer func() { _ = second.Close() }()
+	if _, err := second.Runs.Approve(context.Background(), &controlv1alpha1.ApprovalRequest{RunUid: run.GetUid(), NodeId: "approval", Reason: "restored backup"}); err != nil {
+		t.Fatal(err)
+	}
+	waitForRunEvent(t, second, run.GetUid(), 0, "run.succeeded")
+}
+
+func TestRetryTimerSurvivesDaemonRestart(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "orchigram-retry-restart-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	cfg := config.Development(filepath.Join(root, "state"))
+	stopFirst := serveTestDaemon(t, cfg)
+	first := dialReadyClient(t, cfg.SocketPath)
+	flowDocument := []byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: retry-restart}
+spec:
+  nodes:
+    - id: fail
+      uses: core.fail
+      timeout: 5s
+      retry: {limit: 2, backoff: 750ms}
+`)
+	if response, err := first.Resources.Apply(context.Background(), &controlv1alpha1.ApplyRequest{Document: flowDocument}); err != nil || len(response.GetDiagnostics()) != 0 {
+		t.Fatalf("apply response=%+v err=%v", response, err)
+	}
+	run, err := first.Runs.Start(context.Background(), &controlv1alpha1.StartRunRequest{Flow: "retry-restart", InputJson: []byte(`{}`), IdempotencyKey: "retry-restart"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForRunEvent(t, first, run.GetUid(), 0, "node.failed")
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stopFirst()
+
+	stopSecond := serveTestDaemon(t, cfg)
+	defer stopSecond()
+	second := dialReadyClient(t, cfg.SocketPath)
+	defer func() { _ = second.Close() }()
+	waitForRunEvent(t, second, run.GetUid(), 0, "run.failed")
+	events, err := second.Runs.WatchEvents(context.Background(), &controlv1alpha1.WatchRunRequest{Uid: run.GetUid()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedAttempts := 0
+	for {
+		event, err := events.Recv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if event.GetNodeId() == "fail" && event.GetType() == "node.failed" {
+			failedAttempts++
+		}
+		if event.GetType() == "run.failed" {
+			break
+		}
+	}
+	// The activity interrupted by shutdown may consume a framework attempt
+	// before product code appends node.failed. At least one persisted failure
+	// before and after restart proves the timer/history resumed to terminal.
+	if failedAttempts < 2 {
+		t.Fatalf("failed attempts=%d", failedAttempts)
+	}
 }
 
 func TestNativeScheduleRestartCreatesExactlyOneRun(t *testing.T) {

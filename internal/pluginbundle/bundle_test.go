@@ -1,6 +1,7 @@
 package pluginbundle
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
@@ -74,5 +75,27 @@ func TestManifestRejectsTraversalAndIncompatiblePlatform(t *testing.T) {
 	manifest.Platforms[0].OS = "unsupported"
 	if _, err := manifest.CurrentPlatform(); err == nil {
 		t.Fatal("missing current platform was accepted")
+	}
+}
+
+func TestParseForForeignPlatform(t *testing.T) {
+	t.Parallel()
+	binary := []byte("foreign executable")
+	digest := sha256.Sum256(binary)
+	manifest := Manifest{
+		APIVersion: APIVersion, Name: "foreign", Version: "1.2.3",
+		Protocol: ProtocolRange{Minimum: 1, Maximum: 1}, Capabilities: []string{"task.foreign"},
+		Platforms: []Platform{{OS: "plan9", Arch: "amd64", Path: "bin/plugin", SHA256: hex.EncodeToString(digest[:])}},
+	}
+	bundle, err := Build(manifest, map[string][]byte{"bin/plugin": binary})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, payload, _, err := ParseForPlatform(bundle, "plan9", "amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Name != manifest.Name || !bytes.Equal(payload, binary) {
+		t.Fatalf("unexpected parsed bundle: %#v %q", parsed, payload)
 	}
 }

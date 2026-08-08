@@ -66,6 +66,12 @@ type Installed struct {
 
 // Parse validates the archive and returns the current platform payload.
 func Parse(bundle []byte) (Manifest, []byte, string, error) {
+	return ParseForPlatform(bundle, runtime.GOOS, runtime.GOARCH)
+}
+
+// ParseForPlatform validates an archive and returns its selected target payload.
+// Release tooling uses this to verify bundles before publishing them.
+func ParseForPlatform(bundle []byte, targetOS, targetArch string) (Manifest, []byte, string, error) {
 	if len(bundle) == 0 || len(bundle) > maxBundle {
 		return Manifest{}, nil, "", errors.New("plugin bundle must be between 1 byte and 128 MiB")
 	}
@@ -121,7 +127,7 @@ func Parse(bundle []byte) (Manifest, []byte, string, error) {
 	if err := manifest.Validate(); err != nil {
 		return Manifest{}, nil, "", err
 	}
-	platform, err := manifest.CurrentPlatform()
+	platform, err := manifest.Platform(targetOS, targetArch)
 	if err != nil {
 		return Manifest{}, nil, "", err
 	}
@@ -173,12 +179,17 @@ func (m Manifest) Validate() error {
 
 // CurrentPlatform selects the binary for this daemon host.
 func (m Manifest) CurrentPlatform() (Platform, error) {
+	return m.Platform(runtime.GOOS, runtime.GOARCH)
+}
+
+// Platform selects the declared binary for a target.
+func (m Manifest) Platform(targetOS, targetArch string) (Platform, error) {
 	for _, platform := range m.Platforms {
-		if platform.OS == runtime.GOOS && platform.Arch == runtime.GOARCH {
+		if platform.OS == targetOS && platform.Arch == targetArch {
 			return platform, nil
 		}
 	}
-	return Platform{}, fmt.Errorf("plugin %s %s has no binary for %s/%s", m.Name, m.Version, runtime.GOOS, runtime.GOARCH)
+	return Platform{}, fmt.Errorf("plugin %s %s has no binary for %s/%s", m.Name, m.Version, targetOS, targetArch)
 }
 
 // Install atomically writes an immutable verified version directory.

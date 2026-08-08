@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -191,11 +190,12 @@ func (a *Adapter) findInstance(ctx context.Context, runUID string) (*core.Workfl
 
 // NodeRequest is a stable activity input.
 type NodeRequest struct {
-	RunUID   string          `json:"runUID"`
-	Node     flow.PlanNode   `json:"node"`
-	Outgoing []flow.PlanEdge `json:"outgoing"`
-	Input    json.RawMessage `json:"input"`
-	Nodes    map[string]any  `json:"nodes"`
+	RunUID    string          `json:"runUID"`
+	Node      flow.PlanNode   `json:"node"`
+	Iteration int             `json:"iteration"`
+	Outgoing  []flow.PlanEdge `json:"outgoing"`
+	Input     json.RawMessage `json:"input"`
+	Nodes     map[string]any  `json:"nodes"`
 }
 
 // NodeResult is a stable recorded activity result.
@@ -207,123 +207,260 @@ type NodeResult struct {
 
 // InterpreterWorkflow executes an immutable plan as deterministic data.
 func InterpreterWorkflow(ctx workflowRuntime.Context, runUID string, plan flow.ExecutionPlan, input json.RawMessage) error {
-	nodeIndex := make(map[string]int, len(plan.Nodes))
-	incoming := make(map[string][]int, len(plan.Nodes))
-	outgoing := make(map[string][]int, len(plan.Nodes))
-	for i, node := range plan.Nodes {
-		nodeIndex[node.ID] = i
+	model, err := buildComponentModel(plan)
+	if err != nil {
+		_, _ = workflowRuntime.ExecuteActivity[bool](ctx, workflowRuntime.DefaultActivityOptions, activityFailRun, runUID, err.Error()).Get(ctx)
+		return err
 	}
-	for i, edge := range plan.Edges {
-		incoming[edge.To] = append(incoming[edge.To], i)
-		outgoing[edge.From] = append(outgoing[edge.From], i)
-	}
-	states := make([]string, len(plan.Nodes))
-	edgeResolved := make([]bool, len(plan.Edges))
 	edgeActive := make([]bool, len(plan.Edges))
 	nodeOutputs := map[string]any{}
-	remaining := len(plan.Nodes)
-	for remaining > 0 {
-		progressed := false
-		for index, node := range plan.Nodes {
-			if states[index] != "" {
-				continue
-			}
-			allResolved, anyActive := true, len(incoming[node.ID]) == 0
-			for _, edgeIndex := range incoming[node.ID] {
-				if !edgeResolved[edgeIndex] {
-					allResolved = false
-				}
-				if edgeActive[edgeIndex] {
-					anyActive = true
-				}
-			}
-			if !allResolved {
-				continue
-			}
-			if !anyActive {
-				if _, err := workflowRuntime.ExecuteActivity[bool](ctx, workflowRuntime.DefaultActivityOptions, activitySkipNode, runUID, node.ID).Get(ctx); err != nil {
-					return err
-				}
-				states[index] = "skipped"
-				remaining--
-				for _, edgeIndex := range outgoing[node.ID] {
-					edgeResolved[edgeIndex] = true
-				}
-				progressed = true
-				continue
-			}
-
-			edges := make([]flow.PlanEdge, len(outgoing[node.ID]))
-			for i, edgeIndex := range outgoing[node.ID] {
-				edges[i] = plan.Edges[edgeIndex]
-			}
-			request := NodeRequest{RunUID: runUID, Node: node, Outgoing: edges, Input: input, Nodes: nodeOutputs}
-			var result NodeResult
-			var err error
-			if node.Uses == "core.approval" {
-				if _, err = workflowRuntime.ExecuteActivity[bool](ctx, workflowRuntime.DefaultActivityOptions, activityBeginApproval, request).Get(ctx); err != nil {
-					return err
-				}
-				signalChannel := workflowRuntime.NewSignalChannel[ApprovalSignal](ctx, approvalSignalName(node.ID))
-				timeout, parseErr := time.ParseDuration(node.Timeout)
-				if parseErr != nil {
-					return parseErr
-				}
-				timerContext, cancelTimer := workflowRuntime.WithCancel(ctx)
-				timer := workflowRuntime.ScheduleTimer(timerContext, timeout, workflowRuntime.WithTimerName("approval-timeout-"+node.ID))
-				signal := ApprovalSignal{State: "rejected", Reason: "approval timed out"}
-				workflowRuntime.Select(ctx,
-					workflowRuntime.Receive(signalChannel, func(_ workflowRuntime.Context, value ApprovalSignal, ok bool) {
-						if ok {
-							signal = value
-						}
-						cancelTimer()
-					}),
-					workflowRuntime.Await(timer, func(workflowRuntime.Context, workflowRuntime.Future[any]) {}),
-				)
-				result, err = workflowRuntime.ExecuteActivity[NodeResult](ctx, workflowRuntime.DefaultActivityOptions, activityEndApproval, request, signal).Get(ctx)
-			} else {
-				backoff, _ := time.ParseDuration(node.RetryBackoff)
-				timeout, _ := time.ParseDuration(node.Timeout)
-				options := workflowRuntime.ActivityOptions{RetryOptions: workflowRuntime.RetryOptions{MaxAttempts: node.RetryLimit + 1, FirstRetryInterval: backoff, BackoffCoefficient: 2, RetryTimeout: timeout}}
-				result, err = workflowRuntime.ExecuteActivity[NodeResult](ctx, options, activityExecuteNode, request).Get(ctx)
-			}
-			if err != nil {
-				_, _ = workflowRuntime.ExecuteActivity[bool](ctx, workflowRuntime.DefaultActivityOptions, activityFailRun, runUID, err.Error()).Get(ctx)
-				return err
-			}
-			states[index] = "completed"
-			remaining--
-			var output any
-			_ = json.Unmarshal(result.Output, &output)
-			nodeOutputs[node.ID] = output
-			for i, edgeIndex := range outgoing[node.ID] {
-				edgeResolved[edgeIndex] = true
-				if i < len(result.Activated) {
-					edgeActive[edgeIndex] = result.Activated[i]
-				}
-			}
-			progressed = true
-			if result.Rejected {
-				_, err = workflowRuntime.ExecuteActivity[bool](ctx, workflowRuntime.DefaultActivityOptions, activityCompleteRun, runUID, "rejected").Get(ctx)
-				return err
+	for _, componentIndex := range model.order {
+		component := model.components[componentIndex]
+		active := len(component.incoming) == 0
+		for _, edgeIndex := range component.incoming {
+			if edgeActive[edgeIndex] {
+				active = true
 			}
 		}
-		if !progressed {
-			pending := make([]string, 0)
-			for id, index := range nodeIndex {
-				if states[index] == "" {
-					pending = append(pending, id)
+		if !active {
+			for _, nodeID := range component.nodes {
+				if err := skipPlanNode(ctx, runUID, nodeID); err != nil {
+					return err
 				}
 			}
-			sort.Strings(pending)
-			message := "interpreter cannot advance cyclic component: " + strings.Join(pending, ",")
-			_, _ = workflowRuntime.ExecuteActivity[bool](ctx, workflowRuntime.DefaultActivityOptions, activityFailRun, runUID, message).Get(ctx)
-			return errors.New(message)
+			continue
+		}
+		if !component.cyclic {
+			node := model.nodes[component.nodes[0]]
+			result, executeErr := executePlanNode(ctx, NodeRequest{RunUID: runUID, Node: node, Iteration: 0, Outgoing: model.outgoingEdges(node.ID, plan), Input: input, Nodes: nodeOutputs})
+			if executeErr != nil {
+				return failInterpreterRun(ctx, runUID, executeErr)
+			}
+			model.recordResult(node.ID, result, edgeActive, nodeOutputs)
+			if result.Rejected {
+				_, executeErr = workflowRuntime.ExecuteActivity[bool](ctx, workflowRuntime.DefaultActivityOptions, activityCompleteRun, runUID, "rejected").Get(ctx)
+				return executeErr
+			}
+			continue
+		}
+		queue := []string{}
+		queued := map[string]bool{}
+		for _, edgeIndex := range component.incoming {
+			if edgeActive[edgeIndex] {
+				target := plan.Edges[edgeIndex].To
+				if !queued[target] {
+					queue, queued[target] = append(queue, target), true
+				}
+			}
+		}
+		if len(queue) == 0 && len(component.incoming) == 0 {
+			queue, queued[component.nodes[0]] = append(queue, component.nodes[0]), true
+		}
+		counts := map[string]int{}
+		for len(queue) > 0 {
+			nodeID := queue[0]
+			queue = queue[1:]
+			queued[nodeID] = false
+			if counts[nodeID] >= component.maxIterations {
+				continue
+			}
+			node := model.nodes[nodeID]
+			iteration := counts[nodeID]
+			counts[nodeID]++
+			result, executeErr := executePlanNode(ctx, NodeRequest{RunUID: runUID, Node: node, Iteration: iteration, Outgoing: model.outgoingEdges(node.ID, plan), Input: input, Nodes: nodeOutputs})
+			if executeErr != nil {
+				return failInterpreterRun(ctx, runUID, executeErr)
+			}
+			model.recordResult(node.ID, result, edgeActive, nodeOutputs)
+			if result.Rejected {
+				_, executeErr = workflowRuntime.ExecuteActivity[bool](ctx, workflowRuntime.DefaultActivityOptions, activityCompleteRun, runUID, "rejected").Get(ctx)
+				return executeErr
+			}
+			for position, edgeIndex := range model.outgoing[nodeID] {
+				if position >= len(result.Activated) || !result.Activated[position] {
+					continue
+				}
+				target := plan.Edges[edgeIndex].To
+				if model.componentByNode[target] == componentIndex && counts[target] < component.maxIterations && !queued[target] {
+					queue, queued[target] = append(queue, target), true
+				}
+			}
+		}
+		for _, nodeID := range component.nodes {
+			if counts[nodeID] == 0 {
+				if err := skipPlanNode(ctx, runUID, nodeID); err != nil {
+					return err
+				}
+			}
 		}
 	}
-	_, err := workflowRuntime.ExecuteActivity[bool](ctx, workflowRuntime.DefaultActivityOptions, activityCompleteRun, runUID, "succeeded").Get(ctx)
+	_, err = workflowRuntime.ExecuteActivity[bool](ctx, workflowRuntime.DefaultActivityOptions, activityCompleteRun, runUID, "succeeded").Get(ctx)
 	return err
+}
+
+type planComponent struct {
+	nodes         []string
+	incoming      []int
+	cyclic        bool
+	maxIterations int
+}
+
+type componentModel struct {
+	nodes           map[string]flow.PlanNode
+	outgoing        map[string][]int
+	componentByNode map[string]int
+	components      []planComponent
+	order           []int
+}
+
+func buildComponentModel(plan flow.ExecutionPlan) (componentModel, error) {
+	model := componentModel{nodes: map[string]flow.PlanNode{}, outgoing: map[string][]int{}, componentByNode: map[string]int{}}
+	for _, node := range plan.Nodes {
+		model.nodes[node.ID] = node
+	}
+	components := make([][]string, len(plan.Components))
+	for index, component := range plan.Components {
+		components[index] = append([]string(nil), component...)
+	}
+	covered := map[string]bool{}
+	for _, component := range components {
+		for _, nodeID := range component {
+			covered[nodeID] = true
+		}
+	}
+	for _, node := range plan.Nodes {
+		if !covered[node.ID] {
+			components = append(components, []string{node.ID})
+		}
+	}
+	for index, nodeIDs := range components {
+		sort.Strings(nodeIDs)
+		component := planComponent{nodes: nodeIDs, maxIterations: 1}
+		for _, nodeID := range nodeIDs {
+			node, exists := model.nodes[nodeID]
+			if !exists {
+				return componentModel{}, fmt.Errorf("plan component references unknown node %s", nodeID)
+			}
+			model.componentByNode[nodeID] = index
+			if node.LoopMaxIterations > component.maxIterations {
+				component.maxIterations = node.LoopMaxIterations
+			}
+		}
+		model.components = append(model.components, component)
+	}
+	indegree := make([]int, len(model.components))
+	adjacency := make(map[int][]int)
+	seenComponentEdge := map[[2]int]bool{}
+	for edgeIndex, edge := range plan.Edges {
+		fromComponent, fromOK := model.componentByNode[edge.From]
+		toComponent, toOK := model.componentByNode[edge.To]
+		if !fromOK || !toOK {
+			return componentModel{}, fmt.Errorf("plan edge references unknown node %s -> %s", edge.From, edge.To)
+		}
+		model.outgoing[edge.From] = append(model.outgoing[edge.From], edgeIndex)
+		if fromComponent == toComponent {
+			model.components[fromComponent].cyclic = model.components[fromComponent].cyclic || len(model.components[fromComponent].nodes) > 1 || edge.From == edge.To
+			continue
+		}
+		model.components[toComponent].incoming = append(model.components[toComponent].incoming, edgeIndex)
+		key := [2]int{fromComponent, toComponent}
+		if !seenComponentEdge[key] {
+			seenComponentEdge[key] = true
+			adjacency[fromComponent] = append(adjacency[fromComponent], toComponent)
+			indegree[toComponent]++
+		}
+	}
+	for nodeID := range model.outgoing {
+		sort.Slice(model.outgoing[nodeID], func(i, j int) bool {
+			left, right := plan.Edges[model.outgoing[nodeID][i]], plan.Edges[model.outgoing[nodeID][j]]
+			if left.To == right.To {
+				return left.Condition < right.Condition
+			}
+			return left.To < right.To
+		})
+	}
+	ready := []int{}
+	for index, degree := range indegree {
+		if degree == 0 {
+			ready = append(ready, index)
+		}
+	}
+	sort.Slice(ready, func(i, j int) bool { return model.components[ready[i]].nodes[0] < model.components[ready[j]].nodes[0] })
+	for len(ready) > 0 {
+		current := ready[0]
+		ready = ready[1:]
+		model.order = append(model.order, current)
+		for _, next := range adjacency[current] {
+			indegree[next]--
+			if indegree[next] == 0 {
+				ready = append(ready, next)
+				sort.Slice(ready, func(i, j int) bool { return model.components[ready[i]].nodes[0] < model.components[ready[j]].nodes[0] })
+			}
+		}
+	}
+	if len(model.order) != len(model.components) {
+		return componentModel{}, errors.New("plan component graph is cyclic")
+	}
+	return model, nil
+}
+
+func (m componentModel) outgoingEdges(nodeID string, plan flow.ExecutionPlan) []flow.PlanEdge {
+	result := make([]flow.PlanEdge, len(m.outgoing[nodeID]))
+	for index, edgeIndex := range m.outgoing[nodeID] {
+		result[index] = plan.Edges[edgeIndex]
+	}
+	return result
+}
+
+func (m componentModel) recordResult(nodeID string, result NodeResult, edgeActive []bool, nodeOutputs map[string]any) {
+	var output any
+	_ = json.Unmarshal(result.Output, &output)
+	nodeOutputs[nodeID] = output
+	for position, edgeIndex := range m.outgoing[nodeID] {
+		if position < len(result.Activated) && result.Activated[position] {
+			edgeActive[edgeIndex] = true
+		}
+	}
+}
+
+func executePlanNode(ctx workflowRuntime.Context, request NodeRequest) (NodeResult, error) {
+	if request.Node.Uses != "core.approval" {
+		backoff, _ := time.ParseDuration(request.Node.RetryBackoff)
+		timeout, _ := time.ParseDuration(request.Node.Timeout)
+		options := workflowRuntime.ActivityOptions{RetryOptions: workflowRuntime.RetryOptions{MaxAttempts: request.Node.RetryLimit + 1, FirstRetryInterval: backoff, BackoffCoefficient: 2, RetryTimeout: timeout}}
+		return workflowRuntime.ExecuteActivity[NodeResult](ctx, options, activityExecuteNode, request).Get(ctx)
+	}
+	if _, err := workflowRuntime.ExecuteActivity[bool](ctx, workflowRuntime.DefaultActivityOptions, activityBeginApproval, request).Get(ctx); err != nil {
+		return NodeResult{}, err
+	}
+	signalChannel := workflowRuntime.NewSignalChannel[ApprovalSignal](ctx, approvalSignalName(request.Node.ID))
+	timeout, err := time.ParseDuration(request.Node.Timeout)
+	if err != nil {
+		return NodeResult{}, err
+	}
+	timerContext, cancelTimer := workflowRuntime.WithCancel(ctx)
+	timer := workflowRuntime.ScheduleTimer(timerContext, timeout, workflowRuntime.WithTimerName(fmt.Sprintf("approval-timeout-%s-%d", request.Node.ID, request.Iteration)))
+	signal := ApprovalSignal{State: "rejected", Reason: "approval timed out"}
+	workflowRuntime.Select(ctx,
+		workflowRuntime.Receive(signalChannel, func(_ workflowRuntime.Context, value ApprovalSignal, ok bool) {
+			if ok {
+				signal = value
+			}
+			cancelTimer()
+		}),
+		workflowRuntime.Await(timer, func(workflowRuntime.Context, workflowRuntime.Future[any]) {}),
+	)
+	return workflowRuntime.ExecuteActivity[NodeResult](ctx, workflowRuntime.DefaultActivityOptions, activityEndApproval, request, signal).Get(ctx)
+}
+
+func skipPlanNode(ctx workflowRuntime.Context, runUID, nodeID string) error {
+	_, err := workflowRuntime.ExecuteActivity[bool](ctx, workflowRuntime.DefaultActivityOptions, activitySkipNode, runUID, nodeID).Get(ctx)
+	return err
+}
+
+func failInterpreterRun(ctx workflowRuntime.Context, runUID string, cause error) error {
+	_, _ = workflowRuntime.ExecuteActivity[bool](ctx, workflowRuntime.DefaultActivityOptions, activityFailRun, runUID, cause.Error()).Get(ctx)
+	return cause
 }
 
 // Activities are framework activity boundaries with access to product state.
@@ -334,7 +471,11 @@ type Activities struct {
 
 // ExecuteNode records and invokes a non-approval action at least once.
 func (a *Activities) ExecuteNode(ctx context.Context, request NodeRequest) (NodeResult, error) {
-	if err := a.store.AppendRunEvent(ctx, request.RunUID, request.Node.ID, "node.started", "running", 1, nil); err != nil {
+	if request.Iteration < 0 || request.Iteration >= 1000 {
+		return NodeResult{}, errors.New("node iteration is outside the compiled limit")
+	}
+	attempt := uint32(request.Iteration) + 1 //nolint:gosec // Iteration was bounded to [0, 999] above.
+	if err := a.store.AppendRunEvent(ctx, request.RunUID, request.Node.ID, "node.started", "running", attempt, nil); err != nil {
 		return NodeResult{}, err
 	}
 	var output json.RawMessage
@@ -351,19 +492,19 @@ func (a *Activities) ExecuteNode(ctx context.Context, request NodeRequest) (Node
 		if a.executor == nil {
 			err = fmt.Errorf("no task executor for %q", request.Node.Uses)
 		} else {
-			key := fmt.Sprintf("run/%s/node/%s/iteration/0/operation/execute", request.RunUID, request.Node.ID)
+			key := fmt.Sprintf("run/%s/node/%s/iteration/%d/operation/execute", request.RunUID, request.Node.ID, request.Iteration)
 			output, err = a.executor.Execute(ctx, request.RunUID, request.Node, request.Input, request.Nodes, key)
 		}
 	}
 	if err != nil {
-		_ = a.store.AppendRunEvent(ctx, request.RunUID, request.Node.ID, "node.failed", "running", 1, mustJSON(map[string]any{"error": err.Error()}))
+		_ = a.store.AppendRunEvent(ctx, request.RunUID, request.Node.ID, "node.failed", "running", attempt, mustJSON(map[string]any{"error": err.Error()}))
 		return NodeResult{}, err
 	}
 	activated, err := evaluate(request, output)
 	if err != nil {
 		return NodeResult{}, err
 	}
-	if err := a.store.AppendRunEvent(ctx, request.RunUID, request.Node.ID, "node.completed", "running", 1, output); err != nil {
+	if err := a.store.AppendRunEvent(ctx, request.RunUID, request.Node.ID, "node.completed", "running", attempt, output); err != nil {
 		return NodeResult{}, err
 	}
 	return NodeResult{Output: output, Activated: activated}, nil

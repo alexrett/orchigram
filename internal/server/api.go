@@ -12,6 +12,7 @@ import (
 	"time"
 
 	controlv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/control/v1alpha1"
+	"github.com/alexrett/orchigram/internal/backup"
 	"github.com/alexrett/orchigram/internal/engine"
 	"github.com/alexrett/orchigram/internal/flow"
 	"github.com/alexrett/orchigram/internal/orchestrator"
@@ -36,12 +37,13 @@ type API struct {
 	engine       engine.DurableEngine
 	plugins      *pluginmanager.Manager
 	triggers     *triggercontroller.Controller
+	stateDir     string
 	startedAt    time.Time
 }
 
 // NewAPI constructs the public service implementation.
-func NewAPI(state *store.Store, compiler *flow.Compiler, control *orchestrator.Orchestrator, durable engine.DurableEngine, plugins *pluginmanager.Manager, triggers *triggercontroller.Controller) *API {
-	return &API{store: state, compiler: compiler, orchestrator: control, engine: durable, plugins: plugins, triggers: triggers, startedAt: time.Now()}
+func NewAPI(state *store.Store, compiler *flow.Compiler, control *orchestrator.Orchestrator, durable engine.DurableEngine, plugins *pluginmanager.Manager, triggers *triggercontroller.Controller, stateDir string) *API {
+	return &API{store: state, compiler: compiler, orchestrator: control, engine: durable, plugins: plugins, triggers: triggers, stateDir: stateDir, startedAt: time.Now()}
 }
 
 // Register binds every public service to one gRPC server.
@@ -379,6 +381,15 @@ func (a *API) Health(context.Context, *emptypb.Empty) (*controlv1alpha1.HealthRe
 	return &controlv1alpha1.HealthResponse{Ready: true}, nil
 }
 
+// Backup creates an online state snapshot under the daemon state directory.
+func (a *API) Backup(ctx context.Context, request *controlv1alpha1.BackupRequest) (*controlv1alpha1.BackupResponse, error) {
+	result, err := backup.Create(ctx, a.stateDir, request.GetDestination())
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	return &controlv1alpha1.BackupResponse{Path: result.Path, Sha256: result.SHA256}, nil
+}
+
 // InstallPlugin receives one bounded bundle and closes with its verified identity.
 func (a *API) InstallPlugin(stream grpc.ClientStreamingServer[controlv1alpha1.PluginUploadRequest, controlv1alpha1.PluginInstallResponse]) error {
 	if a.plugins == nil {
@@ -677,4 +688,7 @@ func (s *systemService) Info(ctx context.Context, request *emptypb.Empty) (*cont
 }
 func (s *systemService) Health(ctx context.Context, request *emptypb.Empty) (*controlv1alpha1.HealthResponse, error) {
 	return s.api.Health(ctx, request)
+}
+func (s *systemService) Backup(ctx context.Context, request *controlv1alpha1.BackupRequest) (*controlv1alpha1.BackupResponse, error) {
+	return s.api.Backup(ctx, request)
 }

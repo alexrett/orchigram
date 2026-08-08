@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/alexrett/orchigram/internal/flow"
+	"github.com/alexrett/orchigram/internal/resource"
 	"github.com/alexrett/orchigram/internal/store"
 	"github.com/cschleiden/go-workflows/core"
 )
@@ -69,6 +70,64 @@ func TestApprovalSignalCompletesWithoutPendingTimer(t *testing.T) {
 			t.Fatalf("framework state remained %v", frameworkState)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestFiniteCycleExecutesDeclaredIterationsAndExits(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	state, err := store.Open(filepath.Join(root, "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	adapter, err := Open(ctx, filepath.Join(root, "workflows.sqlite"), state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = adapter.Close() }()
+	flowResource, err := resource.DecodeFlow([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: finite-cycle, uid: flow-cycle, generation: 1}
+spec:
+  nodes:
+    - id: repeat
+      uses: core.noop
+      loop: {maxIterations: 3}
+    - {id: finish, uses: core.noop}
+  edges:
+    - {from: repeat, to: repeat}
+    - {from: repeat, to: finish}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, diagnostics := flow.NewCompiler(nil).Compile(flowResource)
+	if len(diagnostics) != 0 {
+		t.Fatalf("diagnostics=%+v", diagnostics)
+	}
+	payload := store.StartPayload{RunUID: "run-cycle", ReceiptUID: "receipt-cycle", FlowName: "finite-cycle", Namespace: "default", Input: json.RawMessage(`{}`)}
+	if _, err := state.EnsureRun(ctx, payload, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Start(ctx, payload.RunUID, plan, payload.Input); err != nil {
+		t.Fatal(err)
+	}
+	waitForPhase(ctx, t, state, payload.RunUID, "succeeded")
+	events, err := state.RunEventsAfter(ctx, payload.RunUID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed := 0
+	for _, event := range events {
+		if event.NodeID == "repeat" && event.Type == "node.completed" {
+			completed++
+		}
+	}
+	if completed != 3 {
+		t.Fatalf("repeat completed %d times, events=%+v", completed, events)
 	}
 }
 

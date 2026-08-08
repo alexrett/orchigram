@@ -17,6 +17,7 @@ import (
 	"time"
 
 	controlv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/control/v1alpha1"
+	"github.com/alexrett/orchigram/internal/backup"
 	clientpkg "github.com/alexrett/orchigram/internal/client"
 	"github.com/alexrett/orchigram/internal/config"
 	"github.com/alexrett/orchigram/internal/contextcfg"
@@ -76,10 +77,59 @@ func NewRoot() *cobra.Command {
 		newRunCommand(opts),
 		newTriggerCommand(opts),
 		newPluginCommand(opts),
+		newSystemCommand(opts),
 		newContextCommand(opts),
 		newInstallCommand(),
 	)
 	return root
+}
+
+func newSystemCommand(opts *options) *cobra.Command {
+	command := &cobra.Command{Use: "system", Short: "Inspect and back up the daemon", RunE: func(cmd *cobra.Command, _ []string) error { return cmd.Help() }}
+	info := &cobra.Command{Use: "info", Short: "Show daemon identity and capabilities", RunE: func(cmd *cobra.Command, _ []string) error {
+		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error {
+			response, err := client.System.Info(cmd.Context(), &emptypb.Empty{})
+			if err != nil {
+				return err
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "version: %s\nhost: %s\nos: %s/%s\nprotocol: %s\ncapabilities: %s\n", response.GetVersion(), response.GetHostname(), response.GetOs(), response.GetArchitecture(), response.GetProtocolVersion(), strings.Join(response.GetCapabilities(), ","))
+			return err
+		})
+	}}
+	var destination string
+	backupCommand := &cobra.Command{Use: "backup", Short: "Create an online state backup", RunE: func(cmd *cobra.Command, _ []string) error {
+		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error {
+			response, err := client.System.Backup(cmd.Context(), &controlv1alpha1.BackupRequest{Destination: destination})
+			if err != nil {
+				return err
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\n", response.GetSha256(), response.GetPath())
+			return err
+		})
+	}}
+	backupCommand.Flags().StringVar(&destination, "destination", "", "archive path or directory under the server state directory")
+	var restoreDestination string
+	restoreCommand := &cobra.Command{Use: "restore ARCHIVE", Short: "Restore a verified backup into a new offline state directory", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		if restoreDestination == "" {
+			return errors.New("--destination is required")
+		}
+		archivePath, err := filepath.Abs(args[0])
+		if err != nil {
+			return err
+		}
+		destinationPath, err := filepath.Abs(restoreDestination)
+		if err != nil {
+			return err
+		}
+		if err := backup.Restore(cmd.Context(), archivePath, destinationPath); err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(cmd.OutOrStdout(), destinationPath)
+		return err
+	}}
+	restoreCommand.Flags().StringVar(&restoreDestination, "destination", "", "new state directory; it must not already exist")
+	command.AddCommand(info, backupCommand, restoreCommand)
+	return command
 }
 
 func newServerCommand() *cobra.Command {
