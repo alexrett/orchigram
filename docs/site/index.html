@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#080b09">
+    <meta name="description" content="Orchigram is a single-binary control plane and terminal UI for durable, declarative agent workflows.">
+    <meta property="og:title" content="Orchigram — durable agent workflows from your terminal">
+    <meta property="og:description" content="Run scheduled and event-driven agent pipelines across repositories and servers without a web control plane.">
+    <meta property="og:type" content="website">
+    <meta property="og:image" content="https://alexrett.github.io/orchigram/assets/tui-run-approval.png">
+    <title>Orchigram — durable agent workflows from your terminal</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="script.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header">
+      <a class="brand" href="#top" aria-label="Orchigram home"><span aria-hidden="true">&gt;_</span> ORCHIGRAM</a>
+      <nav aria-label="Primary navigation">
+        <a href="#why">Why</a>
+        <a href="#workflow">Workflow</a>
+        <a href="#tui">TUI</a>
+        <a href="#docs">Docs</a>
+      </nav>
+      <a class="header-link" href="https://github.com/alexrett/orchigram">GitHub <span aria-hidden="true">↗</span></a>
+    </header>
+
+    <main id="main">
+      <section class="hero" id="top">
+        <div class="hero-copy">
+          <h1>Durable agent workflows.<br><span>Operated from your terminal.</span></h1>
+          <p>Run scheduled and event-driven agent pipelines across repositories and servers—without a web control plane.</p>
+          <div class="hero-actions">
+            <a class="button primary" href="https://github.com/alexrett/orchigram">View on GitHub <span aria-hidden="true">→</span></a>
+            <a class="button secondary" href="#docs">Read the docs</a>
+          </div>
+          <div class="command-block">
+            <code>git clone https://github.com/alexrett/orchigram &amp;&amp; cd orchigram</code>
+            <button class="copy-button" type="button" data-copy="git clone https://github.com/alexrett/orchigram &amp;&amp; cd orchigram" aria-label="Copy clone command">copy</button>
+          </div>
+        </div>
+        <figure class="terminal hero-terminal">
+          <figcaption>
+            <span class="terminal-title"><span class="prompt" aria-hidden="true">›</span> orchigram <span class="muted">— production</span></span>
+            <span class="live"><i aria-hidden="true"></i> connected</span>
+          </figcaption>
+          <img src="assets/tui-run-approval.png" width="1600" height="900" alt="Orchigram terminal UI displaying a live workflow run and durable approval state">
+        </figure>
+      </section>
+
+      <section class="principles section" id="why">
+        <div class="section-heading">
+          <h2>One control plane.<br>Many execution contexts.</h2>
+          <p>A small single-node daemon owns durable state. Every operator surface is a stateless client of the same API.</p>
+        </div>
+        <ol class="feature-rail">
+          <li>
+            <span class="feature-number">01</span><span class="feature-glyph" aria-hidden="true">o─┬─o<br>&nbsp;&nbsp;│<br>o─┴─o</span>
+            <h3>Declarative flows</h3><p>Strict YAML, typed nodes, CEL conditions, finite loops and immutable compiled plans.</p>
+          </li>
+          <li>
+            <span class="feature-number">02</span><span class="feature-glyph" aria-hidden="true">╭─╮<br>│↻│<br>╰─╯</span>
+            <h3>Durable by construction</h3><p>Trigger receipts, SQLite outbox, pinned plan hashes and restart-safe approvals.</p>
+          </li>
+          <li>
+            <span class="feature-number">03</span><span class="feature-glyph" aria-hidden="true">┌──┐<br>│{}│<br>└──┘</span>
+            <h3>Plugin processes</h3><p>gRPC contracts, versioned bundles, crash isolation and explicit at-least-once effects.</p>
+          </li>
+          <li>
+            <span class="feature-number">04</span><span class="feature-glyph" aria-hidden="true">┌──┐<br>│&gt;_│<br>└──┘</span>
+            <h3>Local or over SSH</h3><p>Unix socket locally, OpenSSH StreamLocal remotely—the same API everywhere.</p>
+          </li>
+        </ol>
+      </section>
+
+      <section class="workflow section" id="workflow">
+        <div class="section-heading compact-heading">
+          <h2>From trigger to reconciled effect.</h2>
+          <p>Every accepted occurrence is persisted before execution starts. Effects may repeat; identities do not.</p>
+        </div>
+        <div class="workflow-terminal terminal" aria-label="Example durable workflow">
+          <div class="terminal-bar"><span><span class="prompt">›</span> orchigram run watch issue-184</span><span class="live"><i aria-hidden="true"></i> live</span></div>
+          <div class="workflow-track">
+            <article class="workflow-node complete"><span>01</span><h3>Trigger receipt</h3><p>persisted</p></article>
+            <span class="connector" aria-hidden="true">──→</span>
+            <article class="workflow-node complete"><span>02</span><h3>Pinned plan</h3><p>compiled</p></article>
+            <span class="connector" aria-hidden="true">──→</span>
+            <article class="workflow-node complete"><span>03</span><h3>Planning agent</h3><p>completed</p></article>
+            <span class="connector" aria-hidden="true">──→</span>
+            <article class="workflow-node waiting"><span>04</span><h3>Approval</h3><p>waiting</p></article>
+            <span class="connector" aria-hidden="true">──→</span>
+            <article class="workflow-node pending"><span>05</span><h3>Tests + PR</h3><p>pending</p></article>
+          </div>
+          <p class="workflow-note">All times UTC · safe to restart · deterministic local identities · reconciled external effects</p>
+        </div>
+      </section>
+
+      <section class="tui-section section" id="tui">
+        <div class="section-heading compact-heading">
+          <h2>Operate the whole system without leaving the terminal.</h2>
+          <p>Inspect the same graph as a definition, a live overlay or a historical replay. Drill into nodes, logs, events and YAML.</p>
+        </div>
+        <div class="shot-tabs" role="tablist" aria-label="TUI screenshots">
+          <button id="tab-flow" role="tab" aria-selected="true" aria-controls="shot-panel" data-shot="assets/tui-flow.png" data-alt="Flow definition rendered as an interactive terminal graph">Flow graph</button>
+          <button id="tab-run" role="tab" aria-selected="false" aria-controls="shot-panel" data-shot="assets/tui-run-approval.png" data-alt="Live run graph with node status and event stream">Live approval</button>
+          <button id="tab-trigger" role="tab" aria-selected="false" aria-controls="shot-panel" data-shot="assets/tui-trigger.png" data-alt="Schedule trigger details and durable enable or disable controls">Trigger control</button>
+        </div>
+        <figure class="terminal product-shot" id="shot-panel" role="tabpanel" aria-labelledby="tab-flow">
+          <figcaption><span><span class="prompt">›</span> orchigram</span><span class="muted">real TUI · 1600×900</span></figcaption>
+          <img id="product-shot" src="assets/tui-flow.png" width="1600" height="900" alt="Flow definition rendered as an interactive terminal graph">
+        </figure>
+        <div class="shortcut-rail" aria-label="Keyboard shortcuts">
+          <span><kbd>:</kbd> command</span><span><kbd>/</kbd> filter</span><span><kbd>?</kbd> help</span><span><kbd>g</kbd> graph</span><span><kbd>l</kbd> logs</span><span><kbd>e</kbd> events</span><span><kbd>y</kbd> YAML</span>
+        </div>
+      </section>
+
+      <section class="quickstart section" id="docs">
+        <div class="quickstart-grid">
+          <div>
+            <h2>Ship one binary.<br>Connect from anywhere.</h2>
+            <ol class="commands">
+              <li><code>git clone https://github.com/alexrett/orchigram &amp;&amp; cd orchigram</code><button class="copy-button" data-copy="git clone https://github.com/alexrett/orchigram &amp;&amp; cd orchigram" aria-label="Copy clone command">copy</button></li>
+              <li><code>make build</code><button class="copy-button" data-copy="make build" aria-label="Copy build command">copy</button></li>
+              <li><code>sudo ./bin/orchigram install --plugin-dir ./bin</code><button class="copy-button" data-copy="sudo ./bin/orchigram install --plugin-dir ./bin" aria-label="Copy install command">copy</button></li>
+              <li><code>orchigram</code><button class="copy-button" data-copy="orchigram" aria-label="Copy launch command">copy</button></li>
+            </ol>
+            <p class="platforms">Client: macOS/Linux · Server: Linux · amd64/arm64</p>
+          </div>
+          <div class="docs-list">
+            <h2>Documentation</h2>
+            <a href="https://github.com/alexrett/orchigram/blob/main/docs/architecture.md"><span>Architecture</span><span aria-hidden="true">→</span></a>
+            <a href="https://github.com/alexrett/orchigram/blob/main/docs/durability.md"><span>Durability</span><span aria-hidden="true">→</span></a>
+            <a href="https://github.com/alexrett/orchigram/blob/main/docs/plugin-authoring.md"><span>Plugin authoring</span><span aria-hidden="true">→</span></a>
+            <a href="https://github.com/alexrett/orchigram/blob/main/docs/security.md"><span>Security</span><span aria-hidden="true">→</span></a>
+            <a href="https://github.com/alexrett/orchigram/tree/main/examples"><span>Example flows</span><span aria-hidden="true">→</span></a>
+          </div>
+        </div>
+      </section>
+
+      <section class="final-cta section">
+        <h2>Build your first durable flow.</h2>
+        <div class="hero-actions">
+          <a class="button primary" href="https://github.com/alexrett/orchigram/tree/main/examples">View examples <span aria-hidden="true">→</span></a>
+          <a class="button secondary" href="https://github.com/alexrett/orchigram">Star on GitHub <span aria-hidden="true">☆</span></a>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <a class="brand" href="#top"><span aria-hidden="true">&gt;_</span> ORCHIGRAM</a>
+      <p>Apache-2.0 <span>·</span> Go <span>·</span> gRPC <span>·</span> SQLite</p>
+      <a href="https://github.com/alexrett/orchigram">Source ↗</a>
+    </footer>
+  </body>
+</html>

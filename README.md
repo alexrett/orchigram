@@ -2,7 +2,11 @@
 
 Orchigram is a local-first, declarative agent workflow orchestrator with a k9s-style terminal interface. It runs as one non-root daemon, stores state in SQLite, and is operated locally or through OpenSSH Unix-socket forwarding. There is no web control plane and no Orchigram-specific user authentication system.
 
-> Status: v0.1 is under active development. The repository is intentionally kept local until the publication gates pass.
+> Status: v0.1 is under active development. Public APIs remain `v1alpha1` until the first tagged release.
+
+[Website](https://alexrett.github.io/orchigram/) · [Operator guide](docs/operator-guide.md) · [Architecture](docs/architecture.md) · [Examples](examples/)
+
+![Orchigram TUI showing a durable approval run](docs/site/assets/tui-run-approval.png)
 
 ## Shape of the product
 
@@ -24,7 +28,7 @@ make check
 make cross-build
 ```
 
-See [Operator guide](docs/operator-guide.md), [Architecture](docs/architecture.md), [Durability](docs/durability.md), [Triggers](docs/triggers.md), [GitHub SDLC tracer](docs/github-sdlc.md), [Security](docs/security.md), and [Plugin authoring](docs/plugin-authoring.md).
+See [Operator guide](docs/operator-guide.md), [Architecture](docs/architecture.md), [Durability](docs/durability.md), [Triggers](docs/triggers.md), [GitHub SDLC tracer](docs/github-sdlc.md), [Security](docs/security.md), [Plugin authoring](docs/plugin-authoring.md), and [Release process](docs/release.md).
 
 ## License
 
