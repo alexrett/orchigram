@@ -105,6 +105,7 @@ type ActionBinding struct {
 type PlanNode struct {
 	ID                string            `json:"id"`
 	Name              string            `json:"name"`
+	Namespace         string            `json:"namespace"`
 	Uses              string            `json:"uses"`
 	With              map[string]any    `json:"with,omitempty"`
 	RetryLimit        int               `json:"retryLimit"`
@@ -311,7 +312,7 @@ func (c *Compiler) Compile(input resource.Flow) (ExecutionPlan, []Diagnostic) {
 		if name == "" {
 			name = node.ID
 		}
-		planNode := PlanNode{ID: node.ID, Name: name, Uses: node.Uses, With: node.With, RetryLimit: retryLimit, RetryBackoff: retryBackoff, Timeout: nodeTimeout.String(), LoopMaxIterations: loopMax}
+		planNode := PlanNode{ID: node.ID, Name: name, Namespace: input.Metadata.Namespace, Uses: node.Uses, With: node.With, RetryLimit: retryLimit, RetryBackoff: retryBackoff, Timeout: nodeTimeout.String(), LoopMaxIterations: loopMax}
 		if binding != nil {
 			planNode.With = binding.Config
 			planNode.Plugin = &binding.Plugin

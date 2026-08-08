@@ -4,12 +4,14 @@ package references
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/alexrett/orchigram/internal/flow"
 	"github.com/alexrett/orchigram/internal/resource"
+	"github.com/alexrett/orchigram/internal/store"
 )
 
 // Lookup returns one canonical desired resource.
@@ -55,7 +57,7 @@ func (r *Resolver) Diagnostics(ctx context.Context, document resource.Document) 
 	case "Trigger":
 		trigger, err := resource.DecodeTrigger(document.JSON)
 		if err != nil {
-			return []flow.Diagnostic{{Path: "spec", Code: "invalid", Message: "stored Trigger cannot be decoded"}}
+			return []flow.Diagnostic{{Path: "spec", Code: "invalid", Message: "Trigger cannot be decoded"}}
 		}
 		diagnostics = append(diagnostics, r.require(ctx, namespace, "Flow", trigger.Spec.Flow, "spec.flow")...)
 		if trigger.Spec.Webhook != nil {
@@ -74,7 +76,7 @@ func (r *Resolver) Diagnostics(ctx context.Context, document resource.Document) 
 	case "Repository":
 		repository, err := resource.DecodeRepository(document.JSON)
 		if err != nil {
-			return []flow.Diagnostic{{Path: "spec", Code: "invalid", Message: "stored Repository cannot be decoded"}}
+			return []flow.Diagnostic{{Path: "spec", Code: "invalid", Message: "Repository cannot be decoded"}}
 		}
 		if repository.Spec.AuthSecretRef != "" {
 			diagnostics = append(diagnostics, r.require(ctx, namespace, "SecretRef", repository.Spec.AuthSecretRef, "spec.authSecretRef")...)
@@ -82,7 +84,7 @@ func (r *Resolver) Diagnostics(ctx context.Context, document resource.Document) 
 	case "AgentProfile":
 		profile, err := resource.DecodeAgentProfile(document.JSON)
 		if err != nil {
-			return []flow.Diagnostic{{Path: "spec", Code: "invalid", Message: "stored AgentProfile cannot be decoded"}}
+			return []flow.Diagnostic{{Path: "spec", Code: "invalid", Message: "AgentProfile cannot be decoded"}}
 		}
 		for index, binding := range profile.Spec.SecretRefs {
 			name := secretName(binding)
@@ -110,8 +112,10 @@ func (r *Resolver) require(ctx context.Context, namespace, kind, name, path stri
 	if r.resources == nil {
 		return []flow.Diagnostic{{Path: path, Code: "reference_unavailable", Message: "resource reference validation is unavailable"}}
 	}
-	if _, err := r.resources.Get(ctx, kind, namespace, name); err != nil {
+	if _, err := r.resources.Get(ctx, kind, namespace, name); errors.Is(err, store.ErrNotFound) {
 		return []flow.Diagnostic{{Path: path, Code: "reference_not_found", Message: fmt.Sprintf("%s %q is not available in namespace %q", kind, name, namespace)}}
+	} else if err != nil {
+		return []flow.Diagnostic{{Path: path, Code: "reference_unavailable", Message: kind + " reference state is temporarily unavailable"}}
 	}
 	return nil
 }

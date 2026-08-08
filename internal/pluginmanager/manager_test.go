@@ -128,7 +128,7 @@ spec:
   secretRefs: ["API_TOKEN=agent-token"]
 `)
 		agentOutput, executeErr := manager.Execute(context.Background(), "run-agent-"+profileType, flow.PlanNode{
-			ID: "agent", Uses: "agent-command.run", Timeout: "10s", With: map[string]any{"profile": "fake-" + profileType},
+			ID: "agent", Namespace: resource.DefaultNamespace, Uses: "agent-command.run", Timeout: "10s", With: map[string]any{"profile": "fake-" + profileType},
 		}, json.RawMessage(`{"prompt":"conformance"}`), nil, "stable-agent-"+profileType)
 		if executeErr != nil {
 			t.Fatalf("%s profile: %v", profileType, executeErr)
@@ -150,7 +150,7 @@ spec:
   args: ["-c", "echo expected-agent-failure >&2; exit 17"]
 `)
 	_, failureErr := manager.Execute(context.Background(), "run-agent-failure", flow.PlanNode{
-		ID: "agent", Uses: "agent-command.run", Timeout: "10s", With: map[string]any{"profile": "fake-failure"},
+		ID: "agent", Namespace: resource.DefaultNamespace, Uses: "agent-command.run", Timeout: "10s", With: map[string]any{"profile": "fake-failure"},
 	}, json.RawMessage(`{"prompt":"conformance"}`), nil, "stable-agent-failure")
 	if failureErr == nil || !strings.Contains(failureErr.Error(), "process exited with status 17") || strings.Contains(failureErr.Error(), "did not end immediately") {
 		t.Fatalf("agent failure diagnostic=%v", failureErr)
@@ -184,7 +184,7 @@ metadata: {name: webhook-url}
 spec: {backend: env, key: ORCHIGRAM_TEST_WEBHOOK_URL}
 `)
 	if _, err := manager.Execute(context.Background(), "run-mapping", flow.PlanNode{
-		ID: "notify", Uses: "http.request", Timeout: "10s",
+		ID: "notify", Namespace: resource.DefaultNamespace, Uses: "http.request", Timeout: "10s",
 		With: map[string]any{
 			"urlSecret": "endpoint", "secretRefs": map[string]any{"endpoint": "webhook-url"},
 			"body":     map[string]any{"type": "message", "text": "placeholder"},
@@ -277,7 +277,7 @@ spec: {backend: env, key: ORCHIGRAM_TEST_GITHUB_PROVIDER_TOKEN}
 	case <-time.After(5 * time.Second):
 		t.Fatal("GitHub provider stream did not stop")
 	}
-	githubCommentNode := flow.PlanNode{ID: "publish", Uses: "github.issue.comment", Timeout: "10s", With: map[string]any{
+	githubCommentNode := flow.PlanNode{ID: "publish", Namespace: resource.DefaultNamespace, Uses: "github.issue.comment", Timeout: "10s", With: map[string]any{
 		"owner": "acme", "repository": "widget", "apiBase": providerServer.URL, "tokenSecret": "token", "number": 42, "body": "Reconciled plan",
 		"secretRefs": map[string]any{"token": "github-provider-token"},
 	}}
@@ -355,6 +355,38 @@ func TestProviderEventContractRejectsMalformedPayloadBeforeAcceptance(t *testing
 	valid := []byte(`{"repository":{"owner":"acme","name":"widget"},"issue":{"number":42,"title":"title","body":"body","html_url":"https://example.invalid/42","state":"open"}}`)
 	if validation := validateTriggerContractJSON(catalog.Triggers[0].EventSchema, "event", valid); validation != nil {
 		t.Fatalf("valid event validation=%+v", validation)
+	}
+}
+
+func TestLegacyResourceFallbackRequiresExplicitNamespace(t *testing.T) {
+	ctx := context.Background()
+	state, err := store.Open(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	manager := New(state, t.TempDir())
+	t.Setenv("ORCHIGRAM_TEAM_TOKEN", "team-value")
+	applyResource(t, state, `apiVersion: orchigram.dev/v1alpha1
+kind: SecretRef
+metadata: {name: token, namespace: team-a}
+spec: {backend: env, key: ORCHIGRAM_TEAM_TOKEN}
+`)
+	applyResource(t, state, `apiVersion: orchigram.dev/v1alpha1
+kind: AgentProfile
+metadata: {name: worker, namespace: team-a}
+spec: {type: command, executable: fake-agent, secretRefs: [TOKEN=token]}
+`)
+	if _, err := manager.resolveBoundSecret(ctx, "", "token", nil); err == nil || !strings.Contains(err.Error(), "does not pin a resource namespace") {
+		t.Fatalf("namespace-less SecretRef fallback error=%v", err)
+	}
+	secret, err := manager.resolveBoundSecret(ctx, "team-a", "token", nil)
+	if err != nil || string(secret) != "team-value" {
+		t.Fatalf("team SecretRef=%q err=%v", secret, err)
+	}
+	profile, err := manager.boundAgentProfile(ctx, "team-a", nil, "worker")
+	if err != nil || profile.Executable != "fake-agent" {
+		t.Fatalf("team AgentProfile=%+v err=%v", profile, err)
 	}
 }
 
@@ -446,7 +478,7 @@ spec:
 		t.Fatalf("plan=%+v diagnostics=%+v", plan, diagnostics)
 	}
 	node := plan.Nodes[0]
-	if node.Plugin == nil || node.Plugin.Version != record.Version || node.Plugin.Digest != record.Digest || node.Contract == nil || node.Contract.Digest != record.ContractDigest || len(node.Contract.ConfigSchema) == 0 || len(node.Contract.OutputSchema) == 0 || len(node.Resources) != 2 {
+	if node.Namespace != resource.DefaultNamespace || node.Plugin == nil || node.Plugin.Version != record.Version || node.Plugin.Digest != record.Digest || node.Contract == nil || node.Contract.Digest != record.ContractDigest || len(node.Contract.ConfigSchema) == 0 || len(node.Contract.OutputSchema) == 0 || len(node.Resources) != 2 {
 		t.Fatalf("compiled binding=%+v contract=%+v resources=%+v", node.Plugin, node.Contract, node.Resources)
 	}
 	if encoded, marshalErr := json.Marshal(plan); marshalErr != nil || strings.Contains(string(encoded), "runtime-only-test-value") {

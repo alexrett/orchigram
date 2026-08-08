@@ -30,6 +30,11 @@ webhook, or provider watch resolves the value immediately before use in the
 same namespace. The value is never placed in a diagnostic, status, plan, event,
 or debug representation.
 
+Every newly compiled plan pins its resource namespace on each node. A legacy
+prototype plan that lacks both a pinned resource binding and a namespace fails
+closed; the runtime never guesses `default` for an ambiguous profile,
+repository, or secret.
+
 Provider config contains the host-only `secretRefs` map. The daemon validates
 those references, removes the map, and then validates the remaining config
 against the immutable provider schema. Every emitted provider payload is

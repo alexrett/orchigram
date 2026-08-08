@@ -365,8 +365,10 @@ func (m *Manager) ValidateTriggerProvider(ctx context.Context, namespace, plugin
 		return []flow.Diagnostic{{Path: "config.secretRefs", Code: "invalid", Message: err.Error()}}
 	}
 	for _, secretName := range secretNames {
-		if _, getErr := m.store.Get(ctx, "SecretRef", namespace, secretName); getErr != nil {
+		if _, getErr := m.store.Get(ctx, "SecretRef", namespace, secretName); errors.Is(getErr, store.ErrNotFound) {
 			return []flow.Diagnostic{{Path: "config.secretRefs", Code: "reference_not_found", Message: fmt.Sprintf("SecretRef %q is not available in namespace %q", secretName, normalizedNamespace(namespace))}}
+		} else if getErr != nil {
+			return []flow.Diagnostic{{Path: "config.secretRefs", Code: "reference_unavailable", Message: "SecretRef state is temporarily unavailable"}}
 		}
 	}
 	delete(configCopy, "secretRefs")
@@ -686,7 +688,7 @@ func (m *Manager) Doctor(ctx context.Context, name, version string) error {
 		return fmt.Errorf("plugin is not ready: %s", health.GetMessage())
 	}
 	if name == "agent-command" {
-		profiles, _, err := m.store.List(ctx, "AgentProfile", resource.DefaultNamespace, 1000)
+		profiles, _, err := m.store.List(ctx, "AgentProfile", "", 1000)
 		if err != nil {
 			return err
 		}
@@ -695,7 +697,7 @@ func (m *Manager) Doctor(ctx context.Context, name, version string) error {
 			if err != nil {
 				return err
 			}
-			secrets, err := m.resolveProfileSecrets(ctx, profile.Spec.SecretRefs)
+			secrets, err := m.resolveProfileSecrets(ctx, profile.Metadata.Namespace, profile.Spec.SecretRefs)
 			if err != nil {
 				return fmt.Errorf("agent profile %s: %w", profile.Metadata.Name, err)
 			}
@@ -853,7 +855,7 @@ func (m *Manager) executeTask(ctx context.Context, process *pluginhost.Process, 
 	}
 	if node.Uses == "github.workspace.checkout" {
 		if _, legacy := config["repositoryRef"]; legacy {
-			if err := m.expandRepositoryConfig(ctx, config); err != nil {
+			if err := m.expandRepositoryConfig(ctx, node.Namespace, config); err != nil {
 				return nil, err
 			}
 		}
@@ -861,7 +863,7 @@ func (m *Manager) executeTask(ctx context.Context, process *pluginhost.Process, 
 	if strings.HasPrefix(node.Uses, "github.workspace.") {
 		config["workspaceRoot"] = m.workspaces
 	}
-	secrets, err := m.resolveNodeSecrets(ctx, config, node.Resources)
+	secrets, err := m.resolveNodeSecretsInNamespace(ctx, node.Namespace, config, node.Resources)
 	if err != nil {
 		return nil, err
 	}
@@ -889,12 +891,15 @@ func (m *Manager) executeTask(ctx context.Context, process *pluginhost.Process, 
 	return output, nil
 }
 
-func (m *Manager) expandRepositoryConfig(ctx context.Context, config map[string]any) error {
+func (m *Manager) expandRepositoryConfig(ctx context.Context, namespace string, config map[string]any) error {
+	if namespace == "" {
+		return errors.New("legacy plan does not pin a resource namespace")
+	}
 	name, _ := config["repositoryRef"].(string)
 	if name == "" {
 		return errors.New("repositoryRef is required")
 	}
-	document, err := m.store.Get(ctx, "Repository", resource.DefaultNamespace, name)
+	document, err := m.store.Get(ctx, "Repository", namespace, name)
 	if err != nil {
 		return fmt.Errorf("resolve Repository %q: %w", name, err)
 	}
@@ -930,11 +935,11 @@ func (m *Manager) executeAgent(ctx context.Context, process *pluginhost.Process,
 	if profileName == "" {
 		return nil, errors.New("agent-command node requires with.profile")
 	}
-	profileSpec, err := m.boundAgentProfile(ctx, node.Resources, profileName)
+	profileSpec, err := m.boundAgentProfile(ctx, node.Namespace, node.Resources, profileName)
 	if err != nil {
 		return nil, err
 	}
-	secrets, err := m.resolveProfileSecrets(ctx, profileSpec.SecretRefs, node.Resources)
+	secrets, err := m.resolveProfileSecrets(ctx, node.Namespace, profileSpec.SecretRefs, node.Resources)
 	if err != nil {
 		return nil, err
 	}
@@ -1241,10 +1246,6 @@ func (m *Manager) launch(ctx context.Context, record store.PluginRecord) (*plugi
 	return process, nil
 }
 
-func (m *Manager) resolveNodeSecrets(ctx context.Context, config map[string]any, bindingSets ...[]flow.ResourceBinding) (map[string][]byte, error) {
-	return m.resolveNodeSecretsInNamespace(ctx, resource.DefaultNamespace, config, bindingSets...)
-}
-
 func (m *Manager) resolveNodeSecretsInNamespace(ctx context.Context, namespace string, config map[string]any, bindingSets ...[]flow.ResourceBinding) (map[string][]byte, error) {
 	value, exists := config["secretRefs"]
 	if !exists {
@@ -1265,8 +1266,11 @@ func (m *Manager) resolveNodeSecretsInNamespace(ctx context.Context, namespace s
 		var secret []byte
 		var err error
 		if len(bindings) > 0 {
-			secret, err = m.resolveBoundSecret(ctx, name, bindings)
+			secret, err = m.resolveBoundSecret(ctx, namespace, name, bindings)
 		} else {
+			if namespace == "" {
+				return nil, errors.New("legacy plan does not pin a resource namespace")
+			}
 			secret, err = m.resolveSecret(ctx, namespace, name)
 		}
 		if err != nil {
@@ -1459,14 +1463,14 @@ func setPointerValue(current any, tokens []string, value any) (any, error) {
 	}
 }
 
-func (m *Manager) resolveProfileSecrets(ctx context.Context, references []string, bindingSets ...[]flow.ResourceBinding) (map[string][]byte, error) {
+func (m *Manager) resolveProfileSecrets(ctx context.Context, namespace string, references []string, bindingSets ...[]flow.ResourceBinding) (map[string][]byte, error) {
 	result := make(map[string][]byte, len(references))
 	for _, binding := range references {
 		target, name := splitSecretBinding(binding)
 		if target == "" {
 			target = secretEnvironmentName(name)
 		}
-		secret, err := m.resolveBoundSecret(ctx, name, firstBindings(bindingSets))
+		secret, err := m.resolveBoundSecret(ctx, namespace, name, firstBindings(bindingSets))
 		if err != nil {
 			return nil, err
 		}
@@ -1482,7 +1486,7 @@ func firstBindings(bindingSets [][]flow.ResourceBinding) []flow.ResourceBinding 
 	return bindingSets[0]
 }
 
-func (m *Manager) boundAgentProfile(ctx context.Context, bindings []flow.ResourceBinding, name string) (resource.AgentProfileSpec, error) {
+func (m *Manager) boundAgentProfile(ctx context.Context, namespace string, bindings []flow.ResourceBinding, name string) (resource.AgentProfileSpec, error) {
 	for _, binding := range bindings {
 		if binding.Kind == "AgentProfile" && binding.Name == name {
 			var spec resource.AgentProfileSpec
@@ -1492,8 +1496,14 @@ func (m *Manager) boundAgentProfile(ctx context.Context, bindings []flow.Resourc
 			return spec, nil
 		}
 	}
+	if len(bindings) > 0 {
+		return resource.AgentProfileSpec{}, fmt.Errorf("pinned AgentProfile %q is missing from the execution plan", name)
+	}
+	if namespace == "" {
+		return resource.AgentProfileSpec{}, errors.New("legacy plan does not pin a resource namespace")
+	}
 	// Compatibility for prototype plans compiled before resource binding.
-	document, err := m.store.Get(ctx, "AgentProfile", resource.DefaultNamespace, name)
+	document, err := m.store.Get(ctx, "AgentProfile", namespace, name)
 	if err != nil {
 		return resource.AgentProfileSpec{}, err
 	}
@@ -1504,7 +1514,7 @@ func (m *Manager) boundAgentProfile(ctx context.Context, bindings []flow.Resourc
 	return profile.Spec, nil
 }
 
-func (m *Manager) resolveBoundSecret(ctx context.Context, name string, bindings []flow.ResourceBinding) ([]byte, error) {
+func (m *Manager) resolveBoundSecret(ctx context.Context, namespace, name string, bindings []flow.ResourceBinding) ([]byte, error) {
 	for _, binding := range bindings {
 		if binding.Kind != "SecretRef" || binding.Name != name {
 			continue
@@ -1515,8 +1525,14 @@ func (m *Manager) resolveBoundSecret(ctx context.Context, name string, bindings 
 		}
 		return resolveSecretSpec(name, spec)
 	}
+	if len(bindings) > 0 {
+		return nil, fmt.Errorf("pinned SecretRef %q is missing from the execution plan", name)
+	}
+	if namespace == "" {
+		return nil, errors.New("legacy plan does not pin a resource namespace")
+	}
 	// Compatibility for prototype plans and controller-owned secret resolution.
-	return m.resolveSecret(ctx, resource.DefaultNamespace, name)
+	return m.resolveSecret(ctx, namespace, name)
 }
 
 func (m *Manager) resolveSecret(ctx context.Context, namespace, name string) ([]byte, error) {

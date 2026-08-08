@@ -3,6 +3,7 @@ package references
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/alexrett/orchigram/internal/flow"
@@ -22,6 +23,12 @@ func (f fixtureLookup) Get(_ context.Context, kind, namespace, name string) (res
 type fixtureProvider struct {
 	namespace   string
 	diagnostics []flow.Diagnostic
+}
+
+type failingLookup struct{}
+
+func (failingLookup) Get(context.Context, string, string, string) (resource.Document, error) {
+	return resource.Document{}, errors.New("storage offline")
 }
 
 func (f *fixtureProvider) ValidateTriggerProvider(_ context.Context, namespace, _ string, _ map[string]any) []flow.Diagnostic {
@@ -95,6 +102,19 @@ spec: {backend: env, key: ORCHIGRAM_TEST_TOKEN}
 	condition := conditions[0].(map[string]any)
 	if condition["status"] != "False" || condition["reason"] != "MissingReference" {
 		t.Fatalf("status=%+v", status)
+	}
+}
+
+func TestResolverDoesNotMisreportOperationalFailureAsMissing(t *testing.T) {
+	t.Parallel()
+	profile := decodeReferenceDocument(t, `apiVersion: orchigram.dev/v1alpha1
+kind: AgentProfile
+metadata: {name: worker}
+spec: {type: command, executable: fake-agent, secretRefs: [token]}
+`)
+	diagnostics := New(failingLookup{}, nil).Diagnostics(context.Background(), profile)
+	if len(diagnostics) != 1 || diagnostics[0].Code != "reference_unavailable" || diagnostics[0].Message != "SecretRef reference state is temporarily unavailable" {
+		t.Fatalf("diagnostics=%+v", diagnostics)
 	}
 }
 
