@@ -81,3 +81,21 @@ func TestMinimalEnvironmentDoesNotInheritHost(t *testing.T) {
 		t.Fatalf("unexpected environment: %s", text)
 	}
 }
+
+func TestRunnerCapturesShortLivedOutput(t *testing.T) {
+	t.Parallel()
+	runner := NewRunner()
+	for attempt := range 100 {
+		result, err := runner.Run(context.Background(), "short-"+strconv.Itoa(attempt), Spec{
+			Executable:  "/bin/sh",
+			Args:        []string{"-c", "printf stdout; printf stderr >&2"},
+			Environment: []string{"PATH=/usr/bin:/bin"},
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(result.Stdout) != "stdout" || string(result.Stderr) != "stderr" {
+			t.Fatalf("attempt %d: stdout=%q stderr=%q", attempt, result.Stdout, result.Stderr)
+		}
+	}
+}

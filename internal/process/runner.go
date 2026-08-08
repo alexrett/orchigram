@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os/exec"
 	"strings"
 	"sync"
@@ -85,15 +84,27 @@ func (r *Runner) Run(ctx context.Context, requestID string, spec Spec, emit func
 	command.Env = append([]string(nil), spec.Environment...)
 	command.Stdin = bytes.NewReader(spec.Stdin)
 	configureProcessGroup(command)
-	stdout, err := command.StdoutPipe()
-	if err != nil {
-		return Result{}, err
-	}
-	stderr, err := command.StderrPipe()
-	if err != nil {
-		return Result{}, err
-	}
+	var stdoutCapture, stderrCapture limitedBuffer
+	stdoutCapture.limit, stderrCapture.limit = spec.CaptureLimit, spec.CaptureLimit
 	entry := &activeProcess{command: command, done: make(chan struct{}), wait: spec.TerminateWait}
+	var outputError error
+	var outputMu sync.Mutex
+	emitChunk := func(stream string, capture *limitedBuffer, data []byte) {
+		outputMu.Lock()
+		defer outputMu.Unlock()
+		_, _ = capture.Write(data)
+		if emit != nil && outputError == nil {
+			outputError = emit(Output{Stream: stream, Data: append([]byte(nil), data...)})
+			if outputError != nil {
+				go entry.terminate("stream-error")
+			}
+		}
+	}
+	// Let os/exec own the copy goroutines by supplying writers instead of
+	// StdoutPipe/StderrPipe. Cmd.Wait then cannot close a pipe before our reader
+	// has captured the final short-lived process output.
+	command.Stdout = outputWriter(func(data []byte) { emitChunk("stdout", &stdoutCapture, data) })
+	command.Stderr = outputWriter(func(data []byte) { emitChunk("stderr", &stderrCapture, data) })
 	r.mu.Lock()
 	if _, exists := r.active[requestID]; exists {
 		r.mu.Unlock()
@@ -111,26 +122,6 @@ func (r *Runner) Run(ctx context.Context, requestID string, spec Spec, emit func
 		return Result{}, fmt.Errorf("start %s: %w", spec.Executable, err)
 	}
 
-	var stdoutCapture, stderrCapture limitedBuffer
-	stdoutCapture.limit, stderrCapture.limit = spec.CaptureLimit, spec.CaptureLimit
-	var outputError error
-	var outputMu sync.Mutex
-	emitChunk := func(stream string, capture *limitedBuffer, data []byte) {
-		outputMu.Lock()
-		defer outputMu.Unlock()
-		_, _ = capture.Write(data)
-		if emit != nil && outputError == nil {
-			outputError = emit(Output{Stream: stream, Data: append([]byte(nil), data...)})
-			if outputError != nil {
-				go entry.terminate("stream-error")
-			}
-		}
-	}
-	var copies sync.WaitGroup
-	copies.Add(2)
-	go copyOutput(stdout, func(data []byte) { emitChunk("stdout", &stdoutCapture, data) }, &copies)
-	go copyOutput(stderr, func(data []byte) { emitChunk("stderr", &stderrCapture, data) }, &copies)
-
 	waitResult := make(chan error, 1)
 	go func() {
 		waitResult <- command.Wait()
@@ -142,7 +133,6 @@ func (r *Runner) Run(ctx context.Context, requestID string, spec Spec, emit func
 	case <-entry.done:
 	}
 	waitErr := <-waitResult
-	copies.Wait()
 	entry.mu.RLock()
 	outcome := entry.outcome
 	entry.mu.RUnlock()
@@ -196,18 +186,11 @@ func (p *activeProcess) terminate(reason string) {
 	})
 }
 
-func copyOutput(reader io.Reader, emit func([]byte), wait *sync.WaitGroup) {
-	defer wait.Done()
-	buffer := make([]byte, 32<<10)
-	for {
-		count, err := reader.Read(buffer)
-		if count > 0 {
-			emit(buffer[:count])
-		}
-		if err != nil {
-			return
-		}
-	}
+type outputWriter func([]byte)
+
+func (writer outputWriter) Write(data []byte) (int, error) {
+	writer(data)
+	return len(data), nil
 }
 
 type limitedBuffer struct {
