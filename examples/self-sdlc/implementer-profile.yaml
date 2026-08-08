@@ -1,0 +1,9 @@
+apiVersion: orchigram.dev/v1alpha1
+kind: AgentProfile
+metadata:
+  name: self-sdlc-implementer
+spec:
+  type: codex
+  executable: codex
+  effort: high
+  sandbox: workspace-write

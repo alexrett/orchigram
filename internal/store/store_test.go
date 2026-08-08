@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alexrett/orchigram/internal/flow"
 	"github.com/alexrett/orchigram/internal/resource"
 )
 
@@ -19,6 +20,81 @@ func openTestStore(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	return s
+}
+
+func TestTerminalRunTransitionsAreImmutable(t *testing.T) {
+	t.Parallel()
+	for _, terminal := range []string{"succeeded", "failed", "rejected", "cancelled"} {
+		t.Run(terminal, func(t *testing.T) {
+			ctx := context.Background()
+			s := openTestStore(t)
+			plan := flow.ExecutionPlan{FlowUID: "flow-" + terminal, FlowGeneration: 1, PlanHash: "plan-" + terminal, InterpreterVersion: flow.InterpreterVersion}
+			runUID := "run-" + terminal
+			if _, err := s.EnsureRun(ctx, StartPayload{RunUID: runUID, Input: json.RawMessage(`{}`)}, plan); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.AppendRunEvent(ctx, runUID, "", "run."+terminal, terminal, 0, nil); err != nil {
+				t.Fatal(err)
+			}
+			before, err := s.RunEventsAfter(ctx, runUID, 0, 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, late := range []struct{ event, phase string }{{"node.completed", "running"}, {"run.failed", "failed"}, {"approval.waiting", "waiting"}, {"run.succeeded", "succeeded"}} {
+				if err := s.AppendRunEvent(ctx, runUID, "node", late.event, late.phase, 1, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			run, err := s.GetRun(ctx, runUID)
+			if err != nil || run.Phase != terminal {
+				t.Fatalf("run=%+v err=%v", run, err)
+			}
+			after, err := s.RunEventsAfter(ctx, runUID, 0, 100)
+			if err != nil || len(after) != len(before) {
+				t.Fatalf("late events were appended: before=%d after=%d err=%v", len(before), len(after), err)
+			}
+		})
+	}
+}
+
+func TestRunCancellationIntentAndDeliveryAreDurableAndIdempotent(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openTestStore(t)
+	plan := flow.ExecutionPlan{FlowUID: "flow-cancel", FlowGeneration: 1, PlanHash: "plan-cancel", InterpreterVersion: flow.InterpreterVersion}
+	if _, err := s.EnsureRun(ctx, StartPayload{RunUID: "run-cancel", Input: json.RawMessage(`{}`)}, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RequestRunCancellation(ctx, "run-cancel", "first reason"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RequestRunCancellation(ctx, "run-cancel", "later reason"); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := s.UndeliveredRunCancellations(ctx, 100)
+	if err != nil || len(pending) != 1 || pending[0].Reason != "first reason" {
+		t.Fatalf("pending=%+v err=%v", pending, err)
+	}
+	events, err := s.RunEventsAfter(ctx, "run-cancel", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancellations := 0
+	for _, event := range events {
+		if event.Type == "run.cancelled" {
+			cancellations++
+		}
+	}
+	if cancellations != 1 {
+		t.Fatalf("cancellation events=%d", cancellations)
+	}
+	if err := s.MarkRunCancellationDelivered(ctx, "run-cancel"); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = s.UndeliveredRunCancellations(ctx, 100)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("delivered cancellation remained pending: %+v err=%v", pending, err)
+	}
 }
 
 func testFlowDocument(t *testing.T) resource.Document {

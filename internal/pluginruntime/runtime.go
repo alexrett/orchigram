@@ -19,6 +19,7 @@ import (
 	pluginv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/plugin/v1alpha1"
 	"github.com/alexrett/orchigram/internal/process"
 	"github.com/alexrett/orchigram/internal/resource"
+	pluginsdk "github.com/alexrett/orchigram/sdk/plugin"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -26,42 +27,6 @@ import (
 )
 
 const maxHTTPResponse = 1 << 20
-
-// Info is immutable plugin identity returned during protocol negotiation.
-type Info struct {
-	Name         string
-	Version      string
-	Capabilities []string
-}
-
-// Control implements the lifecycle service shared by all first-party plugins.
-type Control struct {
-	pluginv1alpha1.UnimplementedPluginControlServer
-	Info Info
-}
-
-// Describe negotiates the protobuf business protocol and reports capabilities.
-func (c *Control) Describe(_ context.Context, request *pluginv1alpha1.DescribeRequest) (*pluginv1alpha1.DescribeResponse, error) {
-	host := request.GetHostProtocol()
-	if host != nil && (host.GetMaximum() < 1 || host.GetMinimum() > 1) {
-		return nil, status.Error(codes.FailedPrecondition, "plugin protocol ranges do not overlap")
-	}
-	return &pluginv1alpha1.DescribeResponse{
-		Name: c.Info.Name, Version: c.Info.Version,
-		Protocol:     &pluginv1alpha1.ProtocolRange{Minimum: 1, Maximum: 1},
-		Capabilities: append([]string(nil), c.Info.Capabilities...),
-	}, nil
-}
-
-// Health reports process readiness without inspecting secret values.
-func (*Control) Health(context.Context, *emptypb.Empty) (*pluginv1alpha1.HealthResponse, error) {
-	return &pluginv1alpha1.HealthResponse{Ready: true, Message: "ready"}, nil
-}
-
-// Shutdown acknowledges the lifecycle request; go-plugin closes the process transport.
-func (*Control) Shutdown(context.Context, *pluginv1alpha1.ShutdownRequest) (*emptypb.Empty, error) {
-	return &emptypb.Empty{}, nil
-}
 
 type executeStream interface {
 	Send(*pluginv1alpha1.ExecuteEvent) error
@@ -93,7 +58,6 @@ func (w *eventWriter) send(eventType string, payload any, raw []byte) error {
 
 // Exec implements deterministic argv task execution.
 type Exec struct {
-	pluginv1alpha1.UnimplementedTaskProviderServer
 	Runner *process.Runner
 }
 
@@ -105,66 +69,52 @@ type execConfig struct {
 }
 
 // ValidateAction validates exec.run without invoking it.
-func (*Exec) ValidateAction(_ context.Context, request *pluginv1alpha1.ValidateActionRequest) (*pluginv1alpha1.ValidateActionResponse, error) {
-	issues := []*pluginv1alpha1.ValidationIssue{}
-	if request.GetAction() != "exec.run" {
-		issues = append(issues, issue("action", "unsupported", "expected exec.run"))
+func (*Exec) ValidateAction(_ context.Context, action string, configJSON json.RawMessage) []pluginsdk.ValidationIssue {
+	issues := []pluginsdk.ValidationIssue{}
+	if action != "exec.run" {
+		issues = append(issues, sdkIssue("action", "unsupported", "expected exec.run"))
 	}
 	var config execConfig
-	if err := decodeStrictJSON(request.GetConfigJson(), &config); err != nil {
-		issues = append(issues, issue("config", "invalid", err.Error()))
+	if err := decodeStrictJSON(configJSON, &config); err != nil {
+		issues = append(issues, sdkIssue("config", "invalid", err.Error()))
 	} else if len(config.Argv) == 0 || config.Argv[0] == "" {
-		issues = append(issues, issue("config.argv", "required", "argv must contain an executable"))
+		issues = append(issues, sdkIssue("config.argv", "required", "argv must contain an executable"))
 	}
-	return &pluginv1alpha1.ValidateActionResponse{Issues: issues}, nil
+	return issues
 }
 
-// Execute streams raw logs and one stable completion event.
-func (e *Exec) Execute(request *pluginv1alpha1.ExecuteRequest, stream pluginv1alpha1.TaskProvider_ExecuteServer) error {
+// Execute streams non-terminal raw logs and returns the completion payload.
+func (e *Exec) Execute(ctx context.Context, request pluginsdk.TaskRequest, sink pluginsdk.EventSink) (any, error) {
 	if e.Runner == nil {
 		e.Runner = process.NewRunner()
 	}
-	if err := validateMeta(request.GetMeta()); err != nil {
-		return err
-	}
-	if request.GetAction() != "exec.run" {
-		return status.Error(codes.InvalidArgument, "expected action exec.run")
+	if request.Action != "exec.run" {
+		return nil, errors.New("expected action exec.run")
 	}
 	var config execConfig
-	if err := decodeStrictJSON(request.GetConfigJson(), &config); err != nil {
-		return status.Error(codes.InvalidArgument, err.Error())
+	if err := decodeStrictJSON(request.Config, &config); err != nil {
+		return nil, err
 	}
 	if len(config.Argv) == 0 || config.Argv[0] == "" {
-		return status.Error(codes.InvalidArgument, "config.argv must contain an executable")
+		return nil, errors.New("config.argv must contain an executable")
 	}
-	writer := &eventWriter{stream: stream}
-	if err := writer.send("task.started", map[string]any{"executable": filepath.Base(config.Argv[0])}, nil); err != nil {
-		return err
+	if err := sink.Emit("task.started", map[string]any{"executable": filepath.Base(config.Argv[0])}); err != nil {
+		return nil, err
 	}
 	environment := process.MinimalEnvironment(baseEnvironment(), config.Environment)
-	result, err := e.Runner.Run(stream.Context(), request.GetMeta().GetRequestId(), process.Spec{
+	result, err := e.Runner.Run(ctx, request.RequestID, process.Spec{
 		Executable: config.Argv[0], Args: config.Argv[1:], Directory: config.Directory,
 		Environment: environment, Stdin: []byte(config.Stdin),
 	}, func(output process.Output) error {
-		return writer.send("task.log", map[string]string{"stream": output.Stream}, output.Data)
+		return sink.Log("task.log."+output.Stream, output.Data)
 	})
 	if err != nil {
-		_ = writer.send("task.failed", map[string]any{"exitCode": result.ExitCode, "outcome": result.Outcome}, nil)
-		return status.Errorf(codes.Internal, "%v (outcome=%s, exit=%d)", err, result.Outcome, result.ExitCode)
+		return nil, fmt.Errorf("%w (outcome=%s, exit=%d)", err, result.Outcome, result.ExitCode)
 	}
-	return writer.send("task.completed", map[string]any{
+	return map[string]any{
 		"exitCode": result.ExitCode, "outcome": result.Outcome,
 		"stdout": string(result.Stdout), "stderr": string(result.Stderr),
-	}, nil)
-}
-
-// Cancel terminates the complete process group for the request identity.
-func (e *Exec) Cancel(_ context.Context, request *pluginv1alpha1.CancelRequest) (*pluginv1alpha1.CancelResponse, error) {
-	if e.Runner == nil {
-		return &pluginv1alpha1.CancelResponse{Accepted: false, Outcome: "not-running"}, nil
-	}
-	outcome, accepted := e.Runner.Cancel(request.GetMeta().GetRequestId())
-	return &pluginv1alpha1.CancelResponse{Accepted: accepted, Outcome: outcome}, nil
+	}, nil
 }
 
 // Agent executes Codex, Claude, or a static custom argv profile.
@@ -280,7 +230,6 @@ func (a *Agent) Cancel(_ context.Context, request *pluginv1alpha1.CancelRequest)
 
 // HTTP implements generic idempotent outbound requests.
 type HTTP struct {
-	pluginv1alpha1.UnimplementedTaskProviderServer
 	Client *http.Client
 	Action string
 }
@@ -295,50 +244,47 @@ type httpConfig struct {
 }
 
 // ValidateAction validates an http.request definition.
-func (h *HTTP) ValidateAction(_ context.Context, request *pluginv1alpha1.ValidateActionRequest) (*pluginv1alpha1.ValidateActionResponse, error) {
-	issues := []*pluginv1alpha1.ValidationIssue{}
+func (h *HTTP) ValidateAction(_ context.Context, action string, configJSON json.RawMessage) []pluginsdk.ValidationIssue {
+	issues := []pluginsdk.ValidationIssue{}
 	expected := h.expectedAction()
-	if request.GetAction() != expected {
-		issues = append(issues, issue("action", "unsupported", "expected "+expected))
+	if action != expected {
+		issues = append(issues, sdkIssue("action", "unsupported", "expected "+expected))
 	}
 	var config httpConfig
-	if err := decodeStrictJSON(request.GetConfigJson(), &config); err != nil {
-		issues = append(issues, issue("config", "invalid", err.Error()))
+	if err := decodeStrictJSON(configJSON, &config); err != nil {
+		issues = append(issues, sdkIssue("config", "invalid", err.Error()))
 	} else {
 		switch {
 		case config.URL == "" && config.URLSecret == "":
-			issues = append(issues, issue("config.url", "required", "url or urlSecret is required"))
+			issues = append(issues, sdkIssue("config.url", "required", "url or urlSecret is required"))
 		case config.URL != "" && config.URLSecret != "":
-			issues = append(issues, issue("config.urlSecret", "conflict", "url and urlSecret are mutually exclusive"))
+			issues = append(issues, sdkIssue("config.urlSecret", "conflict", "url and urlSecret are mutually exclusive"))
 		case config.URL != "" && !strings.HasPrefix(config.URL, "https://") && !strings.HasPrefix(config.URL, "http://"):
-			issues = append(issues, issue("config.url", "invalid", "URL must use http or https"))
+			issues = append(issues, sdkIssue("config.url", "invalid", "URL must use http or https"))
 		}
 	}
-	return &pluginv1alpha1.ValidateActionResponse{Issues: issues}, nil
+	return issues
 }
 
 // Execute sends a request with the stable activity idempotency key.
-func (h *HTTP) Execute(request *pluginv1alpha1.ExecuteRequest, stream pluginv1alpha1.TaskProvider_ExecuteServer) error {
-	if err := validateMeta(request.GetMeta()); err != nil {
-		return err
-	}
-	if request.GetAction() != h.expectedAction() {
-		return status.Errorf(codes.InvalidArgument, "expected action %s", h.expectedAction())
+func (h *HTTP) Execute(ctx context.Context, request pluginsdk.TaskRequest, sink pluginsdk.EventSink) (any, error) {
+	if request.Action != h.expectedAction() {
+		return nil, fmt.Errorf("expected action %s", h.expectedAction())
 	}
 	var config httpConfig
-	if err := decodeStrictJSON(request.GetConfigJson(), &config); err != nil {
-		return status.Error(codes.InvalidArgument, err.Error())
+	if err := decodeStrictJSON(request.Config, &config); err != nil {
+		return nil, err
 	}
 	requestURL := config.URL
 	if config.URLSecret != "" {
-		secret, exists := request.GetSecrets()[config.URLSecret]
+		secret, exists := request.Secrets[config.URLSecret]
 		if !exists {
-			return status.Errorf(codes.InvalidArgument, "URL secret %q is missing", config.URLSecret)
+			return nil, fmt.Errorf("URL secret %q is missing", config.URLSecret)
 		}
 		requestURL = string(secret)
 	}
 	if !strings.HasPrefix(requestURL, "https://") && !strings.HasPrefix(requestURL, "http://") {
-		return status.Error(codes.InvalidArgument, "resolved URL must use http or https")
+		return nil, errors.New("resolved URL must use http or https")
 	}
 	method := strings.ToUpper(config.Method)
 	if method == "" {
@@ -346,29 +292,28 @@ func (h *HTTP) Execute(request *pluginv1alpha1.ExecuteRequest, stream pluginv1al
 	}
 	body := config.Body
 	if len(body) == 0 {
-		body = request.GetInputJson()
+		body = request.Input
 	}
-	httpRequest, err := http.NewRequestWithContext(stream.Context(), method, requestURL, strings.NewReader(string(body)))
+	httpRequest, err := http.NewRequestWithContext(ctx, method, requestURL, strings.NewReader(string(body)))
 	if err != nil {
-		return status.Error(codes.InvalidArgument, err.Error())
+		return nil, err
 	}
 	for key, value := range config.Headers {
 		httpRequest.Header.Set(key, value)
 	}
 	for header, secretName := range config.SecretHeaders {
-		secret, exists := request.GetSecrets()[secretName]
+		secret, exists := request.Secrets[secretName]
 		if !exists {
-			return status.Errorf(codes.InvalidArgument, "secret %q is missing", secretName)
+			return nil, fmt.Errorf("secret %q is missing", secretName)
 		}
 		httpRequest.Header.Set(header, string(secret))
 	}
-	httpRequest.Header.Set("Idempotency-Key", request.GetMeta().GetIdempotencyKey())
+	httpRequest.Header.Set("Idempotency-Key", request.IdempotencyKey)
 	if httpRequest.Header.Get("Content-Type") == "" {
 		httpRequest.Header.Set("Content-Type", "application/json")
 	}
-	writer := &eventWriter{stream: stream}
-	if err := writer.send("http.started", map[string]string{"method": method}, nil); err != nil {
-		return err
+	if err := sink.Emit("http.started", map[string]string{"method": method}); err != nil {
+		return nil, err
 	}
 	client := h.Client
 	if client == nil {
@@ -376,24 +321,18 @@ func (h *HTTP) Execute(request *pluginv1alpha1.ExecuteRequest, stream pluginv1al
 	}
 	response, err := client.Do(httpRequest)
 	if err != nil {
-		return status.Error(codes.Unavailable, err.Error())
+		return nil, err
 	}
 	defer func() { _ = response.Body.Close() }()
 	responseBody, err := readLimited(response.Body, maxHTTPResponse)
 	if err != nil {
-		return status.Error(codes.ResourceExhausted, err.Error())
+		return nil, err
 	}
 	payload := map[string]any{"status": response.StatusCode, "body": string(responseBody)}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		_ = writer.send("http.failed", payload, nil)
-		return status.Errorf(codes.Unavailable, "HTTP status %d", response.StatusCode)
+		return nil, fmt.Errorf("HTTP status %d", response.StatusCode)
 	}
-	return writer.send("http.completed", payload, nil)
-}
-
-// Cancel relies on request context cancellation for in-flight HTTP calls.
-func (*HTTP) Cancel(context.Context, *pluginv1alpha1.CancelRequest) (*pluginv1alpha1.CancelResponse, error) {
-	return &pluginv1alpha1.CancelResponse{Accepted: true, Outcome: "context-cancel"}, nil
+	return payload, nil
 }
 
 func (h *HTTP) expectedAction() string {
@@ -410,8 +349,8 @@ func validateMeta(meta *pluginv1alpha1.CallMeta) error {
 	return nil
 }
 
-func issue(path, code, message string) *pluginv1alpha1.ValidationIssue {
-	return &pluginv1alpha1.ValidationIssue{Path: path, Code: code, Message: message}
+func sdkIssue(path, code, message string) pluginsdk.ValidationIssue {
+	return pluginsdk.ValidationIssue{Path: path, Code: code, Message: message}
 }
 
 func decodeStrictJSON(data []byte, target any) error {

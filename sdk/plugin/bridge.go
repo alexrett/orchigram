@@ -1,6 +1,5 @@
-// Package pluginprotocol binds Orchigram's protobuf services to HashiCorp
-// go-plugin process bootstrap without leaking framework types into resources.
-package pluginprotocol
+// Package plugin is the supported authoring SDK for Orchigram plugins.
+package plugin
 
 import (
 	"context"
@@ -13,18 +12,20 @@ import (
 const (
 	// ProtocolVersion is the current host/plugin bootstrap protocol.
 	ProtocolVersion = 1
-	// DispenseName is the single go-plugin capability containing all gRPC services.
+	// DispenseName is the go-plugin capability containing Orchigram services.
 	DispenseName = "orchigram"
 )
 
-// Handshake is intentionally independent from the public business protocol.
+// Handshake is shared by the public SDK and the Orchigram host.
 var Handshake = hplugin.HandshakeConfig{
 	ProtocolVersion:  ProtocolVersion,
 	MagicCookieKey:   "ORCHIGRAM_PLUGIN_MAGIC_COOKIE",
 	MagicCookieValue: "orchigram-plugin-v1",
 }
 
-// Servers contains the services implemented by a plugin binary.
+// Servers is the protobuf service set registered in a plugin process. Most
+// authors should use Config; Servers exists for host integration and advanced
+// protobuf implementations.
 type Servers struct {
 	Control pluginv1alpha1.PluginControlServer
 	Task    pluginv1alpha1.TaskProviderServer
@@ -32,7 +33,7 @@ type Servers struct {
 	Agent   pluginv1alpha1.AgentRuntimeServer
 }
 
-// Clients is the typed host view of one running plugin process.
+// Clients is the host-side typed view of a running plugin process.
 type Clients struct {
 	Control pluginv1alpha1.PluginControlClient
 	Task    pluginv1alpha1.TaskProviderClient
@@ -40,13 +41,13 @@ type Clients struct {
 	Agent   pluginv1alpha1.AgentRuntimeClient
 }
 
-// Bridge implements go-plugin's transport adapter and registers protobuf services.
+// Bridge registers Orchigram protobuf services with HashiCorp go-plugin.
 type Bridge struct {
 	hplugin.NetRPCUnsupportedPlugin
 	Servers Servers
 }
 
-// GRPCServer registers every service supplied by the plugin runtime.
+// GRPCServer registers every supplied service.
 func (p *Bridge) GRPCServer(_ *hplugin.GRPCBroker, server *grpc.Server) error {
 	if p.Servers.Control != nil {
 		pluginv1alpha1.RegisterPluginControlServer(server, p.Servers.Control)
@@ -63,7 +64,7 @@ func (p *Bridge) GRPCServer(_ *hplugin.GRPCBroker, server *grpc.Server) error {
 	return nil
 }
 
-// GRPCClient creates typed clients over go-plugin's negotiated connection.
+// GRPCClient constructs typed clients over the negotiated connection.
 func (*Bridge) GRPCClient(_ context.Context, _ *hplugin.GRPCBroker, connection *grpc.ClientConn) (any, error) {
 	return &Clients{
 		Control: pluginv1alpha1.NewPluginControlClient(connection),
@@ -73,16 +74,7 @@ func (*Bridge) GRPCClient(_ context.Context, _ *hplugin.GRPCBroker, connection *
 	}, nil
 }
 
-// PluginSet returns a fresh bridge for host-side dispensing.
-func PluginSet(servers Servers) hplugin.PluginSet {
+// Set returns a fresh transport bridge set.
+func Set(servers Servers) hplugin.PluginSet {
 	return hplugin.PluginSet{DispenseName: &Bridge{Servers: servers}}
-}
-
-// Serve starts one isolated plugin process and never returns.
-func Serve(servers Servers) {
-	hplugin.Serve(&hplugin.ServeConfig{
-		HandshakeConfig: Handshake,
-		Plugins:         PluginSet(servers),
-		GRPCServer:      hplugin.DefaultGRPCServer,
-	})
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,8 +13,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -23,39 +26,37 @@ import (
 	"github.com/alexrett/orchigram/internal/config"
 	"github.com/alexrett/orchigram/internal/githubplugin"
 	"github.com/alexrett/orchigram/internal/pluginbundle"
-	"github.com/alexrett/orchigram/internal/pluginprotocol"
 	"github.com/alexrett/orchigram/internal/pluginruntime"
 	"github.com/alexrett/orchigram/internal/process"
 	"github.com/alexrett/orchigram/internal/resource"
 	"github.com/alexrett/orchigram/internal/store"
+	pluginsdk "github.com/alexrett/orchigram/sdk/plugin"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 func TestMain(m *testing.M) {
-	if os.Getenv(pluginprotocol.Handshake.MagicCookieKey) == pluginprotocol.Handshake.MagicCookieValue {
+	if os.Getenv(pluginsdk.Handshake.MagicCookieKey) == pluginsdk.Handshake.MagicCookieValue {
 		executable, _ := os.Executable()
 		name := filepath.Base(filepath.Dir(filepath.Dir(executable)))
-		info := pluginruntime.Info{Name: name, Version: "0.1.0"}
-		servers := pluginprotocol.Servers{}
+		config := pluginsdk.Config{Metadata: pluginsdk.Metadata{Name: name, Version: "0.1.0"}}
 		switch name {
 		case "exec":
-			info.Capabilities = []string{"task.exec.run"}
-			servers.Task = &pluginruntime.Exec{Runner: process.NewRunner()}
+			config.Metadata.Capabilities = []string{"task.exec.run"}
+			config.Task = &pluginruntime.Exec{Runner: process.NewRunner()}
 		case "agent-command":
-			info.Capabilities = []string{"agent.codex", "agent.claude", "agent.command"}
-			servers.Agent = &pluginruntime.Agent{Runner: process.NewRunner()}
+			config.Metadata.Capabilities = []string{"agent.codex", "agent.claude", "agent.command"}
+			config.Agent = &pluginruntime.Agent{Runner: process.NewRunner()}
 		case "github":
-			info.Capabilities = githubplugin.Capabilities
+			config.Metadata.Capabilities = githubplugin.Capabilities
 			githubRuntime := &githubplugin.Runtime{Runner: process.NewRunner()}
-			servers.Task = githubRuntime
-			servers.Trigger = githubRuntime
+			config.Task = githubRuntime
+			config.Trigger = githubRuntime
 		default:
 			os.Exit(2)
 		}
-		servers.Control = &pluginruntime.Control{Info: info}
-		pluginprotocol.Serve(servers)
+		pluginsdk.Serve(config)
 		return
 	}
 	os.Exit(m.Run())
@@ -121,6 +122,88 @@ spec:
 	artifact, err := os.ReadFile(filepath.Join(cfg.StateDir, "artifacts", run.GetUid(), "execute", "attempt-1", "raw.log")) //nolint:gosec // Test-owned daemon state path.
 	if err != nil || string(artifact) != "durable-plugin-flow\n" {
 		t.Fatalf("artifact=%q err=%v", artifact, err)
+	}
+}
+
+func TestRunCancellationTerminatesAgentProcessGroupAndRemainsCancelled(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "orchigram-cancel-e2e-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	cfg := config.Development(filepath.Join(root, "state"))
+	stop := serveTestDaemon(t, cfg)
+	defer stop()
+	client := dialReadyClient(t, cfg.SocketPath)
+	defer func() { _ = client.Close() }()
+	installDaemonPlugin(t, client, daemonPluginBundle(t, "agent-command", []string{"agent.codex", "agent.claude", "agent.command"}), "agent-command")
+	pidFile := filepath.Join(root, "agent-pids")
+	applyClientResource(t, client, fmt.Sprintf(`apiVersion: orchigram.dev/v1alpha1
+kind: AgentProfile
+metadata: {name: cancellation-agent}
+spec:
+  type: command
+  executable: /bin/sh
+  args: ["-c", "sleep 30 & child=$!; printf '%%s %%s' \"$$\" \"$child\" > \"$1\"; wait", "orchigram-agent", "{prompt}"]
+`))
+	applyClientResource(t, client, fmt.Sprintf(`apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: cancellation-flow}
+spec:
+  nodes:
+    - id: agent
+      uses: agent-command.run
+      timeout: 1m
+      with:
+        profile: cancellation-agent
+        prompt: %q
+`, pidFile))
+	started, err := client.Runs.Start(context.Background(), &controlv1alpha1.StartRunRequest{Flow: "cancellation-flow", InputJson: []byte(`{}`), IdempotencyKey: "cancellation-e2e"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pids []int
+	deadline := time.Now().Add(10 * time.Second)
+	for len(pids) != 2 {
+		data, readErr := os.ReadFile(pidFile) //nolint:gosec // Test-owned synchronization file.
+		if readErr == nil {
+			fields := strings.Fields(string(data))
+			if len(fields) == 2 {
+				leader, leaderErr := strconv.Atoi(fields[0])
+				child, childErr := strconv.Atoi(fields[1])
+				if leaderErr == nil && childErr == nil {
+					pids = []int{leader, child}
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("agent process group did not start: %v", readErr)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := client.Runs.Cancel(context.Background(), &controlv1alpha1.CancelRunRequest{RunUid: started.GetUid(), Reason: "operator cancellation test"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, pid := range pids {
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			err := syscall.Kill(pid, 0)
+			if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("agent process %d survived Run cancellation", pid)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+	summary, err := client.Runs.Reconcile(context.Background(), &controlv1alpha1.ReconcileRequest{RunUid: started.GetUid()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.GetPhase() != "cancelled" {
+		t.Fatalf("late activity completion regressed run phase to %q", summary.GetPhase())
 	}
 }
 

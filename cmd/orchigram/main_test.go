@@ -14,4 +14,7 @@ func TestCanonicalCommandsExist(t *testing.T) {
 			t.Errorf("command %q missing: %v", name, err)
 		}
 	}
+	if _, _, err := root.Find([]string{"plugin", "pack"}); err != nil {
+		t.Errorf("command plugin pack missing: %v", err)
+	}
 }

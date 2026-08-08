@@ -13,8 +13,8 @@ import (
 	"time"
 
 	pluginv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/plugin/v1alpha1"
-	"github.com/alexrett/orchigram/internal/pluginprotocol"
 	"github.com/alexrett/orchigram/internal/process"
+	pluginsdk "github.com/alexrett/orchigram/sdk/plugin"
 	"github.com/hashicorp/go-hclog"
 	hplugin "github.com/hashicorp/go-plugin"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -22,7 +22,7 @@ import (
 
 // Process is a negotiated plugin connection and its lifecycle owner.
 type Process struct {
-	clients *pluginprotocol.Clients
+	clients *pluginsdk.Clients
 	client  *hplugin.Client
 	command *exec.Cmd
 	once    sync.Once
@@ -38,8 +38,8 @@ func Launch(ctx context.Context, executable, binaryDigest string) (*Process, *pl
 	command.Env = process.MinimalEnvironment(hostEnvironment(), nil)
 	configureProcessGroup(command)
 	client := hplugin.NewClient(&hplugin.ClientConfig{
-		HandshakeConfig: pluginprotocol.Handshake,
-		Plugins:         pluginprotocol.PluginSet(pluginprotocol.Servers{}),
+		HandshakeConfig: pluginsdk.Handshake,
+		Plugins:         pluginsdk.Set(pluginsdk.Servers{}),
 		Cmd:             command,
 		AllowedProtocols: []hplugin.Protocol{
 			hplugin.ProtocolGRPC,
@@ -57,12 +57,12 @@ func Launch(ctx context.Context, executable, binaryDigest string) (*Process, *pl
 		client.Kill()
 		return nil, nil, fmt.Errorf("start plugin: %w", err)
 	}
-	dispensed, err := rpcClient.Dispense(pluginprotocol.DispenseName)
+	dispensed, err := rpcClient.Dispense(pluginsdk.DispenseName)
 	if err != nil {
 		client.Kill()
 		return nil, nil, fmt.Errorf("dispense plugin: %w", err)
 	}
-	clients, ok := dispensed.(*pluginprotocol.Clients)
+	clients, ok := dispensed.(*pluginsdk.Clients)
 	if !ok {
 		client.Kill()
 		return nil, nil, errors.New("plugin returned an unexpected client type")
@@ -78,7 +78,7 @@ func Launch(ctx context.Context, executable, binaryDigest string) (*Process, *pl
 }
 
 // Clients returns the business protocol clients for this process.
-func (p *Process) Clients() *pluginprotocol.Clients { return p.clients }
+func (p *Process) Clients() *pluginsdk.Clients { return p.clients }
 
 // Exited reports process loss without propagating it to the daemon.
 func (p *Process) Exited() bool { return p == nil || p.client.Exited() }

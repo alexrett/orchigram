@@ -1,31 +1,96 @@
 # Plugin authoring
 
-Plugins are deterministic `.tar.gz` bundles containing `plugin.yaml` and one binary per supported platform. Installation checks both the bundle digest and the selected binary digest, negotiates the running plugin, and writes an owner-only immutable version directory. Activation changes the SQLite activation record and never overwrites a previous version.
+Community plugins are ordinary Go modules built outside the Orchigram source
+tree. The supported boundary is `github.com/alexrett/orchigram/sdk/plugin`;
+plugin code must not import an Orchigram `internal` package. A complete example
+is in [`examples/plugins/echo`](../examples/plugins/echo).
+
+## Create a task plugin
+
+Initialize a separate module and add the SDK:
+
+```console
+mkdir orchigram-plugin-echo && cd orchigram-plugin-echo
+go mod init example.com/orchigram-plugin-echo
+go get github.com/alexrett/orchigram/sdk/plugin
+```
+
+A handler implements `ValidateAction` and `Execute`. Validation returns SDK
+diagnostics. Execution receives `plugin.TaskRequest` and may emit only
+non-terminal events through `plugin.EventSink`:
+
+```go
+type handler struct{}
+
+func (handler) ValidateAction(_ context.Context, action string, config json.RawMessage) []plugin.ValidationIssue {
+	if action != "echo.echo" {
+		return []plugin.ValidationIssue{{Path: "action", Code: "unsupported", Message: "expected echo.echo"}}
+	}
+	return nil
+}
+
+func (handler) Execute(ctx context.Context, request plugin.TaskRequest, sink plugin.EventSink) (any, error) {
+	var input struct{ Message string `json:"message"` }
+	if err := json.Unmarshal(request.Input, &input); err != nil { return nil, err }
+	_ = sink.Emit("echo.progress", map[string]int{"percent": 100})
+	return map[string]string{"message": input.Message}, nil
+}
+
+func main() {
+	plugin.Serve(plugin.Config{
+		Metadata: plugin.Metadata{Name: "echo", Version: "0.1.0", Capabilities: []string{"task.echo.echo"}},
+		Task: handler{},
+	})
+}
+```
+
+Metadata names, strict semantic versions, capabilities, and optional JSON input
+and output schemas are validated before serving. Capability namespaces are
+limited to `task`, `trigger`, and `agent`; task capabilities must use
+`task.<plugin-name>.<action>`. Every request includes action,
+input/config JSON, operation-scoped secrets, request/run/node/attempt identity,
+a stable idempotency key, and a deadline. Honor `ctx.Done()` promptly. External
+effects are at-least-once, so reconcile repeated idempotency keys instead of
+duplicating effects. Never emit or persist secret values.
+
+The SDK negotiates protocol v1, assigns timestamps and gap-free sequences,
+rejects author terminal events, emits exactly one `task.completed` or
+`task.failed`, maps `Cancel` to the active handler context, and drains active
+work only until the shutdown deadline. Advanced trigger or agent providers may
+implement the public generated `gen/orchigram/plugin/v1alpha1`
+`TriggerProviderServer` or `AgentRuntimeServer` and pass it in `Config.Trigger`
+or `Config.Agent`. Trigger watches participate in the same shutdown admission,
+cancellation, and drain accounting. Daemon, resource, bundle, and
+workflow-engine internals are not public APIs.
+
+## Build and pack
+
+Build each target directly and list its path relative to `plugin.yaml`. Author
+manifests omit `sha256`; the packer calculates and embeds it:
 
 ```yaml
 apiVersion: orchigram.dev/plugin/v1alpha1
-name: example
+name: echo
 version: 0.1.0
 protocol: {minimum: 1, maximum: 1}
-capabilities: [task.example.run]
+capabilities: [task.echo.echo]
 platforms:
-  - os: linux
-    arch: amd64
-    path: bin/example_linux_amd64
-    sha256: <64 lowercase hex characters>
+  - {os: linux, arch: amd64, path: bin/echo-linux-amd64}
+  - {os: darwin, arch: arm64, path: bin/echo-darwin-arm64}
 ```
 
-HashiCorp go-plugin provides process bootstrap, protocol negotiation, AutoMTLS, log routing, and cleanup. Protobuf/gRPC in `api/orchigram/plugin/v1alpha1` is the business protocol.
+```console
+GOOS=linux GOARCH=amd64 go build -trimpath -o bin/echo-linux-amd64 .
+GOOS=darwin GOARCH=arm64 go build -trimpath -o bin/echo-darwin-arm64 .
+orchigram plugin pack --manifest plugin.yaml --output dist/echo-0.1.0.tar.gz
+orchigram plugin install dist/echo-0.1.0.tar.gz
+orchigram plugin enable echo 0.1.0
+orchigram plugin doctor echo 0.1.0
+```
 
-Every call includes request, run, node, attempt, deadline, and idempotency identity. A plugin must:
-
-- emit monotonically increasing stream sequence numbers;
-- stop accepting work after shutdown begins;
-- implement cancel where advertised;
-- avoid logging secret maps or protobuf requests containing them;
-- tolerate duplicate requests with the same idempotency key;
-- report whether its remote provider honors idempotency.
-
-The conformance suite covers normal completion, cancellation, timeout, crash, incompatible protocol, malformed streams, and duplicate delivery.
-
-The daemon starts plugins with `SkipHostEnv` and AutoMTLS. A first-party command receives only a small platform baseline (`PATH`, `HOME`, temporary-directory and CA variables), declared non-secret environment values, and operation-scoped `SecretRef` values. Commands are argv arrays; Orchigram never evaluates them through a shell.
+Packing is local and requires no daemon connection. It rejects absolute or
+traversing paths, symlinks and non-regular files, duplicate targets, unknown
+manifest fields, oversized inputs, and mismatched supplied digests. Archive
+ordering and tar/gzip metadata are canonical. Existing outputs are refused even
+when byte-identical; `--force` is required for atomic replacement. The command
+prints the final bundle SHA-256 and absolute path.

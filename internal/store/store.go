@@ -554,6 +554,19 @@ func (s *Store) CompleteOutbox(ctx context.Context, id int64) error {
 	return err
 }
 
+// CompleteStartIfRunCancelled suppresses a claimed start after cancellation.
+// The conditional update is the serialization point with cancellation: when it
+// does not complete the command, the outbox remains capable of starting the
+// workflow until the normal dispatch path completes it.
+func (s *Store) CompleteStartIfRunCancelled(ctx context.Context, id int64, runUID string) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE outbox SET state='completed',completed_at=?,last_error='' WHERE id=? AND command_type='start-run' AND aggregate_uid=? AND EXISTS (SELECT 1 FROM run_cancellations WHERE run_uid=?)`, s.timestamp(), id, runUID, runUID)
+	if err != nil {
+		return false, err
+	}
+	updated, err := result.RowsAffected()
+	return updated == 1, err
+}
+
 // RetryOutbox records an error and makes the command available later.
 func (s *Store) RetryOutbox(ctx context.Context, id int64, cause error, delay time.Duration) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE outbox SET state='pending',available_at=?,last_error=? WHERE id=?`, s.now().UTC().Add(delay).Format(time.RFC3339Nano), cause.Error(), id)
@@ -648,6 +661,16 @@ func (s *Store) AppendRunEvent(ctx context.Context, runUID, nodeID, eventType, p
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	var currentPhase string
+	if err := tx.QueryRowContext(ctx, `SELECT phase FROM runs WHERE uid=?`, runUID).Scan(&currentPhase); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if terminalRunPhase(currentPhase) {
+		return tx.Commit()
+	}
 	var sequence uint64
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM run_events WHERE run_uid=?`, runUID).Scan(&sequence); err != nil {
 		return err
@@ -664,6 +687,98 @@ func (s *Store) AppendRunEvent(ctx context.Context, runUID, nodeID, eventType, p
 		return err
 	}
 	return tx.Commit()
+}
+
+func terminalRunPhase(phase string) bool {
+	return phase == "succeeded" || phase == "failed" || phase == "rejected" || phase == "cancelled"
+}
+
+// RequestRunCancellation atomically records operator intent, the terminal run
+// projection, and an engine-delivery record. Repeated requests preserve the
+// first cancellation reason and do not append duplicate events.
+func (s *Store) RequestRunCancellation(ctx context.Context, runUID, reason string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var phase string
+	if err := tx.QueryRowContext(ctx, `SELECT phase FROM runs WHERE uid=?`, runUID).Scan(&phase); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if phase != "cancelled" && terminalRunPhase(phase) {
+		return tx.Commit()
+	}
+	now := s.timestamp()
+	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO run_cancellations(run_uid,reason,requested_at) VALUES(?,?,?)`, runUID, reason, now)
+	if err != nil {
+		return err
+	}
+	inserted, _ := result.RowsAffected()
+	if inserted == 0 {
+		return tx.Commit()
+	}
+	var sequence uint64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM run_events WHERE run_uid=?`, runUID).Scan(&sequence); err != nil {
+		return err
+	}
+	payload, _ := json.Marshal(map[string]string{"reason": reason})
+	if _, err := tx.ExecContext(ctx, `INSERT INTO run_events(run_uid,sequence,node_id,attempt,event_type,payload_json,occurred_at) VALUES(?,?,?,?,?,?,?)`, runUID, sequence, "", 0, "run.cancelled", payload, now); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE runs SET phase='cancelled',updated_at=?,completed_at=COALESCE(completed_at,?) WHERE uid=?`, now, now, runUID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// RunCancellation is durable cancellation intent awaiting engine delivery.
+type RunCancellation struct {
+	RunUID string
+	Reason string
+}
+
+// UndeliveredRunCancellations returns cancellation intents in request order.
+func (s *Store) UndeliveredRunCancellations(ctx context.Context, limit int) ([]RunCancellation, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT run_uid,reason FROM run_cancellations WHERE delivery_completed=0 ORDER BY requested_at,run_uid LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	result := []RunCancellation{}
+	for rows.Next() {
+		var cancellation RunCancellation
+		if err := rows.Scan(&cancellation.RunUID, &cancellation.Reason); err != nil {
+			return nil, err
+		}
+		result = append(result, cancellation)
+	}
+	return result, rows.Err()
+}
+
+// MarkRunCancellationDelivered acknowledges both provider and workflow delivery.
+func (s *Store) MarkRunCancellationDelivered(ctx context.Context, runUID string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE run_cancellations SET delivery_completed=1,delivered_at=? WHERE run_uid=?`, s.timestamp(), runUID)
+	return err
+}
+
+// MarkRunCancellationDeliveredIfStartImpossible acknowledges a missing
+// workflow only after every durable start command for the Run is completed.
+// Keeping the predicate in the update prevents an outbox/cancellation race
+// from losing the cancellation intent.
+func (s *Store) MarkRunCancellationDeliveredIfStartImpossible(ctx context.Context, runUID string) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE run_cancellations SET delivery_completed=1,delivered_at=? WHERE run_uid=? AND delivery_completed=0 AND NOT EXISTS (SELECT 1 FROM outbox WHERE command_type='start-run' AND aggregate_uid=? AND state!='completed')`, s.timestamp(), runUID, runUID)
+	if err != nil {
+		return false, err
+	}
+	updated, err := result.RowsAffected()
+	return updated == 1, err
 }
 
 // RunEvent is an operator-visible durable transition.

@@ -22,42 +22,40 @@ import (
 	"github.com/alexrett/orchigram/internal/flow"
 	"github.com/alexrett/orchigram/internal/githubplugin"
 	"github.com/alexrett/orchigram/internal/pluginbundle"
-	"github.com/alexrett/orchigram/internal/pluginprotocol"
 	"github.com/alexrett/orchigram/internal/pluginruntime"
 	"github.com/alexrett/orchigram/internal/process"
 	"github.com/alexrett/orchigram/internal/resource"
 	"github.com/alexrett/orchigram/internal/store"
+	pluginsdk "github.com/alexrett/orchigram/sdk/plugin"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const conformanceVersion = "0.1.0"
 
 func TestMain(m *testing.M) {
-	if os.Getenv(pluginprotocol.Handshake.MagicCookieKey) == pluginprotocol.Handshake.MagicCookieValue {
+	if os.Getenv(pluginsdk.Handshake.MagicCookieKey) == pluginsdk.Handshake.MagicCookieValue {
 		executable, _ := os.Executable()
 		name := filepath.Base(filepath.Dir(filepath.Dir(executable)))
-		info := pluginruntime.Info{Name: name, Version: conformanceVersion}
-		servers := pluginprotocol.Servers{}
+		config := pluginsdk.Config{Metadata: pluginsdk.Metadata{Name: name, Version: conformanceVersion}}
 		switch name {
 		case "exec":
-			info.Capabilities = []string{"task.exec.run"}
-			servers.Task = &pluginruntime.Exec{Runner: process.NewRunner()}
+			config.Metadata.Capabilities = []string{"task.exec.run"}
+			config.Task = &pluginruntime.Exec{Runner: process.NewRunner()}
 		case "agent-command":
-			info.Capabilities = []string{"agent.codex", "agent.claude", "agent.command"}
-			servers.Agent = &pluginruntime.Agent{Runner: process.NewRunner()}
+			config.Metadata.Capabilities = []string{"agent.codex", "agent.claude", "agent.command"}
+			config.Agent = &pluginruntime.Agent{Runner: process.NewRunner()}
 		case "http":
-			info.Capabilities = []string{"task.http.request"}
-			servers.Task = &pluginruntime.HTTP{}
+			config.Metadata.Capabilities = []string{"task.http.request"}
+			config.Task = &pluginruntime.HTTP{}
 		case "github":
-			info.Capabilities = githubplugin.Capabilities
+			config.Metadata.Capabilities = githubplugin.Capabilities
 			githubRuntime := &githubplugin.Runtime{Runner: process.NewRunner()}
-			servers.Task = githubRuntime
-			servers.Trigger = githubRuntime
+			config.Task = githubRuntime
+			config.Trigger = githubRuntime
 		default:
 			os.Exit(2)
 		}
-		servers.Control = &pluginruntime.Control{Info: info}
-		pluginprotocol.Serve(servers)
+		pluginsdk.Serve(config)
 		return
 	}
 	os.Exit(m.Run())
@@ -306,6 +304,47 @@ spec: {backend: env, key: ORCHIGRAM_TEST_GITHUB_PROVIDER_TOKEN}
 	}
 }
 
+func TestSelfSDLCCExampleRendersFetchedIssueRequirementsForPlanner(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "examples", "self-sdlc", "issue-to-pr-flow.yaml")) //nolint:gosec // Repository-owned fixture.
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err := resource.DecodeStrict(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flowResource, err := resource.DecodeFlow(document.JSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, diagnostics := flow.NewCompiler(nil).Compile(flowResource)
+	if len(diagnostics) != 0 {
+		t.Fatalf("compile diagnostics: %+v", diagnostics)
+	}
+	var planner map[string]any
+	for _, node := range plan.Nodes {
+		if node.ID == "plan" {
+			planner = node.With
+			break
+		}
+	}
+	if planner == nil {
+		t.Fatal("planner node is missing")
+	}
+	issueFixture := map[string]any{"issue": map[string]any{
+		"number": float64(42), "title": "Preserve durable requirements", "body": "Acceptance: work without GitHub or network access.",
+	}}
+	if err := renderConfigTemplates(planner, json.RawMessage(`{}`), map[string]any{"fetch_issue": issueFixture}); err != nil {
+		t.Fatal(err)
+	}
+	prompt, _ := planner["prompt"].(string)
+	for _, requirement := range []string{"Issue #42: Preserve durable requirements", "Acceptance: work without GitHub or network access."} {
+		if !strings.Contains(prompt, requirement) {
+			t.Fatalf("rendered planner prompt omitted %q: %s", requirement, prompt)
+		}
+	}
+}
+
 func TestRejectsIncompatibleProtocolBeforeInstallation(t *testing.T) {
 	state, err := store.Open(filepath.Join(t.TempDir(), "state.sqlite"))
 	if err != nil {
@@ -322,11 +361,98 @@ func TestRejectsIncompatibleProtocolBeforeInstallation(t *testing.T) {
 	}
 }
 
+func TestInstallFailuresDoNotPublishImmutableVersion(t *testing.T) {
+	t.Run("launch failure permits corrected same version", func(t *testing.T) {
+		stateRoot := t.TempDir()
+		state, err := store.Open(filepath.Join(stateRoot, "state.sqlite"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = state.Close() }()
+		manager := New(state, stateRoot)
+		broken := bundleWithBinary(t, "exec", conformanceVersion, []string{"task.exec.run"}, []byte("not an executable"))
+		if _, err := manager.Install(context.Background(), broken); err == nil {
+			t.Fatal("invalid executable installed")
+		}
+		assertVersionAbsent(t, stateRoot, "exec", conformanceVersion)
+		if _, err := manager.Install(context.Background(), conformanceBundle(t, "exec", 1, 1)); err != nil {
+			t.Fatalf("corrected bundle was poisoned by failed install: %v", err)
+		}
+	})
+
+	for name, test := range map[string]struct {
+		version      string
+		capabilities []string
+	}{
+		"identity mismatch":   {version: "0.2.0", capabilities: []string{"task.exec.run"}},
+		"capability mismatch": {version: conformanceVersion, capabilities: []string{"task.exec.other"}},
+	} {
+		name, test := name, test
+		t.Run(name, func(t *testing.T) {
+			stateRoot := t.TempDir()
+			state, err := store.Open(filepath.Join(stateRoot, "state.sqlite"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = state.Close() }()
+			manager := New(state, stateRoot)
+			if _, err := manager.Install(context.Background(), bundleWithMetadata(t, "exec", test.version, test.capabilities)); err == nil {
+				t.Fatal("negotiation mismatch installed")
+			}
+			assertVersionAbsent(t, stateRoot, "exec", test.version)
+		})
+	}
+
+	t.Run("database failure rolls back publication", func(t *testing.T) {
+		stateRoot := t.TempDir()
+		state, err := store.Open(filepath.Join(stateRoot, "state.sqlite"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		manager := New(state, stateRoot)
+		if err := state.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := manager.Install(context.Background(), conformanceBundle(t, "exec", 1, 1)); err == nil {
+			t.Fatal("install unexpectedly survived closed database")
+		}
+		assertVersionAbsent(t, stateRoot, "exec", conformanceVersion)
+	})
+}
+
+func assertVersionAbsent(t *testing.T, stateRoot, name, version string) {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join(stateRoot, "plugins", name, version)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed installation published version directory: %v", err)
+	}
+}
+
 func TestMalformedStreamIsRejected(t *testing.T) {
+	valid := func(sequence uint64, eventType, payload string) *pluginv1alpha1.ExecuteEvent {
+		return &pluginv1alpha1.ExecuteEvent{Sequence: sequence, Type: eventType, PayloadJson: []byte(payload), OccurredAt: timestamppb.Now()}
+	}
+	tests := map[string][]*pluginv1alpha1.ExecuteEvent{
+		"sequence starts at two": {valid(2, "task.completed", `{}`)},
+		"sequence gap":           {valid(1, "task.progress", `{}`), valid(3, "task.completed", `{}`)},
+		"empty type":             {valid(1, "", `{}`)},
+		"missing timestamp":      {{Sequence: 1, Type: "task.completed", PayloadJson: []byte(`{}`)}},
+		"invalid JSON":           {valid(1, "task.completed", `{`)},
+		"missing terminal":       {valid(1, "task.progress", `{}`)},
+		"event after terminal":   {valid(1, "task.completed", `{}`), valid(2, "task.progress", `{}`)},
+		"multiple terminals":     {valid(1, "task.completed", `{}`), valid(2, "task.failed", `{}`)},
+	}
+	for name, events := range tests {
+		t.Run(name, func(t *testing.T) {
+			manager := &Manager{artifacts: t.TempDir()}
+			if _, err := manager.consume(context.Background(), runArtifact{runUID: "run", nodeID: "node", attempt: 1}, &fakeReceiver{events: events}); err == nil {
+				t.Fatal("malformed plugin stream was accepted")
+			}
+		})
+	}
 	manager := &Manager{artifacts: t.TempDir()}
-	receiver := &fakeReceiver{events: []*pluginv1alpha1.ExecuteEvent{{Sequence: 2, Type: "task.completed", PayloadJson: []byte(`{}`), OccurredAt: timestamppb.Now()}}}
-	if _, err := manager.consume(context.Background(), runArtifact{runUID: "run", nodeID: "node", attempt: 1}, receiver); err == nil {
-		t.Fatal("out-of-order plugin stream was accepted")
+	output, err := manager.consume(context.Background(), runArtifact{runUID: "run", nodeID: "node", attempt: 1}, &fakeReceiver{events: []*pluginv1alpha1.ExecuteEvent{valid(1, "task.completed", `{"ok":true}`)}})
+	if err != nil || string(output) != `{"ok":true}` {
+		t.Fatalf("valid stream output=%s err=%v", output, err)
 	}
 }
 
@@ -362,6 +488,34 @@ func conformanceBundle(t *testing.T, name string, minimum, maximum uint32) []byt
 	manifest := pluginbundle.Manifest{
 		APIVersion: pluginbundle.APIVersion, Name: name, Version: conformanceVersion,
 		Protocol: pluginbundle.ProtocolRange{Minimum: minimum, Maximum: maximum}, Capabilities: capabilities,
+		Platforms: []pluginbundle.Platform{{OS: runtime.GOOS, Arch: runtime.GOARCH, Path: "bin/plugin", SHA256: hex.EncodeToString(digest[:])}},
+	}
+	bundle, err := pluginbundle.Build(manifest, map[string][]byte{"bin/plugin": binary})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bundle
+}
+
+func bundleWithMetadata(t *testing.T, name, version string, capabilities []string) []byte {
+	t.Helper()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary, err := os.ReadFile(executable) //nolint:gosec // Test intentionally bundles its executable.
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bundleWithBinary(t, name, version, capabilities, binary)
+}
+
+func bundleWithBinary(t *testing.T, name, version string, capabilities []string, binary []byte) []byte {
+	t.Helper()
+	digest := sha256.Sum256(binary)
+	manifest := pluginbundle.Manifest{
+		APIVersion: pluginbundle.APIVersion, Name: name, Version: version,
+		Protocol: pluginbundle.ProtocolRange{Minimum: 1, Maximum: 1}, Capabilities: capabilities,
 		Platforms: []pluginbundle.Platform{{OS: runtime.GOOS, Arch: runtime.GOARCH, Path: "bin/plugin", SHA256: hex.EncodeToString(digest[:])}},
 	}
 	bundle, err := pluginbundle.Build(manifest, map[string][]byte{"bin/plugin": binary})

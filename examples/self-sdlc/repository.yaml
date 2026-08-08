@@ -1,0 +1,9 @@
+apiVersion: orchigram.dev/v1alpha1
+kind: Repository
+metadata:
+  name: self-sdlc-repository
+spec:
+  cloneURL: https://github.com/REPLACE_WITH_GITHUB_OWNER/REPLACE_WITH_REPOSITORY.git
+  defaultBranch: main
+  workspacePolicy: isolated-run
+  authSecretRef: self-sdlc-github-token

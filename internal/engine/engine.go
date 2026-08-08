@@ -47,6 +47,10 @@ type TaskExecutor interface {
 	Execute(context.Context, string, flow.PlanNode, json.RawMessage, map[string]any, string) (json.RawMessage, error)
 }
 
+type runCanceler interface {
+	CancelRun(context.Context, string, string) error
+}
+
 // ApprovalSignal is the framework-independent durable decision payload.
 type ApprovalSignal struct {
 	State  string `json:"state"`
@@ -55,13 +59,15 @@ type ApprovalSignal struct {
 
 // Adapter runs one stable data-driven interpreter on go-workflows.
 type Adapter struct {
-	backend backend.Backend
-	client  *workflowClient.Client
-	worker  *worker.Worker
-	store   *store.Store
-	cancel  context.CancelFunc
-	done    chan error
-	once    sync.Once
+	backend   backend.Backend
+	client    *workflowClient.Client
+	worker    *worker.Worker
+	store     *store.Store
+	cancel    context.CancelFunc
+	done      chan error
+	runs      runCanceler
+	lifecycle sync.Mutex
+	once      sync.Once
 }
 
 // Open starts the go-workflows worker against its private SQLite history database.
@@ -71,7 +77,10 @@ func Open(ctx context.Context, workflowDBPath string, state *store.Store, execut
 		backend.WithActivityLockTimeout(2*time.Second),
 		backend.WithStickyTimeout(0),
 	))
-	w := worker.New(b, nil)
+	workerOptions := worker.DefaultOptions
+	workerOptions.WorkflowHeartbeatInterval = 500 * time.Millisecond
+	workerOptions.ActivityHeartbeatInterval = 500 * time.Millisecond
+	w := worker.New(b, &workerOptions)
 	if err := w.RegisterWorkflow(InterpreterWorkflow, registry.WithName(workflowName)); err != nil {
 		return nil, fmt.Errorf("register interpreter: %w", err)
 	}
@@ -98,20 +107,30 @@ func Open(ctx context.Context, workflowDBPath string, state *store.Store, execut
 		return nil, err
 	}
 	adapter := &Adapter{backend: b, client: workflowClient.New(b), worker: w, store: state, cancel: cancel, done: make(chan error, 1)}
+	adapter.runs, _ = executor.(runCanceler)
 	go func() { adapter.done <- w.WaitForCompletion() }()
 	return adapter, nil
 }
 
 // Start idempotently starts a pinned interpreter instance.
 func (a *Adapter) Start(ctx context.Context, runUID string, plan flow.ExecutionPlan, input json.RawMessage) error {
+	a.lifecycle.Lock()
+	defer a.lifecycle.Unlock()
+	run, err := a.store.GetRun(ctx, runUID)
+	if err != nil {
+		return err
+	}
+	if run.Phase == "cancelled" {
+		return nil
+	}
 	if _, err := a.findInstance(ctx, runUID); err == nil {
 		return nil
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return err
 	}
-	_, err := a.client.CreateWorkflowInstance(ctx, workflowClient.WorkflowInstanceOptions{InstanceID: runUID}, workflowName, runUID, plan, input)
+	_, err = a.client.CreateWorkflowInstance(ctx, workflowClient.WorkflowInstanceOptions{InstanceID: runUID}, workflowName, runUID, plan, input)
 	if err == nil {
-		return nil
+		return a.cancelCreatedRunIfRequested(ctx, runUID)
 	}
 	// A crash/retry can race after durable workflow creation. Reconcile by identity.
 	if _, findErr := a.findInstance(ctx, runUID); findErr == nil {
@@ -126,7 +145,31 @@ func (a *Adapter) Signal(ctx context.Context, runUID, nodeID string, signal Appr
 }
 
 // Cancel cancels a workflow instance after the daemon records operator intent.
-func (a *Adapter) Cancel(ctx context.Context, runUID, _ string) error {
+func (a *Adapter) Cancel(ctx context.Context, runUID, reason string) error {
+	a.lifecycle.Lock()
+	defer a.lifecycle.Unlock()
+	var providerErr error
+	if a.runs != nil {
+		providerErr = a.runs.CancelRun(ctx, runUID, reason)
+	}
+	instance, err := a.findInstance(ctx, runUID)
+	if err != nil {
+		if providerErr != nil {
+			return fmt.Errorf("cancel provider calls: %w", providerErr)
+		}
+		return err
+	}
+	return errors.Join(providerErr, a.client.CancelWorkflowInstance(ctx, instance))
+}
+
+func (a *Adapter) cancelCreatedRunIfRequested(ctx context.Context, runUID string) error {
+	run, err := a.store.GetRun(ctx, runUID)
+	if err != nil {
+		return err
+	}
+	if run.Phase != "cancelled" {
+		return nil
+	}
 	instance, err := a.findInstance(ctx, runUID)
 	if err != nil {
 		return err
@@ -146,6 +189,25 @@ func (a *Adapter) Reconcile(ctx context.Context) error {
 			return fmt.Errorf("redeliver approval %s/%s: %w", signal.RunUID, signal.NodeID, err)
 		}
 		if err := a.store.MarkApprovalSignaled(ctx, signal.RunUID, signal.NodeID); err != nil {
+			return err
+		}
+	}
+	cancellations, err := a.store.UndeliveredRunCancellations(ctx, 100)
+	if err != nil {
+		return err
+	}
+	for _, cancellation := range cancellations {
+		if err := a.Cancel(ctx, cancellation.RunUID, cancellation.Reason); err != nil {
+			if !errors.Is(err, store.ErrNotFound) {
+				return fmt.Errorf("redeliver cancellation %s: %w", cancellation.RunUID, err)
+			}
+			_, markErr := a.store.MarkRunCancellationDeliveredIfStartImpossible(ctx, cancellation.RunUID)
+			if markErr != nil {
+				return markErr
+			}
+			continue
+		}
+		if err := a.store.MarkRunCancellationDelivered(ctx, cancellation.RunUID); err != nil {
 			return err
 		}
 	}

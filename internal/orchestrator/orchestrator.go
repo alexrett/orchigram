@@ -117,6 +117,14 @@ func (o *Orchestrator) ReconcileOne(ctx context.Context) error {
 	if err := o.hit(BoundaryAfterRun); err != nil {
 		return err
 	}
+	cancelled, err := o.store.CompleteStartIfRunCancelled(ctx, command.ID, command.Payload.RunUID)
+	if err != nil {
+		_ = o.store.RetryOutbox(ctx, command.ID, err, time.Second)
+		return err
+	}
+	if cancelled {
+		return nil
+	}
 	if err := o.engine.Start(ctx, command.Payload.RunUID, plan, command.Payload.Input); err != nil {
 		_ = o.store.RetryOutbox(ctx, command.ID, err, time.Second)
 		return err

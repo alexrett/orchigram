@@ -4,6 +4,18 @@ Orchigram guarantees that an acknowledged trigger has a durable `TriggerReceipt`
 
 External activities are at-least-once. The unavoidable crash window is after a remote side effect succeeds and before its completion is recorded locally. Every plugin call therefore receives a stable idempotency key derived from run, node, logical iteration, and operation. Providers that cannot enforce it must reconcile with deterministic remote identifiers or hidden markers and expose the residual risk to the operator.
 
+Workflow and activity workers heartbeat every 500 milliseconds, comfortably
+inside the two-second SQLite task leases. Long-running activities renew
+ownership instead of becoming eligible for concurrent redispatch.
+
+`succeeded`, `failed`, `rejected`, and `cancelled` are immutable terminal run
+phases. The store reads the current phase in the same transaction as every
+event transition; late node completions, failures, or approval waits become
+idempotent no-ops. Run cancellation also propagates directly to active task and
+agent calls. The bounded provider `Cancel` RPC runs before the streaming RPC is
+cancelled, and command providers terminate the process group with `SIGTERM`
+followed by bounded `SIGKILL` escalation.
+
 Approvals, retry timers, plan versions, provider cursors, and run events are durable. TUI state is not. On upgrade, an existing run remains pinned to its interpreter version or becomes visibly blocked; it is never silently reinterpreted by incompatible code.
 
 The compiler collapses strongly connected components and rejects every cycle
