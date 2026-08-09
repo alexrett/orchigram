@@ -107,7 +107,6 @@ checksum:
     - glob: ./.release/plugin-bundles/*.tar.gz
     - glob: ./.release/plugin-bundles/*.spdx.json
     - glob: ./.release/dependency-licenses.csv
-    - glob: ./dist/*.sbom.json
 
 sboms:
   - artifacts: archive
@@ -123,7 +122,6 @@ release:
     - glob: ./.release/plugin-bundles/*.tar.gz
     - glob: ./.release/plugin-bundles/*.spdx.json
     - glob: ./.release/dependency-licenses.csv
-    - glob: ./dist/*.sbom.json
   # GoReleaser metadata embeds invocation time and builder OS/architecture.
   # It is useful locally but is not a reproducible release asset.
   include_meta: false

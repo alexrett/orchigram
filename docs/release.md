@@ -26,6 +26,12 @@ Every release contains:
 - `dependency-licenses.csv`, `checksums.txt`, and GitHub build provenance
   attestations.
 
+`checksums.txt` contains exactly one entry for each of the other 41 public
+assets. The release workflow creates provenance from that checksum manifest and
+a separate attestation for the manifest itself, so every one of the 42 public
+assets is covered. The local release gate rejects missing, duplicate, or extra
+checksum entries.
+
 GoReleaser's internal `metadata.json` and `artifacts.json` embed invocation or
 builder metadata and are deliberately not published. They are excluded from the
 reproducibility manifest because neither file is a release asset.
