@@ -9,9 +9,11 @@ import (
 	"sort"
 	"time"
 
+	"github.com/Masterminds/semver/v3"
 	controlv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/control/v1alpha1"
 	clientpkg "github.com/alexrett/orchigram/internal/client"
 	"github.com/gdamore/tcell/v2"
+	"github.com/google/uuid"
 	"github.com/rivo/tview"
 )
 
@@ -156,8 +158,8 @@ func openDeleteResource(ctx context.Context, application *tview.Application, pag
 }
 
 func openStartFlow(ctx context.Context, application *tview.Application, pages *tview.Pages, client *clientpkg.Client, document *controlv1alpha1.ResourceDocument, notifications *tview.TextView, returnFocus tview.Primitive) {
-	form := tview.NewForm().AddInputField("Input JSON", "{}", 64, nil, nil).AddInputField("Idempotency key", "", 48, nil, nil)
-	form.SetBorder(true).SetTitle(" Start Flow/" + document.GetKey().GetName() + " ")
+	form := tview.NewForm().AddInputField("Input JSON", "{}", 64, nil, nil).AddInputField("Idempotency key", uuid.NewString(), 48, nil, nil)
+	form.SetBorder(true).SetTitle(" Start Flow/" + tview.Escape(document.GetKey().GetName()) + " ")
 	form.AddButton("Start", func() {
 		input := []byte(formText(form, "Input JSON"))
 		if !json.Valid(input) {
@@ -229,13 +231,7 @@ func uploadPluginBundle(ctx context.Context, client *clientpkg.Client, bundle []
 }
 
 func openPluginRollback(ctx context.Context, application *tview.Application, pages *tview.Pages, client *clientpkg.Client, plugin *controlv1alpha1.PluginInfo, plugins []*controlv1alpha1.PluginInfo, notifications *tview.TextView, returnFocus tview.Primitive) {
-	candidates := make([]*controlv1alpha1.PluginInfo, 0)
-	for _, candidate := range plugins {
-		if candidate.GetName() == plugin.GetName() && candidate.GetVersion() != plugin.GetVersion() {
-			candidates = append(candidates, candidate)
-		}
-	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].GetVersion() > candidates[j].GetVersion() })
+	candidates := pluginRollbackCandidates(plugin, plugins)
 	if len(candidates) == 0 {
 		notifications.SetText("[yellow]No previous installed version is available")
 		return
@@ -258,4 +254,22 @@ func openPluginRollback(ctx context.Context, application *tview.Application, pag
 	}
 	pages.AddPage("plugin-rollback", centered(list, 62, min(18, len(candidates)+4)), true, true)
 	application.SetFocus(list)
+}
+
+func pluginRollbackCandidates(plugin *controlv1alpha1.PluginInfo, plugins []*controlv1alpha1.PluginInfo) []*controlv1alpha1.PluginInfo {
+	candidates := make([]*controlv1alpha1.PluginInfo, 0)
+	for _, candidate := range plugins {
+		if candidate.GetName() == plugin.GetName() && candidate.GetVersion() != plugin.GetVersion() {
+			candidates = append(candidates, candidate)
+		}
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		left, leftErr := semver.StrictNewVersion(candidates[i].GetVersion())
+		right, rightErr := semver.StrictNewVersion(candidates[j].GetVersion())
+		if leftErr == nil && rightErr == nil && !left.Equal(right) {
+			return left.GreaterThan(right)
+		}
+		return candidates[i].GetVersion() > candidates[j].GetVersion()
+	})
+	return candidates
 }

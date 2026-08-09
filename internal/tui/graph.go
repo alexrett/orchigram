@@ -53,9 +53,10 @@ func (g *Graph) SetPlan(plan flow.ExecutionPlan) *Graph {
 	defer g.mu.Unlock()
 	previousNode := g.selected
 	var previousEdge flow.PlanEdge
-	hadEdge := g.selectedEdge >= 0 && g.selectedEdge < len(g.plan.Edges)
+	previousEdgeIndex := g.selectedEdge
+	hadEdge := previousEdgeIndex >= 0 && previousEdgeIndex < len(g.plan.Edges)
 	if hadEdge {
-		previousEdge = g.plan.Edges[g.selectedEdge]
+		previousEdge = g.plan.Edges[previousEdgeIndex]
 	}
 	g.plan = plan
 	g.status = map[string]string{}
@@ -64,10 +65,14 @@ func (g *Graph) SetPlan(plan flow.ExecutionPlan) *Graph {
 	if _, exists := g.rects[previousNode]; previousNode != "" && exists {
 		g.selected = previousNode
 	} else if hadEdge {
-		for index, edge := range plan.Edges {
-			if edge == previousEdge {
-				g.selectedEdge = index
-				break
+		if previousEdgeIndex < len(plan.Edges) && plan.Edges[previousEdgeIndex] == previousEdge {
+			g.selectedEdge = previousEdgeIndex
+		} else {
+			for index, edge := range plan.Edges {
+				if edge == previousEdge {
+					g.selectedEdge = index
+					break
+				}
 			}
 		}
 	} else if len(g.order) > 0 {

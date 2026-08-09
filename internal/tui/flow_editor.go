@@ -41,7 +41,7 @@ func openFlowNodeForm(ctx context.Context, application *tview.Application, pages
 	}
 	node := definition.Spec.Nodes[index]
 	form := tview.NewForm()
-	form.SetBorder(true).SetTitle(" Edit node " + node.ID + " ")
+	form.SetBorder(true).SetTitle(" Edit node " + tview.Escape(node.ID) + " ")
 	form.AddInputField("ID", node.ID, 48, nil, nil)
 	form.AddInputField("Name", node.Name, 48, nil, nil)
 	form.AddInputField("Uses", node.Uses, 48, nil, nil)
@@ -159,7 +159,7 @@ func openFlowEdgeForm(ctx context.Context, application *tview.Application, pages
 	}
 	edge := definition.Spec.Edges[index]
 	form := tview.NewForm().AddInputField("From", edge.From, 48, nil, nil).AddInputField("To", edge.To, 48, nil, nil).AddInputField("When (CEL)", edge.When, 64, nil, nil)
-	form.SetBorder(true).SetTitle(" Edit edge " + edge.From + " -> " + edge.To + " ")
+	form.SetBorder(true).SetTitle(" Edit edge " + tview.Escape(edge.From) + " -> " + tview.Escape(edge.To) + " ")
 	form.AddButton("Validate & apply", func() {
 		definition.Spec.Edges[index] = resource.FlowEdge{From: formText(form, "From"), To: formText(form, "To"), When: formText(form, "When (CEL)")}
 		if !applyFlowDefinition(ctx, client, document, definition, notifications) {

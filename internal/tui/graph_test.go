@@ -123,6 +123,23 @@ func TestGraphPlanReplacementPreservesExistingSelection(t *testing.T) {
 	}
 }
 
+func TestGraphPlanReplacementPreservesDuplicateEdgeIndex(t *testing.T) {
+	t.Parallel()
+	edge := flow.PlanEdge{From: "start", To: "finish", Condition: "true"}
+	plan := flow.ExecutionPlan{Nodes: []flow.PlanNode{{ID: "start"}, {ID: "finish"}}, Edges: []flow.PlanEdge{edge, edge}}
+	graph := NewGraph().SetPlan(plan)
+	for range 3 {
+		graph.InputHandler()(tcell.NewEventKey(tcell.KeyTab, 0, 0), nil)
+	}
+	if _, index, ok := graph.SelectedEdge(); !ok || index != 1 {
+		t.Fatalf("initial duplicate edge index=%d ok=%t", index, ok)
+	}
+	graph.SetPlan(plan)
+	if _, index, ok := graph.SelectedEdge(); !ok || index != 1 {
+		t.Fatalf("replacement duplicate edge index=%d ok=%t", index, ok)
+	}
+}
+
 func TestGraphMouseSelectsBackwardAndSelfLoopEdges(t *testing.T) {
 	t.Parallel()
 	plan := flow.ExecutionPlan{

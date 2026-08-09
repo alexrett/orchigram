@@ -616,7 +616,7 @@ func openResourceForm(application *tview.Application, pages *tview.Pages, client
 		return
 	}
 	form := tview.NewForm()
-	form.SetBorder(true).SetTitle(" Edit " + document.GetKey().GetKind() + "/" + document.GetKey().GetName() + " ")
+	form.SetBorder(true).SetTitle(" Edit " + tview.Escape(document.GetKey().GetKind()) + "/" + tview.Escape(document.GetKey().GetName()) + " ")
 	for _, descriptor := range fields {
 		initial := scalarText(readPath(projection, descriptor.path))
 		if initial == "" && descriptor.typeName == "bool" {
@@ -737,7 +737,7 @@ func openYAML(application *tview.Application, pages *tview.Pages, document *cont
 	_ = json.Unmarshal(document.GetJson(), &value)
 	encoded, _ := yaml.Marshal(value)
 	view := tview.NewTextView().SetDynamicColors(false).SetScrollable(true).SetWrap(false).SetText(string(encoded))
-	view.SetBorder(true).SetTitle(" YAML " + document.GetKey().GetKind() + "/" + document.GetKey().GetName() + " (read-only) ")
+	view.SetBorder(true).SetTitle(" YAML " + tview.Escape(document.GetKey().GetKind()) + "/" + tview.Escape(document.GetKey().GetName()) + " (read-only) ")
 	view.SetDoneFunc(func(_ tcell.Key) {
 		pages.RemovePage("yaml")
 		application.SetFocus(returnFocus)
