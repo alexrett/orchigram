@@ -19,6 +19,7 @@ import (
 	"time"
 
 	controlv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/control/v1alpha1"
+	"github.com/alexrett/orchigram/internal/backup"
 	clientpkg "github.com/alexrett/orchigram/internal/client"
 	"github.com/alexrett/orchigram/internal/config"
 	"github.com/alexrett/orchigram/internal/firstparty"
@@ -126,6 +127,12 @@ type installSnapshot struct {
 	files     []installFile
 }
 
+type upgradeStateSnapshot struct {
+	archive   string
+	stateDir  string
+	chownTree func(string) error
+}
+
 // Run installs files, creates the service identity, starts systemd, and uploads bundled plugins.
 func Run(ctx context.Context, options Options) (Result, error) {
 	root := options.Root
@@ -193,6 +200,18 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	rollbackFiles := func(cause error) error {
 		return errors.Join(cause, snapshot.restore())
 	}
+	var previousActivations map[string]string
+	var stateSnapshot *upgradeStateSnapshot
+	if realSystem && options.Start && snapshot.existed(paths.binary) {
+		previousActivations, err = activePluginVersions(ctx, config.DefaultSocketPath)
+		if err != nil {
+			return Result{}, rollbackFiles(fmt.Errorf("inspect existing plugin activations before upgrade: %w", err))
+		}
+		stateSnapshot, err = captureUpgradeStateSnapshot(ctx, config.DefaultSocketPath, paths.state)
+		if err != nil {
+			return Result{}, rollbackFiles(fmt.Errorf("create pre-upgrade state backup: %w", err))
+		}
+	}
 	if err := copyFile(source, paths.binary, 0o755); err != nil {
 		return Result{}, rollbackFiles(err)
 	}
@@ -237,16 +256,22 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		}
 	}
 	if realSystem && options.Start {
-		previousActivations, activationErr := activePluginVersions(ctx, config.DefaultSocketPath)
-		if activationErr != nil && snapshot.existed(paths.binary) {
-			return Result{}, rollbackFiles(fmt.Errorf("inspect existing plugin activations before upgrade: %w", activationErr))
-		}
 		rollbackRunningService := func(cause error) error {
 			fileErr := snapshot.restore()
+			configErr := chownServiceConfig(paths.configDir, paths.config)
+			stopErr := runCommand(ctx, "systemctl", "stop", "orchigram.service")
+			var stateErr error
+			var failedState string
+			if stopErr == nil && stateSnapshot != nil {
+				failedState, stateErr = stateSnapshot.restore(ctx)
+			}
 			reloadErr := runCommand(ctx, "systemctl", "daemon-reload")
 			restartErr := runCommand(ctx, "systemctl", "restart", "orchigram.service")
 			activationRestoreErr := restorePluginVersions(ctx, config.DefaultSocketPath, previousActivations)
-			return errors.Join(cause, fileErr, reloadErr, restartErr, activationRestoreErr)
+			if failedState != "" {
+				cause = fmt.Errorf("%w (previous service restored; failed upgrade state preserved at %s)", cause, failedState)
+			}
+			return errors.Join(cause, fileErr, configErr, stopErr, stateErr, reloadErr, restartErr, activationRestoreErr)
 		}
 		if err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
 			return Result{}, rollbackRunningService(err)
@@ -342,8 +367,82 @@ func (s *installSnapshot) discard() {
 	}
 }
 
+func captureUpgradeStateSnapshot(ctx context.Context, socket, stateDir string) (*upgradeStateSnapshot, error) {
+	connection, err := dialAvailable(ctx, socket, 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = connection.Close() }()
+	response, err := connection.System.Backup(ctx, &controlv1alpha1.BackupRequest{})
+	if err != nil {
+		return nil, err
+	}
+	archive := filepath.Clean(response.GetPath())
+	if !filepath.IsAbs(archive) || !within(stateDir, archive) {
+		return nil, errors.New("daemon returned an unsafe pre-upgrade backup path")
+	}
+	if err := validateInstallSource(archive, 2<<30); err != nil {
+		return nil, fmt.Errorf("validate pre-upgrade backup: %w", err)
+	}
+	return &upgradeStateSnapshot{archive: archive, stateDir: filepath.Clean(stateDir), chownTree: chownServiceTree}, nil
+}
+
+// restore replaces only the backed-up databases and plugin installations while
+// carrying forward workspaces, artifacts, and backup archives. The failed state
+// is retained beside the active directory for bounded operator forensics.
+func (s *upgradeStateSnapshot) restore(ctx context.Context) (string, error) {
+	if s == nil {
+		return "", nil
+	}
+	parent, base := filepath.Dir(s.stateDir), filepath.Base(s.stateDir)
+	suffix := strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
+	restored := filepath.Join(parent, "."+base+"-restore-"+suffix)
+	failed := filepath.Join(parent, base+".failed-"+suffix)
+	if err := backup.Restore(ctx, s.archive, restored); err != nil {
+		return "", err
+	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.RemoveAll(restored)
+		}
+	}()
+	_ = os.Remove(filepath.Join(restored, "backup.json"))
+	if s.chownTree == nil {
+		return "", errors.New("upgrade state snapshot has no ownership handler")
+	}
+	if err := s.chownTree(restored); err != nil {
+		return "", err
+	}
+	if err := os.Rename(s.stateDir, failed); err != nil {
+		return "", err
+	}
+	if err := os.Rename(restored, s.stateDir); err != nil {
+		return "", errors.Join(err, os.Rename(failed, s.stateDir))
+	}
+	cleanup = false
+	for _, name := range []string{"workspaces", "artifacts", "backups"} {
+		source, target := filepath.Join(failed, name), filepath.Join(s.stateDir, name)
+		if _, err := os.Stat(source); errors.Is(err, os.ErrNotExist) {
+			if err := os.MkdirAll(target, 0o750); err != nil {
+				return failed, err
+			}
+			continue
+		} else if err != nil {
+			return failed, err
+		}
+		if err := os.Rename(source, target); err != nil {
+			return failed, err
+		}
+	}
+	return failed, nil
+}
+
 func bootstrapPlugins(ctx context.Context, socket string, binaries map[string]string) error {
-	connection, err := dialHealthy(ctx, socket, 30*time.Second)
+	// The freshly started control plane may correctly report degraded health
+	// until its bundled plugins have been upgraded. Probe API availability first,
+	// install and activate the complete set, and only then require aggregate health.
+	connection, err := dialAvailable(ctx, socket, 30*time.Second)
 	if err != nil {
 		return err
 	}
@@ -391,7 +490,12 @@ func bootstrapPlugins(ctx context.Context, socket string, binaries map[string]st
 			return err
 		}
 	}
-	return nil
+	_ = connection.Close()
+	healthy, err := dialHealthy(ctx, socket, 30*time.Second)
+	if err != nil {
+		return err
+	}
+	return healthy.Close()
 }
 
 func dialHealthy(ctx context.Context, socket string, maximumWait time.Duration) (*clientpkg.Client, error) {
@@ -544,6 +648,35 @@ func chownServiceConfig(paths ...string) error {
 		}
 	}
 	return nil
+}
+
+func chownServiceTree(root string) error {
+	account, err := user.Lookup("orchigram")
+	if err != nil {
+		return err
+	}
+	uid, err := strconv.Atoi(account.Uid)
+	if err != nil {
+		return err
+	}
+	gid, err := strconv.Atoi(account.Gid)
+	if err != nil {
+		return err
+	}
+	if err := filepath.WalkDir(root, func(path string, _ os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		return os.Lchown(path, uid, gid)
+	}); err != nil {
+		return err
+	}
+	return os.Chmod(root, 0o750) //nolint:gosec // Service state is traversable only by its dedicated user and group.
+}
+
+func within(root, path string) bool {
+	relative, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
 func runCommand(ctx context.Context, name string, args ...string) error {

@@ -16,11 +16,16 @@ sudo ./orchigram install --plugin-dir .
 The installer creates the stable `orchigram` system user and group, installs a
 hardened systemd unit, starts the daemon, verifies each immutable plugin bundle,
 and activates the four plugins. Re-running the command is the supported
-single-node upgrade path. Before replacement it verifies every source and
-captures the current core files and plugin activation set. A failed restart,
-health check, bundle install, or activation restores the previous binary, unit,
-bundled executables, and activation set before restarting the old service.
-Durable approvals, timers, and retries then reconcile from SQLite. The service
+single-node upgrade path. Before replacement it verifies every source, captures
+the current core files and plugin activation set, and asks the running daemon
+for a causally safe online backup. A failed restart, health check, bundle
+install, or activation restores the previous binary, unit, config ownership,
+bundled executables, activation set, databases, and immutable plugin state
+before restarting the old service. Workspaces, artifacts, and backup archives
+created around the attempt are carried forward; the failed database/plugin
+state is preserved beside `/var/lib/orchigram` for operator forensics. Durable
+approvals, timers, and retries then reconcile from the restored SQLite state.
+The service
 has default cgroup bounds (`MemoryHigh=512M`, `MemoryMax=768M`, `CPUQuota=200%`,
 and `TasksMax=256`). It never opens a TCP listener unless `/etc/orchigram/config.yaml`
 explicitly sets `http.listen`.
