@@ -1,7 +1,7 @@
 # Triggers
 
-Every external occurrence crosses the same SQLite transaction boundary. The
-daemon compiles the target Flow and writes its immutable `ExecutionPlan`, a
+Every external occurrence crosses the same SQLite transaction boundary. Start
+delivery compiles the target Flow and writes its immutable `ExecutionPlan`, a
 `TriggerReceipt`, and a `start-run` outbox command in one transaction before it
 returns HTTP 202 or acknowledges a provider event. The receipt's stable
 occurrence identity selects exactly one local Run UID. External activities are
@@ -47,3 +47,32 @@ Provider acceptance also verifies the authoritative Trigger generation and
 enabled state in that transaction. Disable and delete therefore fence an
 in-flight watch before it can commit a later receipt; controller cancellation is
 cleanup rather than the correctness boundary.
+
+### Resume an active Run
+
+A provider Trigger can explicitly route accepted occurrences to a waiting node
+instead of starting another Run:
+
+```yaml
+spec:
+  flow: issue-to-pr
+  provider:
+    plugin: github
+    config: {}
+  delivery:
+    mode: signal
+    node: wait_review
+```
+
+The referenced Flow node must use `core.event`. The provider supplies the target
+Run UID in the protocol event envelope; the daemon verifies that the Run is
+active, belongs to the referenced Flow UID, and pins a plan containing that
+event node. Receipt, provider cursor, payload, and `signal-run` outbox command
+commit together before acknowledgement. Missing, terminal, wrong-Flow, or
+wrong-node targets fail without advancing the cursor.
+
+`core.event` exposes the accepted JSON object as its result, so CEL edges can
+route states such as `result.review.state == "changes_requested"`. It can live
+inside a compiler-bounded cycle. Signal dispatch is at-least-once: the durable
+interpreter remembers stable provider event IDs and records `event.duplicate`
+without advancing another loop iteration after a crash-window redelivery.

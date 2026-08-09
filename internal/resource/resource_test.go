@@ -59,6 +59,58 @@ spec:
 	}
 }
 
+func TestTriggerSignalDeliveryRequiresProviderAndValidNode(t *testing.T) {
+	t.Parallel()
+	for name, document := range map[string]string{
+		"schedule": `apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata: {name: bad}
+spec:
+  flow: demo
+  schedule: {cron: "0 9 * * 1-5"}
+  delivery: {mode: signal, node: review}
+`,
+		"missing node": `apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata: {name: bad}
+spec:
+  flow: demo
+  provider: {plugin: github}
+  delivery: {mode: signal}
+`,
+		"unknown mode": `apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata: {name: bad}
+spec:
+  flow: demo
+  provider: {plugin: github}
+  delivery: {mode: resume, node: review}
+`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := DecodeStrict([]byte(document)); err == nil {
+				t.Fatal("invalid signal delivery was accepted")
+			}
+		})
+	}
+	valid, err := DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata: {name: reviews}
+spec:
+  flow: demo
+  provider: {plugin: github}
+  delivery: {mode: signal, node: wait_review}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	trigger, err := DecodeTrigger(valid.JSON)
+	if err != nil || trigger.Spec.Delivery == nil || trigger.Spec.Delivery.Mode != "signal" || trigger.Spec.Delivery.Node != "wait_review" {
+		t.Fatalf("trigger=%+v err=%v", trigger, err)
+	}
+}
+
 func TestWithServerStatusRemovesClientProjection(t *testing.T) {
 	t.Parallel()
 	doc, err := DecodeStrict([]byte(strings.Replace(validFlow, "spec:\n", "status: {state: client-controlled}\nspec:\n", 1)))

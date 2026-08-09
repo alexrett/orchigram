@@ -75,6 +75,9 @@ func (missingWorkflowEngine) Start(context.Context, string, flow.ExecutionPlan, 
 func (missingWorkflowEngine) Signal(context.Context, string, string, engine.ApprovalSignal) error {
 	return nil
 }
+func (missingWorkflowEngine) SignalEvent(context.Context, string, string, engine.EventSignal) error {
+	return nil
+}
 func (missingWorkflowEngine) Cancel(context.Context, string, string) error { return store.ErrNotFound }
 func (missingWorkflowEngine) Reconcile(context.Context) error              { return nil }
 func (missingWorkflowEngine) Describe(context.Context, string) (store.Run, error) {

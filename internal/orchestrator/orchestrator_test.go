@@ -18,9 +18,10 @@ import (
 )
 
 type fakeEngine struct {
-	mu     sync.Mutex
-	plans  []string
-	unique map[string]string
+	mu      sync.Mutex
+	plans   []string
+	unique  map[string]string
+	signals []engine.EventSignal
 }
 
 func (f *fakeEngine) Start(_ context.Context, runUID string, plan flow.ExecutionPlan, _ json.RawMessage) error {
@@ -37,10 +38,17 @@ func (f *fakeEngine) Start(_ context.Context, runUID string, plan flow.Execution
 	return nil
 }
 func (f *fakeEngine) Signal(context.Context, string, string, engine.ApprovalSignal) error { return nil }
-func (f *fakeEngine) Cancel(context.Context, string, string) error                        { return nil }
-func (f *fakeEngine) Reconcile(context.Context) error                                     { return nil }
-func (f *fakeEngine) Describe(context.Context, string) (store.Run, error)                 { return store.Run{}, nil }
-func (f *fakeEngine) Close() error                                                        { return nil }
+
+func (f *fakeEngine) SignalEvent(_ context.Context, _ string, _ string, signal engine.EventSignal) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.signals = append(f.signals, signal)
+	return nil
+}
+func (f *fakeEngine) Cancel(context.Context, string, string) error        { return nil }
+func (f *fakeEngine) Reconcile(context.Context) error                     { return nil }
+func (f *fakeEngine) Describe(context.Context, string) (store.Run, error) { return store.Run{}, nil }
+func (f *fakeEngine) Close() error                                        { return nil }
 
 type healthEngine struct {
 	*fakeEngine
@@ -299,6 +307,79 @@ spec:
 	cursor, eventID, err := state.ProviderCursor(ctx, trigger.Metadata.UID)
 	if err != nil || cursor != "cursor-2" || eventID != "provider-event-1" {
 		t.Fatalf("cursor=%q event=%q err=%v", cursor, eventID, err)
+	}
+}
+
+func TestProviderSignalOutboxRedeliversSameStableEventAfterCrashBoundary(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	state, err := store.Open(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	applyFlow(ctx, t, state, `
+    - {id: review, uses: core.event, timeout: 1h}
+`, "", 0)
+	fake := &fakeEngine{}
+	control := New(state, flow.NewCompiler(nil), fake)
+	startReceipt, err := control.StartManual(ctx, "demo", "default", json.RawMessage(`{}`), "signal-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := control.ReconcileOne(ctx); err != nil {
+		t.Fatal(err)
+	}
+	triggerDocument, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata: {name: reviews}
+spec:
+  flow: demo
+  provider: {plugin: fixture}
+  delivery: {mode: signal, node: review}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedTrigger, err := state.Apply(ctx, triggerDocument, store.ApplyOptions{RequestID: "signal-trigger"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	trigger, err := resource.DecodeTrigger(storedTrigger.JSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.EnsureTriggerState(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	payload := json.RawMessage(`{"review":{"state":"changes_requested"}}`)
+	if _, err := control.AcceptProviderSignal(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, "review-event-1", "demo", "default", startReceipt.RunUID, "review", payload, "1"); err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("crash after workflow signal delivery")
+	control.SetFaultHook(func(boundary Boundary) error {
+		if boundary == BoundaryAfterEngine {
+			return injected
+		}
+		return nil
+	})
+	if err := control.ReconcileOne(ctx); !errors.Is(err, injected) {
+		t.Fatalf("first signal reconcile=%v", err)
+	}
+	control.SetFaultHook(nil)
+	control.claimStaleAfter = 0
+	time.Sleep(time.Millisecond)
+	if err := control.ReconcileOne(ctx); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	signals := append([]engine.EventSignal(nil), fake.signals...)
+	fake.mu.Unlock()
+	if len(signals) != 2 || signals[0].ProviderEventID != "review-event-1" || signals[1].ProviderEventID != "review-event-1" || string(signals[0].Payload) != string(payload) || string(signals[1].Payload) != string(payload) {
+		t.Fatalf("redelivered signals=%+v", signals)
+	}
+	if _, err := state.ClaimSignal(ctx, time.Hour); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("completed signal remained claimable: %v", err)
 	}
 }
 

@@ -64,7 +64,14 @@ message WatchStart {
 }
 message TriggerAck { string provider_event_id = 1; string cursor = 2; }
 message TriggerCommand { oneof value { WatchStart start = 1; TriggerAck ack = 2; } }
-message TriggerEvent { string provider_event_id = 1; string cursor = 2; google.protobuf.Timestamp occurred_at = 3; bytes payload_json = 4; }
+message TriggerEvent {
+  string provider_event_id = 1;
+  string cursor = 2;
+  google.protobuf.Timestamp occurred_at = 3;
+  bytes payload_json = 4;
+  // target_run_uid is required only when the Trigger opts into signal delivery.
+  string target_run_uid = 5;
+}
 
 message AgentRequest { CallMeta meta = 1; string profile_type = 2; bytes profile_json = 3; bytes input_json = 4; map<string, bytes> secrets = 5; }
 message AgentInput { CallMeta meta = 1; bytes payload_json = 2; }

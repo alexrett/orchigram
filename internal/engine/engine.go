@@ -28,6 +28,9 @@ const (
 	activityExecuteNode   = "orchigram.execute-node.v1"
 	activityBeginApproval = "orchigram.begin-approval.v1"
 	activityEndApproval   = "orchigram.end-approval.v1"
+	activityBeginEvent    = "orchigram.begin-event.v1"
+	activityEndEvent      = "orchigram.end-event.v1"
+	activityIgnoreEvent   = "orchigram.ignore-event.v1"
 	activitySkipNode      = "orchigram.skip-node.v1"
 	activityCancelCalls   = "orchigram.cancel-active-calls.v1"
 	activityCompleteRun   = "orchigram.complete-run.v1"
@@ -38,6 +41,7 @@ const (
 type DurableEngine interface {
 	Start(context.Context, string, flow.ExecutionPlan, json.RawMessage) error
 	Signal(context.Context, string, string, ApprovalSignal) error
+	SignalEvent(context.Context, string, string, EventSignal) error
 	Cancel(context.Context, string, string) error
 	Reconcile(context.Context) error
 	Describe(context.Context, string) (store.Run, error)
@@ -87,6 +91,13 @@ type ApprovalSignal struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// EventSignal is the framework-independent external event envelope. Stable
+// provider IDs let the interpreter ignore at-least-once signal redelivery.
+type EventSignal struct {
+	ProviderEventID string          `json:"providerEventID"`
+	Payload         json.RawMessage `json:"payload"`
+}
+
 // Adapter runs one stable data-driven interpreter on go-workflows.
 type Adapter struct {
 	backend   backend.Backend
@@ -121,6 +132,9 @@ func Open(ctx context.Context, workflowDBPath string, state *store.Store, execut
 		{activityExecuteNode, activities.ExecuteNode},
 		{activityBeginApproval, activities.BeginApproval},
 		{activityEndApproval, activities.EndApproval},
+		{activityBeginEvent, activities.BeginEvent},
+		{activityEndEvent, activities.EndEvent},
+		{activityIgnoreEvent, activities.IgnoreEvent},
 		{activitySkipNode, activities.SkipNode},
 		{activityCancelCalls, activities.CancelActiveCalls},
 		{activityCompleteRun, activities.CompleteRun},
@@ -191,6 +205,11 @@ func (a *Adapter) Start(ctx context.Context, runUID string, plan flow.ExecutionP
 // Signal delivers a durable approval decision.
 func (a *Adapter) Signal(ctx context.Context, runUID, nodeID string, signal ApprovalSignal) error {
 	return a.client.SignalWorkflow(ctx, runUID, approvalSignalName(nodeID), signal)
+}
+
+// SignalEvent durably delivers one external occurrence to a core.event node.
+func (a *Adapter) SignalEvent(ctx context.Context, runUID, nodeID string, signal EventSignal) error {
+	return a.client.SignalWorkflow(ctx, runUID, eventSignalName(nodeID), signal)
 }
 
 // Cancel cancels a workflow instance after the daemon records operator intent.
@@ -431,13 +450,14 @@ func executePlanComponent(ctx workflowRuntime.Context, runUID string, plan flow.
 		return result
 	}
 	localNodes := cloneNodeOutputs(inputNodes)
+	seenEventIDs := map[string]bool{}
 	record := func(nodeID string, nodeResult NodeResult) {
 		model.recordResult(nodeID, nodeResult, result.edgeActive, localNodes)
 		result.outputs[nodeID] = localNodes[nodeID]
 	}
 	if !component.cyclic {
 		node := model.nodes[component.nodes[0]]
-		nodeResult, err := executePlanNode(ctx, NodeRequest{RunUID: runUID, Node: node, Iteration: 0, Outgoing: model.outgoingEdges(node.ID, plan), Input: input, Nodes: localNodes})
+		nodeResult, err := executePlanNode(ctx, NodeRequest{RunUID: runUID, Node: node, Iteration: 0, Outgoing: model.outgoingEdges(node.ID, plan), Input: input, Nodes: localNodes}, seenEventIDs)
 		if err != nil {
 			result.errorText = err.Error()
 			return result
@@ -470,7 +490,7 @@ func executePlanComponent(ctx workflowRuntime.Context, runUID string, plan flow.
 		node := model.nodes[nodeID]
 		iteration := counts[nodeID]
 		counts[nodeID]++
-		nodeResult, err := executePlanNode(ctx, NodeRequest{RunUID: runUID, Node: node, Iteration: iteration, Outgoing: model.outgoingEdges(node.ID, plan), Input: input, Nodes: localNodes})
+		nodeResult, err := executePlanNode(ctx, NodeRequest{RunUID: runUID, Node: node, Iteration: iteration, Outgoing: model.outgoingEdges(node.ID, plan), Input: input, Nodes: localNodes}, seenEventIDs)
 		if err != nil {
 			result.errorText = err.Error()
 			return result
@@ -672,12 +692,15 @@ func (m componentModel) recordResult(nodeID string, result NodeResult, edgeActiv
 	}
 }
 
-func executePlanNode(ctx workflowRuntime.Context, request NodeRequest) (NodeResult, error) {
-	if request.Node.Uses != "core.approval" {
+func executePlanNode(ctx workflowRuntime.Context, request NodeRequest, seenEventIDs map[string]bool) (NodeResult, error) {
+	if request.Node.Uses != "core.approval" && request.Node.Uses != "core.event" {
 		backoff, _ := time.ParseDuration(request.Node.RetryBackoff)
 		timeout, _ := time.ParseDuration(request.Node.Timeout)
 		options := workflowRuntime.ActivityOptions{RetryOptions: workflowRuntime.RetryOptions{MaxAttempts: request.Node.RetryLimit + 1, FirstRetryInterval: backoff, BackoffCoefficient: 2, RetryTimeout: timeout}}
 		return workflowRuntime.ExecuteActivity[NodeResult](ctx, options, activityExecuteNode, request).Get(ctx)
+	}
+	if request.Node.Uses == "core.event" {
+		return executeEventNode(ctx, request, seenEventIDs)
 	}
 	if _, err := workflowRuntime.ExecuteActivity[bool](ctx, workflowRuntime.DefaultActivityOptions, activityBeginApproval, request).Get(ctx); err != nil {
 		return NodeResult{}, err
@@ -700,6 +723,51 @@ func executePlanNode(ctx workflowRuntime.Context, request NodeRequest) (NodeResu
 		workflowRuntime.Await(timer, func(workflowRuntime.Context, workflowRuntime.Future[any]) {}),
 	)
 	return workflowRuntime.ExecuteActivity[NodeResult](ctx, workflowRuntime.DefaultActivityOptions, activityEndApproval, request, signal).Get(ctx)
+}
+
+func executeEventNode(ctx workflowRuntime.Context, request NodeRequest, seenEventIDs map[string]bool) (NodeResult, error) {
+	if _, err := workflowRuntime.ExecuteActivity[bool](ctx, workflowRuntime.DefaultActivityOptions, activityBeginEvent, request).Get(ctx); err != nil {
+		return NodeResult{}, err
+	}
+	signalChannel := workflowRuntime.NewSignalChannel[EventSignal](ctx, eventSignalName(request.Node.ID))
+	timeout, err := time.ParseDuration(request.Node.Timeout)
+	if err != nil {
+		return NodeResult{}, err
+	}
+	timerContext, cancelTimer := workflowRuntime.WithCancel(ctx)
+	defer cancelTimer()
+	timer := workflowRuntime.ScheduleTimer(timerContext, timeout, workflowRuntime.WithTimerName(fmt.Sprintf("event-timeout-%s-%d", request.Node.ID, request.Iteration)))
+	for {
+		var signal EventSignal
+		received, expired := false, false
+		workflowRuntime.Select(ctx,
+			workflowRuntime.Receive(signalChannel, func(_ workflowRuntime.Context, value EventSignal, ok bool) {
+				if ok {
+					signal, received = value, true
+				}
+			}),
+			workflowRuntime.Await(timer, func(workflowRuntime.Context, workflowRuntime.Future[any]) { expired = true }),
+		)
+		if expired {
+			return NodeResult{}, fmt.Errorf("external event node %s timed out", request.Node.ID)
+		}
+		if !received || signal.ProviderEventID == "" || !json.Valid(signal.Payload) {
+			return NodeResult{}, fmt.Errorf("external event node %s received an invalid signal", request.Node.ID)
+		}
+		var object map[string]any
+		if err := json.Unmarshal(signal.Payload, &object); err != nil || object == nil {
+			return NodeResult{}, fmt.Errorf("external event node %s requires a JSON object payload", request.Node.ID)
+		}
+		if seenEventIDs[signal.ProviderEventID] {
+			if _, err := workflowRuntime.ExecuteActivity[bool](ctx, workflowRuntime.DefaultActivityOptions, activityIgnoreEvent, request, signal).Get(ctx); err != nil {
+				return NodeResult{}, err
+			}
+			continue
+		}
+		seenEventIDs[signal.ProviderEventID] = true
+		cancelTimer()
+		return workflowRuntime.ExecuteActivity[NodeResult](ctx, workflowRuntime.DefaultActivityOptions, activityEndEvent, request, signal).Get(ctx)
+	}
 }
 
 func skipPlanNode(ctx workflowRuntime.Context, runUID, nodeID string) error {
@@ -851,6 +919,35 @@ func (a *Activities) EndApproval(ctx context.Context, request NodeRequest, signa
 	return NodeResult{Output: output, Activated: activated, Rejected: state != "approved"}, nil
 }
 
+// BeginEvent records the durable wait in the product projection before the
+// workflow suspends on its signal channel.
+func (a *Activities) BeginEvent(ctx context.Context, request NodeRequest) (bool, error) {
+	return true, a.store.AppendRunEvent(ctx, request.RunUID, request.Node.ID, "event.waiting", "waiting", uint32(request.Iteration+1), nil) //nolint:gosec // Iterations are bounded below 1000.
+}
+
+// EndEvent projects the accepted payload and evaluates declarative edges.
+func (a *Activities) EndEvent(ctx context.Context, request NodeRequest, signal EventSignal) (NodeResult, error) {
+	activated, err := evaluate(request, signal.Payload)
+	if err != nil {
+		return NodeResult{}, err
+	}
+	var payload any
+	if err := json.Unmarshal(signal.Payload, &payload); err != nil {
+		return NodeResult{}, err
+	}
+	evidence := mustJSON(map[string]any{"providerEventID": signal.ProviderEventID, "payload": payload})
+	if err := a.store.AppendRunEvent(ctx, request.RunUID, request.Node.ID, "event.received", "running", uint32(request.Iteration+1), evidence); err != nil { //nolint:gosec // Iterations are bounded below 1000.
+		return NodeResult{}, err
+	}
+	return NodeResult{Output: signal.Payload, Activated: activated}, nil
+}
+
+// IgnoreEvent records at-least-once redelivery without advancing the graph.
+func (a *Activities) IgnoreEvent(ctx context.Context, request NodeRequest, signal EventSignal) (bool, error) {
+	payload := mustJSON(map[string]any{"providerEventID": signal.ProviderEventID})
+	return true, a.store.AppendRunEvent(ctx, request.RunUID, request.Node.ID, "event.duplicate", "waiting", uint32(request.Iteration+1), payload) //nolint:gosec // Iterations are bounded below 1000.
+}
+
 // SkipNode records a conditional skip.
 func (a *Activities) SkipNode(ctx context.Context, runUID, nodeID string) (bool, error) {
 	return true, a.store.AppendRunEvent(ctx, runUID, nodeID, "node.skipped", "running", 0, nil)
@@ -902,3 +999,4 @@ func mustJSON(value any) json.RawMessage {
 }
 
 func approvalSignalName(nodeID string) string { return "approval:" + nodeID }
+func eventSignalName(nodeID string) string    { return "event:" + nodeID }

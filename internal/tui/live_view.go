@@ -68,11 +68,11 @@ func applyRunEventStatuses(graph *Graph, events []*controlv1alpha1.RunEvent) {
 		switch event.GetType() {
 		case "node.started":
 			status = "running"
-		case "node.completed", "approval.approved":
+		case "node.completed", "approval.approved", "event.received":
 			status = "completed"
 		case "node.failed":
 			status = "failed"
-		case "approval.waiting":
+		case "approval.waiting", "event.waiting", "event.duplicate":
 			status = "waiting"
 		case "approval.rejected":
 			status = "rejected"

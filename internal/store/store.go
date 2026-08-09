@@ -702,6 +702,17 @@ type StartPayload struct {
 	IdempotencyKey string          `json:"idempotencyKey"`
 }
 
+// SignalPayload is the durable normalized command used to resume one pinned
+// workflow node from an accepted external occurrence.
+type SignalPayload struct {
+	RunUID          string          `json:"runUID"`
+	ReceiptUID      string          `json:"receiptUID"`
+	NodeID          string          `json:"nodeID"`
+	ProviderEventID string          `json:"providerEventID"`
+	Payload         json.RawMessage `json:"payload"`
+	IdempotencyKey  string          `json:"idempotencyKey"`
+}
+
 // Receipt is the durable acknowledgement of one external occurrence.
 type Receipt struct {
 	UID          string
@@ -735,6 +746,67 @@ func (s *Store) AcceptProviderTrigger(ctx context.Context, triggerUID string, tr
 // immutable plan, and outbox command after validating the Trigger generation.
 func (s *Store) AcceptProviderTriggerWithPlan(ctx context.Context, triggerUID string, triggerGeneration uint64, occurrenceID, flowName, namespace string, input json.RawMessage, cursor string, plan flow.ExecutionPlan) (Receipt, error) {
 	return s.acceptTrigger(ctx, triggerUID, triggerGeneration, occurrenceID, flowName, namespace, input, true, cursor, occurrenceID, nil, &plan)
+}
+
+// AcceptProviderSignal atomically persists a provider cursor, receipt, and
+// at-least-once signal outbox command for an already active pinned Run.
+func (s *Store) AcceptProviderSignal(ctx context.Context, triggerUID string, triggerGeneration uint64, occurrenceID, flowName, namespace, runUID, nodeID string, payload json.RawMessage, cursor string) (Receipt, error) {
+	if namespace == "" {
+		namespace = resource.DefaultNamespace
+	}
+	if !json.Valid(payload) {
+		return Receipt{}, errors.New("provider signal payload must be valid JSON")
+	}
+	var object map[string]any
+	if err := json.Unmarshal(payload, &object); err != nil || object == nil {
+		return Receipt{}, errors.New("provider signal payload must be a JSON object")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Receipt{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := validateTriggerAcceptanceTx(ctx, tx, triggerUID, triggerGeneration, flowName, namespace); err != nil {
+		return Receipt{}, err
+	}
+	existing, err := receiptByOccurrence(ctx, tx, triggerUID, occurrenceID)
+	if err == nil {
+		existing.Existing = true
+		if err := upsertProviderCursor(ctx, tx, triggerUID, cursor, occurrenceID, s.timestamp()); err != nil {
+			return Receipt{}, err
+		}
+		return existing, tx.Commit()
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return Receipt{}, err
+	}
+	if err := validateSignalTargetTx(ctx, tx, flowName, namespace, runUID, nodeID); err != nil {
+		return Receipt{}, err
+	}
+	now := s.timestamp()
+	receipt := Receipt{UID: uuid.NewString(), TriggerUID: triggerUID, OccurrenceID: occurrenceID, RunUID: runUID, Deduplicated: true}
+	receipt.AcceptedAt, _ = time.Parse(time.RFC3339Nano, now)
+	command := SignalPayload{
+		RunUID: runUID, ReceiptUID: receipt.UID, NodeID: nodeID, ProviderEventID: occurrenceID,
+		Payload: payload, IdempotencyKey: "signal/" + triggerUID + "/" + occurrenceID,
+	}
+	commandJSON, err := json.Marshal(command)
+	if err != nil {
+		return Receipt{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO trigger_receipts(uid,trigger_uid,occurrence_id,provider_cursor,payload_json,deduplicated,run_uid,accepted_at) VALUES(?,?,?,?,?,?,?,?)`, receipt.UID, triggerUID, occurrenceID, cursor, payload, 1, runUID, now); err != nil {
+		return Receipt{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO outbox(command_type,aggregate_uid,idempotency_key,payload_json,state,available_at) VALUES(?,?,?,?,?,?)`, "signal-run", runUID, command.IdempotencyKey, commandJSON, "pending", now); err != nil {
+		return Receipt{}, err
+	}
+	if err := upsertProviderCursor(ctx, tx, triggerUID, cursor, occurrenceID, now); err != nil {
+		return Receipt{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Receipt{}, err
+	}
+	return receipt, nil
 }
 
 func (s *Store) acceptProviderTrigger(ctx context.Context, triggerUID string, triggerGeneration uint64, occurrenceID, flowName, namespace string, input json.RawMessage, cursor string, afterValidation func()) (Receipt, error) {
@@ -863,6 +935,52 @@ func validateFlowPlanTx(ctx context.Context, tx *sql.Tx, flowName, namespace str
 	return nil
 }
 
+func validateSignalTargetTx(ctx context.Context, tx *sql.Tx, flowName, namespace, runUID, nodeID string) error {
+	if runUID == "" || nodeID == "" {
+		return errors.New("provider signal target run and node are required")
+	}
+	var planHash, phase string
+	if err := tx.QueryRowContext(ctx, `SELECT plan_hash,phase FROM runs WHERE uid=?`, runUID).Scan(&planHash, &phase); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if terminalRunPhase(phase) {
+		return fmt.Errorf("signal target run %s is already %s", runUID, phase)
+	}
+	var flowUID string
+	if err := tx.QueryRowContext(ctx, `SELECT uid FROM resources WHERE kind='Flow' AND namespace=? AND name=?`, namespace, flowName).Scan(&flowUID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	var planJSON []byte
+	if err := tx.QueryRowContext(ctx, `SELECT plan_json FROM compiled_plans WHERE plan_hash=?`, planHash).Scan(&planJSON); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	var plan flow.ExecutionPlan
+	if err := json.Unmarshal(planJSON, &plan); err != nil {
+		return errors.New("signal target run has an invalid pinned plan")
+	}
+	if plan.FlowUID != flowUID {
+		return errors.New("signal target run belongs to a different Flow")
+	}
+	for _, node := range plan.Nodes {
+		if node.ID == nodeID {
+			if node.Uses != "core.event" {
+				return fmt.Errorf("signal target node %s is not a core.event node", nodeID)
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("signal target node %s is not present in the pinned plan", nodeID)
+}
+
 func upsertProviderCursor(ctx context.Context, tx *sql.Tx, triggerUID, cursor, eventID, now string) error {
 	_, err := tx.ExecContext(ctx, `INSERT INTO provider_cursors(trigger_uid,cursor,provider_event_id,acknowledged_at) VALUES(?,?,?,?) ON CONFLICT(trigger_uid) DO UPDATE SET cursor=excluded.cursor,provider_event_id=excluded.provider_event_id,acknowledged_at=excluded.acknowledged_at`, triggerUID, cursor, eventID, now)
 	return err
@@ -908,6 +1026,23 @@ type OutboxCommand struct {
 	Attempts int
 }
 
+// SignalCommand is a claimed durable workflow-resume command.
+type SignalCommand struct {
+	ID       int64
+	Payload  SignalPayload
+	Attempts int
+}
+
+// DispatchCommand is the next globally ordered durable outbox command. Exactly
+// one payload is populated according to Type.
+type DispatchCommand struct {
+	ID       int64
+	Type     string
+	Start    *StartPayload
+	Signal   *SignalPayload
+	Attempts int
+}
+
 // OutboxStatus is the secret-free readiness projection for durable dispatch.
 type OutboxStatus struct {
 	Active int
@@ -947,6 +1082,77 @@ func (s *Store) ClaimStart(ctx context.Context, staleAfter time.Duration) (Outbo
 	command.Attempts++
 	if err := tx.Commit(); err != nil {
 		return OutboxCommand{}, err
+	}
+	return command, nil
+}
+
+// ClaimSignal claims one pending or stale external signal command.
+func (s *Store) ClaimSignal(ctx context.Context, staleAfter time.Duration) (SignalCommand, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return SignalCommand{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	stale := s.now().UTC().Add(-staleAfter).Format(time.RFC3339Nano)
+	var command SignalCommand
+	var payload []byte
+	if err := tx.QueryRowContext(ctx, `SELECT id,payload_json,attempts FROM outbox WHERE command_type='signal-run' AND (state='pending' OR (state='inflight' AND claimed_at<?)) AND available_at<=? ORDER BY id LIMIT 1`, stale, s.timestamp()).Scan(&command.ID, &payload, &command.Attempts); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return SignalCommand{}, ErrNotFound
+		}
+		return SignalCommand{}, err
+	}
+	if err := json.Unmarshal(payload, &command.Payload); err != nil {
+		return SignalCommand{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE outbox SET state='inflight',attempts=attempts+1,claimed_at=? WHERE id=?`, s.timestamp(), command.ID); err != nil {
+		return SignalCommand{}, err
+	}
+	command.Attempts++
+	if err := tx.Commit(); err != nil {
+		return SignalCommand{}, err
+	}
+	return command, nil
+}
+
+// ClaimNext claims the oldest eligible runtime command regardless of its
+// concrete type. Keeping one global FIFO prevents a stream of new starts from
+// starving an already accepted external signal.
+func (s *Store) ClaimNext(ctx context.Context, staleAfter time.Duration) (DispatchCommand, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return DispatchCommand{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	stale := s.now().UTC().Add(-staleAfter).Format(time.RFC3339Nano)
+	var command DispatchCommand
+	var payload []byte
+	if err := tx.QueryRowContext(ctx, `SELECT id,command_type,payload_json,attempts FROM outbox WHERE command_type IN ('start-run','signal-run') AND (state='pending' OR (state='inflight' AND claimed_at<?)) AND available_at<=? ORDER BY id LIMIT 1`, stale, s.timestamp()).Scan(&command.ID, &command.Type, &payload, &command.Attempts); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return DispatchCommand{}, ErrNotFound
+		}
+		return DispatchCommand{}, err
+	}
+	switch command.Type {
+	case "start-run":
+		command.Start = &StartPayload{}
+		if err := json.Unmarshal(payload, command.Start); err != nil {
+			return DispatchCommand{}, err
+		}
+	case "signal-run":
+		command.Signal = &SignalPayload{}
+		if err := json.Unmarshal(payload, command.Signal); err != nil {
+			return DispatchCommand{}, err
+		}
+	default:
+		return DispatchCommand{}, fmt.Errorf("unsupported outbox command type %q", command.Type)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE outbox SET state='inflight',attempts=attempts+1,claimed_at=? WHERE id=?`, s.timestamp(), command.ID); err != nil {
+		return DispatchCommand{}, err
+	}
+	command.Attempts++
+	if err := tx.Commit(); err != nil {
+		return DispatchCommand{}, err
 	}
 	return command, nil
 }

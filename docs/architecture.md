@@ -23,7 +23,7 @@ enabled state, target Flow name, and compiled Flow UID/generation inside the
 receipt/plan/outbox transaction. See [Resource references](resource-references.md).
 
 The daemon owns triggers, receipts, the transactional outbox, run state,
-physical attempt evidence, approvals, plugin lifecycle, workspaces, and
+physical attempt evidence, approvals, durable external event signals, plugin lifecycle, workspaces, and
 artifacts. Plugins own only provider-specific trigger, task, or agent behavior.
 Public resources never expose go-workflows or go-plugin types. Run inspection
 uses `RunService`: event replay includes validated plugin stream events,

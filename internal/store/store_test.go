@@ -508,6 +508,199 @@ func TestTriggerReceiptAndOutboxAreDeduplicated(t *testing.T) {
 	}
 }
 
+func TestProviderSignalReceiptCursorAndOutboxAreAtomicAndDeduplicated(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	state := openTestStore(t)
+	flowDocument, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: review-loop}
+spec:
+  nodes: [{id: review, uses: core.event, timeout: 1h}]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedFlow, err := state.Apply(ctx, flowDocument, ApplyOptions{RequestID: "signal-flow"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := flow.ExecutionPlan{
+		APIVersion: resource.APIVersion, FlowUID: storedFlow.Metadata.UID, FlowGeneration: storedFlow.Metadata.Generation,
+		InterpreterVersion: flow.InterpreterVersion, Timeout: "1h0m0s", MaxParallel: 1, PlanHash: "signal-plan",
+		Nodes: []flow.PlanNode{{ID: "review", Name: "review", Uses: "core.event", Timeout: "1h0m0s", RetryBackoff: "1s"}},
+	}
+	startReceipt, err := state.AcceptTriggerWithPlan(ctx, "manual", 0, "signal-run-start", "review-loop", "default", json.RawMessage(`{}`), true, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, err := state.ClaimStart(ctx, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.EnsureRun(ctx, start.Payload, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.CompleteOutbox(ctx, start.ID); err != nil {
+		t.Fatal(err)
+	}
+	triggerDocument, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata: {name: reviews}
+spec:
+  flow: review-loop
+  provider: {plugin: github, config: {repository: fixture}}
+  delivery: {mode: signal, node: review}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	trigger, err := state.Apply(ctx, triggerDocument, ApplyOptions{RequestID: "signal-trigger"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.EnsureTriggerState(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	payload := json.RawMessage(`{"review":{"state":"changes_requested"}}`)
+	receipt, err := state.AcceptProviderSignal(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, "review-event-11", "review-loop", "default", startReceipt.RunUID, "review", payload, "11")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.RunUID != startReceipt.RunUID {
+		t.Fatalf("signal run=%q want=%q", receipt.RunUID, startReceipt.RunUID)
+	}
+	command, err := state.ClaimSignal(ctx, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if command.Payload.RunUID != startReceipt.RunUID || command.Payload.NodeID != "review" || command.Payload.ProviderEventID != "review-event-11" || string(command.Payload.Payload) != string(payload) {
+		t.Fatalf("signal command=%+v", command)
+	}
+	replayed, err := state.AcceptProviderSignal(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, "review-event-11", "review-loop", "default", startReceipt.RunUID, "review", payload, "11")
+	if err != nil || !replayed.Existing || replayed.UID != receipt.UID {
+		t.Fatalf("replayed receipt=%+v err=%v", replayed, err)
+	}
+	if err := state.CompleteOutbox(ctx, command.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.ClaimSignal(ctx, time.Hour); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("duplicate signal command error=%v", err)
+	}
+	cursor, eventID, err := state.ProviderCursor(ctx, trigger.Metadata.UID)
+	if err != nil || cursor != "11" || eventID != "review-event-11" {
+		t.Fatalf("cursor=%q event=%q err=%v", cursor, eventID, err)
+	}
+	if _, err := state.AcceptProviderSignal(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, "review-event-12", "review-loop", "default", startReceipt.RunUID, "missing", payload, "12"); err == nil || !strings.Contains(err.Error(), "not present") {
+		t.Fatalf("missing node signal error=%v", err)
+	}
+	cursor, _, _ = state.ProviderCursor(ctx, trigger.Metadata.UID)
+	if cursor != "11" {
+		t.Fatalf("rejected signal advanced cursor to %q", cursor)
+	}
+	if _, err := state.AcceptProviderSignal(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, "review-event-malformed", "review-loop", "default", startReceipt.RunUID, "review", json.RawMessage(`[]`), "malformed"); err == nil || !strings.Contains(err.Error(), "JSON object") {
+		t.Fatalf("malformed signal error=%v", err)
+	}
+	cursor, _, _ = state.ProviderCursor(ctx, trigger.Metadata.UID)
+	if cursor != "11" {
+		t.Fatalf("malformed signal advanced cursor to %q", cursor)
+	}
+	if _, err := state.AcceptProviderSignal(ctx, trigger.Metadata.UID, trigger.Metadata.Generation+1, "review-event-stale", "review-loop", "default", startReceipt.RunUID, "review", payload, "stale"); err == nil {
+		t.Fatal("stale Trigger generation accepted a signal")
+	} else {
+		var stale *StaleTriggerGenerationError
+		if !errors.As(err, &stale) {
+			t.Fatalf("stale Trigger signal error=%T %v", err, err)
+		}
+	}
+	if err := state.SetTriggerEnabled(ctx, trigger.Metadata.UID, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.AcceptProviderSignal(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, "review-event-disabled", "review-loop", "default", startReceipt.RunUID, "review", payload, "disabled"); !errors.Is(err, ErrTriggerDisabled) {
+		t.Fatalf("disabled Trigger signal error=%v", err)
+	}
+	if err := state.SetTriggerEnabled(ctx, trigger.Metadata.UID, true); err != nil {
+		t.Fatal(err)
+	}
+	otherDocument, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: other-flow}
+spec:
+  nodes: [{id: review, uses: core.event}]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherFlow, err := state.Apply(ctx, otherDocument, ApplyOptions{RequestID: "other-signal-flow"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPlan := plan
+	otherPlan.FlowUID = otherFlow.Metadata.UID
+	otherPlan.FlowGeneration = otherFlow.Metadata.Generation
+	otherPlan.PlanHash = "other-signal-plan"
+	otherReceipt, err := state.AcceptTriggerWithPlan(ctx, "manual", 0, "other-signal-run", "other-flow", "default", json.RawMessage(`{}`), true, otherPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherStart, err := state.ClaimStart(ctx, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.EnsureRun(ctx, otherStart.Payload, otherPlan); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.CompleteOutbox(ctx, otherStart.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.AcceptProviderSignal(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, "review-event-wrong-flow", "review-loop", "default", otherReceipt.RunUID, "review", payload, "wrong-flow"); err == nil || !strings.Contains(err.Error(), "different Flow") {
+		t.Fatalf("wrong Flow signal error=%v", err)
+	}
+	if err := state.AppendRunEvent(ctx, startReceipt.RunUID, "review", "run.completed", "succeeded", 1, json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.AcceptProviderSignal(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, "review-event-terminal", "review-loop", "default", startReceipt.RunUID, "review", payload, "terminal"); err == nil || !strings.Contains(err.Error(), "already succeeded") {
+		t.Fatalf("terminal run signal error=%v", err)
+	}
+	cursor, _, _ = state.ProviderCursor(ctx, trigger.Metadata.UID)
+	if cursor != "11" {
+		t.Fatalf("rejected signal advanced cursor to %q", cursor)
+	}
+}
+
+func TestClaimNextPreservesGlobalOutboxOrderAcrossCommandTypes(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	state := openTestStore(t)
+	now := state.timestamp()
+	commands := []struct {
+		commandType string
+		aggregate   string
+		payload     string
+	}{
+		{commandType: "start-run", aggregate: "run-1", payload: `{"runUID":"run-1","input":{}}`},
+		{commandType: "signal-run", aggregate: "run-1", payload: `{"runUID":"run-1","nodeID":"review","providerEventID":"review-1","payload":{}}`},
+		{commandType: "start-run", aggregate: "run-2", payload: `{"runUID":"run-2","input":{}}`},
+	}
+	for index, command := range commands {
+		if _, err := state.db.ExecContext(ctx, `INSERT INTO outbox(command_type,aggregate_uid,idempotency_key,payload_json,state,available_at) VALUES(?,?,?,?,?,?)`, command.commandType, command.aggregate, fmt.Sprintf("ordered-%d", index), command.payload, "pending", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for index, wantType := range []string{"start-run", "signal-run", "start-run"} {
+		command, err := state.ClaimNext(ctx, time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if command.Type != wantType {
+			t.Fatalf("claim %d type=%q want=%q", index, command.Type, wantType)
+		}
+		if err := state.CompleteOutbox(ctx, command.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestAcceptedPlanAndOutboxAreCommittedTogether(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

@@ -1159,8 +1159,10 @@ type TriggerEvent struct {
 	Cursor          string                 `protobuf:"bytes,2,opt,name=cursor,proto3" json:"cursor,omitempty"`
 	OccurredAt      *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=occurred_at,json=occurredAt,proto3" json:"occurred_at,omitempty"`
 	PayloadJson     []byte                 `protobuf:"bytes,4,opt,name=payload_json,json=payloadJson,proto3" json:"payload_json,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// target_run_uid is required only when the Trigger opts into signal delivery.
+	TargetRunUid  string `protobuf:"bytes,5,opt,name=target_run_uid,json=targetRunUid,proto3" json:"target_run_uid,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *TriggerEvent) Reset() {
@@ -1219,6 +1221,13 @@ func (x *TriggerEvent) GetPayloadJson() []byte {
 		return x.PayloadJson
 	}
 	return nil
+}
+
+func (x *TriggerEvent) GetTargetRunUid() string {
+	if x != nil {
+		return x.TargetRunUid
+	}
+	return ""
 }
 
 type AgentRequest struct {
@@ -1442,13 +1451,14 @@ const file_orchigram_plugin_v1alpha1_plugin_proto_rawDesc = "" +
 	"\x0eTriggerCommand\x12=\n" +
 	"\x05start\x18\x01 \x01(\v2%.orchigram.plugin.v1alpha1.WatchStartH\x00R\x05start\x129\n" +
 	"\x03ack\x18\x02 \x01(\v2%.orchigram.plugin.v1alpha1.TriggerAckH\x00R\x03ackB\a\n" +
-	"\x05value\"\xb2\x01\n" +
+	"\x05value\"\xd8\x01\n" +
 	"\fTriggerEvent\x12*\n" +
 	"\x11provider_event_id\x18\x01 \x01(\tR\x0fproviderEventId\x12\x16\n" +
 	"\x06cursor\x18\x02 \x01(\tR\x06cursor\x12;\n" +
 	"\voccurred_at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
 	"occurredAt\x12!\n" +
-	"\fpayload_json\x18\x04 \x01(\fR\vpayloadJson\"\xb8\x02\n" +
+	"\fpayload_json\x18\x04 \x01(\fR\vpayloadJson\x12$\n" +
+	"\x0etarget_run_uid\x18\x05 \x01(\tR\ftargetRunUid\"\xb8\x02\n" +
 	"\fAgentRequest\x127\n" +
 	"\x04meta\x18\x01 \x01(\v2#.orchigram.plugin.v1alpha1.CallMetaR\x04meta\x12!\n" +
 	"\fprofile_type\x18\x02 \x01(\tR\vprofileType\x12!\n" +
