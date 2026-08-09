@@ -86,6 +86,7 @@ type activeProviderCall struct {
 	meta    *pluginv1alpha1.CallMeta
 	kind    string
 	cancel  context.CancelFunc
+	done    chan struct{}
 	stop    func() bool
 	once    sync.Once
 }
@@ -1776,7 +1777,7 @@ func (m *Manager) registerArtifact(ctx context.Context, identity runArtifact, ar
 }
 
 func (m *Manager) registerActiveCall(ctx context.Context, process *pluginhost.Process, meta *pluginv1alpha1.CallMeta, kind string, cancel context.CancelFunc) *activeProviderCall {
-	call := &activeProviderCall{process: process, meta: meta, kind: kind, cancel: cancel}
+	call := &activeProviderCall{process: process, meta: meta, kind: kind, cancel: cancel, done: make(chan struct{})}
 	m.mu.Lock()
 	m.active[meta.GetRequestId()] = call
 	m.mu.Unlock()
@@ -1793,6 +1794,7 @@ func (m *Manager) releaseActiveCall(requestID string, call *activeProviderCall) 
 		delete(m.active, requestID)
 	}
 	m.mu.Unlock()
+	close(call.done)
 }
 
 func contextCause(ctx context.Context) string {
@@ -1805,15 +1807,34 @@ func contextCause(ctx context.Context) string {
 func (m *Manager) cancelProviderCall(call *activeProviderCall, reason string) {
 	call.once.Do(func() {
 		cancelContext, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
 		request := &pluginv1alpha1.CancelRequest{Meta: call.meta, Reason: reason}
+		var response *pluginv1alpha1.CancelResponse
+		var err error
 		if call.kind == "agent" {
-			_, _ = call.process.Clients().Agent.Cancel(cancelContext, request)
+			response, err = call.process.Clients().Agent.Cancel(cancelContext, request)
 		} else {
-			_, _ = call.process.Clients().Task.Cancel(cancelContext, request)
+			response, err = call.process.Clients().Task.Cancel(cancelContext, request)
 		}
-		cancel()
+		// A cooperative plugin may need a final scheduling turn after its Cancel
+		// handler returns to emit the terminal stream event. Keep the client stream
+		// alive until that event has been consumed and the active call is released.
+		// Non-cooperative or malformed plugins still lose the RPC context at the
+		// existing bounded cancellation deadline.
+		if err == nil && response.GetAccepted() && awaitProviderCallTermination(cancelContext, call.done) {
+			return
+		}
 		call.cancel()
 	})
+}
+
+func awaitProviderCallTermination(ctx context.Context, done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // CancelRun propagates durable Run cancellation to every active task or agent call.
