@@ -363,33 +363,6 @@ func TestFlowCASRetryRequiresSameUIDAndGeneration(t *testing.T) {
 	}
 }
 
-func TestLiveResourceRefreshPreservesOpenFormPointer(t *testing.T) {
-	captured := &controlv1alpha1.ResourceDocument{
-		Key:             &controlv1alpha1.ResourceKey{Kind: "Flow", Namespace: "default", Name: "demo", Uid: "flow-uid"},
-		ResourceVersion: 10,
-		Generation:      2,
-		Json:            []byte(`{"old":true}`),
-	}
-	selected := captured
-	updated := &controlv1alpha1.ResourceDocument{
-		Key:             &controlv1alpha1.ResourceKey{Kind: "Flow", Namespace: "default", Name: "demo", Uid: "flow-uid"},
-		ResourceVersion: 12,
-		Generation:      3,
-		Json:            []byte(`{"new":true}`),
-	}
-	selected = refreshSelectedResource(selected, updated)
-	if selected != captured {
-		t.Fatal("live refresh detached an open form from the selected resource")
-	}
-	if captured.GetResourceVersion() != 12 || captured.GetGeneration() != 3 || string(captured.GetJson()) != `{"new":true}` {
-		t.Fatalf("captured document was not refreshed in place: %+v", captured)
-	}
-	updated.Json[2] = 'X'
-	if string(captured.GetJson()) != `{"new":true}` {
-		t.Fatal("live refresh retained mutable storage from the snapshot")
-	}
-}
-
 func TestFlowCASRetriesRepeatedStatusOnlyRevisions(t *testing.T) {
 	t.Parallel()
 	documentJSON := []byte(`apiVersion: orchigram.dev/v1alpha1

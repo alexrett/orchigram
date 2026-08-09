@@ -16,7 +16,6 @@ import (
 	"github.com/alexrett/orchigram/internal/resource"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"gopkg.in/yaml.v3"
 )
@@ -110,7 +109,9 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 	}
 	graph.SetOnSelect(setInspector).SetOnOpen(func(node flow.PlanNode) {
 		if currentRun == "" && currentResource != nil && currentResource.GetKey().GetKind() == "Flow" {
-			openFlowNodeForm(ctx, application, pages, client, currentResource, node, events, graph)
+			openFlowNodeForm(ctx, application, pages, client, currentResource, node, events, graph, func(applied *controlv1alpha1.ResourceDocument) {
+				currentResource = cloneMessage(applied)
+			})
 			return
 		}
 		modal := tview.NewModal().SetText(tview.Escape(fmt.Sprintf("%s\n\nID: %s\nAction: %s\nTimeout: %s", node.Name, node.ID, node.Uses, node.Timeout))).AddButtons([]string{"Close"})
@@ -119,7 +120,9 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 		application.SetFocus(modal)
 	}).SetOnSelectEdge(setEdgeInspector).SetOnOpenEdge(func(edge flow.PlanEdge, index int) {
 		if currentRun == "" && currentResource != nil && currentResource.GetKey().GetKind() == "Flow" {
-			openFlowEdgeForm(ctx, application, pages, client, currentResource, edge, index, events, graph)
+			openFlowEdgeForm(ctx, application, pages, client, currentResource, edge, index, events, graph, func(applied *controlv1alpha1.ResourceDocument) {
+				currentResource = cloneMessage(applied)
+			})
 			return
 		}
 		modal := tview.NewModal().SetText(tview.Escape(fmt.Sprintf("Edge\n\nFrom: %s\nTo: %s\nCondition: %s", edge.From, edge.To, valueOr(edge.Condition, "always")))).AddButtons([]string{"Close"})
@@ -309,7 +312,7 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 						rebuild(currentFilter)
 						return
 					}
-					currentResource = refreshSelectedResource(currentResource, updated)
+					currentResource = cloneMessage(updated)
 					if currentResource.GetKey().GetKind() == "Flow" && currentResource.GetGeneration() != selectedGeneration {
 						plan, compileErr := compileFlowPlan(ctx, client, currentResource)
 						if compileErr != nil {
@@ -491,22 +494,6 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 		return &ContextSwitchError{Name: switchContext}
 	}
 	return nil
-}
-
-// refreshSelectedResource preserves the pointer captured by an open form while
-// replacing its protobuf contents with the newest live projection. Replacing
-// the pointer would detach the form: its successful apply would update an old
-// document while the next edit started from a stale resourceVersion.
-func refreshSelectedResource(current, updated *controlv1alpha1.ResourceDocument) *controlv1alpha1.ResourceDocument {
-	if current == nil {
-		return cloneMessage(updated)
-	}
-	if current == updated {
-		return current
-	}
-	proto.Reset(current)
-	proto.Merge(current, updated)
-	return current
 }
 
 func openPluginDetail(ctx context.Context, application *tview.Application, pages *tview.Pages, client *clientpkg.Client, plugin *controlv1alpha1.PluginInfo, plugins []*controlv1alpha1.PluginInfo, events *tview.TextView, returnFocus tview.Primitive) {
