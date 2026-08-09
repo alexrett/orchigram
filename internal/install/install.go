@@ -418,7 +418,7 @@ func dialHealthy(ctx context.Context, socket string, maximumWait time.Duration) 
 }
 
 func activePluginVersions(ctx context.Context, socket string) (map[string]string, error) {
-	connection, err := dialHealthy(ctx, socket, 5*time.Second)
+	connection, err := dialAvailable(ctx, socket, 5*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -440,7 +440,7 @@ func restorePluginVersions(ctx context.Context, socket string, expected map[stri
 	if expected == nil {
 		return nil
 	}
-	connection, err := dialHealthy(ctx, socket, 30*time.Second)
+	connection, err := dialAvailable(ctx, socket, 30*time.Second)
 	if err != nil {
 		return err
 	}
@@ -471,6 +471,29 @@ func restorePluginVersions(ctx context.Context, socket string, expected map[stri
 		}
 	}
 	return nil
+}
+
+func dialAvailable(ctx context.Context, socket string, maximumWait time.Duration) (*clientpkg.Client, error) {
+	deadline := time.Now().Add(maximumWait)
+	for {
+		client, err := clientpkg.DialUnix(ctx, socket)
+		if err == nil {
+			probeContext, cancel := context.WithTimeout(ctx, 5*time.Second)
+			_, probeErr := client.System.Info(probeContext, &emptypb.Empty{})
+			cancel()
+			if probeErr == nil {
+				return client, nil
+			}
+			_ = client.Close()
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if time.Now().After(deadline) {
+			return nil, errors.New("orchigram control plane did not become available")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 func ensureServiceIdentity(ctx context.Context) error {
