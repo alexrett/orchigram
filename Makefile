@@ -73,6 +73,7 @@ check: generate-check fmt vet test race lint buf-check actions-pinned secret-sca
 
 release-check: check history-scan cross-build release-tools
 	PATH="$(BIN_DIR):$$PATH" $(GO) run github.com/goreleaser/goreleaser/v2@v2.12.7 release --snapshot --clean --parallelism 1
+	PATH="$(BIN_DIR):$$PATH" ./scripts/verify-release-reproducible.sh
 
 clean:
 	rm -rf $(BIN_DIR) dist .release coverage.out

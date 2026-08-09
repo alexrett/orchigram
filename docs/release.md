@@ -9,7 +9,8 @@ make release-check
 
 It runs generated-code checks, formatting, vet, unit and race suites, lint,
 Buf lint/build, worktree and full-history secret scans, local and cross builds,
-license classification, SPDX SBOM generation, and a GoReleaser snapshot.
+license classification, SPDX SBOM generation, and two GoReleaser snapshots
+whose complete 42-file public manifests must match byte-for-byte.
 All third-party GitHub Actions are pinned to full commit SHAs; their release
 aliases remain comments for human update review.
 
@@ -22,8 +23,12 @@ Every release contains:
 - one independent bundle per first-party plugin and target. Every bundle has a
   strict `plugin.yaml`, protocol range, capabilities and payload SHA-256;
 - SPDX JSON SBOMs for core archives and plugin bundles;
-- `dependency-licenses.csv`, `checksums.txt`, GoReleaser metadata, and GitHub
-  build provenance attestations.
+- `dependency-licenses.csv`, `checksums.txt`, and GitHub build provenance
+  attestations.
+
+GoReleaser's internal `metadata.json` and `artifacts.json` embed invocation or
+builder metadata and are deliberately not published. They are excluded from the
+reproducibility manifest because neither file is a release asset.
 
 Build timestamps come from the source commit. Go binaries use `-trimpath`,
 `-buildvcs=false`, a cleared build ID, and fixed version/commit/date values.
