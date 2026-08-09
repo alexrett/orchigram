@@ -143,7 +143,18 @@ without duplicating terminal Run transitions. Editing or deleting the source
 Flow never changes a compiled plan after trigger acceptance, including before
 the local Run projection and durable workflow instance have been created.
 
-Online backups contain consistent snapshots of the resource/event database,
-the workflow engine database, and immutable plugin installations. Restore is an
-offline operation into a new directory; recovery tests reopen the snapshot and
-reconcile an approval that was waiting when the backup was taken.
+Online backups use a recovery-safe causal snapshot: durable workflow history is
+captured before product state, followed by immutable plugin installations. If an
+activity crosses that boundary, product attempt evidence may be ahead of history
+but history can never be ahead of evidence; replay returns the already terminal
+attempt without repeating the external invocation. Restore is an offline
+operation into a new directory; recovery tests reopen the snapshot and reconcile
+an approval that was waiting when the backup was taken.
+
+Run retention never weakens occurrence idempotency. Before deleting a terminal
+Run and its full `TriggerReceipt`, the state transaction writes a compact
+occurrence tombstone containing the original trigger/event identity and Run UID.
+Provider cursor replay therefore acknowledges the historical occurrence without
+creating a new outbox command. Active Runs, incomplete dispatch work, referenced
+artifacts, active plugin versions, desired plugin versions, and plan-pinned
+plugin versions are not collectible.

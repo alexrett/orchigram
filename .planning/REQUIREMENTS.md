@@ -28,12 +28,12 @@ The existing code is a prototype baseline. A checked requirement below means its
 
 ## Phase 10 — GitHub review-event SDLC automation
 
-- [ ] GHR-01: The GitHub TriggerProvider durably emits stable, cursor-backed issue events and pull-request review events, including submitted approval and changes-requested state.
-- [ ] GHR-02: The reference SDLC flow posts and reconciles a plan, waits for durable TUI approval, implements on a deterministic branch, runs tests, and creates or reconciles one pull request.
-- [ ] GHR-03: A changes-requested review resumes the same logical workflow, feeds review context to a workspace-write rework agent, and updates the same branch and pull request.
-- [ ] GHR-04: Every rework cycle reruns configured checks and reconciles comments, commits, pushes, and pull-request state without duplicate mutations after daemon or plugin restart.
-- [ ] GHR-05: Approval plus configured green checks marks a run merge-ready and notifies the operator; v0.1.0 never auto-merges or pushes directly to the default branch.
-- [ ] GHR-06: A public two-account dogfood issue, pull request, changes-requested review, repair, approval, and human merge passes with retained run evidence and no credential disclosure.
+- [x] GHR-01: The GitHub TriggerProvider durably emits stable, cursor-backed issue events and pull-request review events, including submitted approval and changes-requested state.
+- [x] GHR-02: The reference SDLC flow posts and reconciles a plan, waits for durable TUI approval, implements on a deterministic branch, runs tests, and creates or reconciles one pull request.
+- [x] GHR-03: A changes-requested review resumes the same logical workflow, feeds review context to a workspace-write rework agent, and updates the same branch and pull request.
+- [x] GHR-04: Every rework cycle reruns configured checks and reconciles comments, commits, pushes, and pull-request state without duplicate mutations after daemon or plugin restart.
+- [x] GHR-05: Approval plus configured green checks marks a run merge-ready and notifies the operator; v0.1.0 never auto-merges or pushes directly to the default branch.
+- [x] GHR-06: A public two-account dogfood issue, pull request, changes-requested review, repair, approval, and human merge passes with retained run evidence and no credential disclosure.
 
 ## Phase 11 — Bounded single-node operations
 

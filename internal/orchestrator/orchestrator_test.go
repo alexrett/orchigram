@@ -310,6 +310,56 @@ spec:
 	}
 }
 
+func TestActiveRunAdmissionQueuesAcceptedWork(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	state, err := store.Open(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	applyFlow(ctx, t, state, `
+    - {id: hold, uses: core.noop}
+`, "", 0)
+	durable := &fakeEngine{}
+	control := New(state, flow.NewCompiler(nil), durable, Options{MaxActiveRuns: 1})
+	control.capacityRetryAfter = 0
+	first, err := control.StartManual(ctx, "demo", "default", json.RawMessage(`{}`), "capacity-first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := control.ReconcileOne(ctx); err != nil {
+		t.Fatal(err)
+	}
+	second, err := control.StartManual(ctx, "demo", "default", json.RawMessage(`{}`), "capacity-second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := control.ReconcileOne(ctx); !errors.Is(err, errRunCapacity) {
+		t.Fatalf("second admission=%v", err)
+	}
+	if _, err := state.GetRun(ctx, second.RunUID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("queued accepted Run was admitted: %v", err)
+	}
+	diagnostics := control.HealthDiagnostics()
+	foundCapacity := false
+	for _, diagnostic := range diagnostics {
+		foundCapacity = foundCapacity || diagnostic.Path == "capacity/runs" && diagnostic.Code == "saturated"
+	}
+	if !foundCapacity {
+		t.Fatalf("capacity diagnostics=%+v", diagnostics)
+	}
+	if err := state.AppendRunEvent(ctx, first.RunUID, "", "run.succeeded", "succeeded", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := control.ReconcileOne(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if run, err := state.GetRun(ctx, second.RunUID); err != nil || run.Phase != "pending" {
+		t.Fatalf("admitted queued Run=%+v err=%v", run, err)
+	}
+}
+
 func TestProviderSignalOutboxRedeliversSameStableEventAfterCrashBoundary(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

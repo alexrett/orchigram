@@ -16,8 +16,13 @@ sudo ./orchigram install --plugin-dir .
 The installer creates the stable `orchigram` system user and group, installs a
 hardened systemd unit, starts the daemon, verifies each immutable plugin bundle,
 and activates the four plugins. Re-running the command is the supported
-single-node upgrade path: the daemon restarts and reconciles durable state from
-SQLite. It never opens a TCP listener unless `/etc/orchigram/config.yaml`
+single-node upgrade path. Before replacement it verifies every source and
+captures the current core files and plugin activation set. A failed restart,
+health check, bundle install, or activation restores the previous binary, unit,
+bundled executables, and activation set before restarting the old service.
+Durable approvals, timers, and retries then reconcile from SQLite. The service
+has default cgroup bounds (`MemoryHigh=512M`, `MemoryMax=768M`, `CPUQuota=200%`,
+and `TasksMax=256`). It never opens a TCP listener unless `/etc/orchigram/config.yaml`
 explicitly sets `http.listen`.
 
 The server paths are:
@@ -39,6 +44,21 @@ sudo usermod -aG orchigram operator
 `install` warns when `git`, `codex`, or `claude` is unavailable. Agent CLI
 login remains owned by those tools; Orchigram does not copy or print their
 credentials.
+
+The daemon scheduler is also bounded independently of systemd. The default
+configuration admits at most eight non-terminal Runs, four concurrent external
+activities, and two concurrent agent processes:
+
+```yaml
+operations:
+  maxActiveRuns: 8
+  maxConcurrentActivities: 4
+  maxAgentProcesses: 2
+```
+
+Accepted occurrences beyond the Run limit remain durable in the outbox; they
+are not rejected or forgotten. Saturated Run, activity, or agent capacity is
+reported through aggregate health until queued work advances.
 
 ## Local and SSH contexts
 
@@ -164,6 +184,7 @@ systemctl status orchigram.service
 journalctl -u orchigram.service
 systemd-analyze security orchigram.service
 orchigram system health
+orchigram system doctor
 orchigram plugin list
 orchigram plugin doctor agent-command
 ```
@@ -177,6 +198,11 @@ shows the same projection. Diagnostics deliberately omit dependency errors,
 payloads, secret values, server paths, and provider coordinates; use the
 service journal for privileged detail.
 
+`system doctor` verifies writable state storage, system `git`, every active
+plugin, and configured agent profiles (including executable discovery and the
+runtime's own authentication probe). It uses bounded calls and emits only
+generic diagnostics; credentials and resolved secret values are never printed.
+
 A database created by a newer Orchigram schema version is rejected during
 startup. The daemon never serves an apparently healthy control socket after a
 configuration, migration, artifact-reconciliation, or listener failure.
@@ -184,6 +210,29 @@ configuration, migration, artifact-reconciliation, or listener failure.
 The repository's `scripts/verify-ssh-context.sh` performs the manual exec plus
 durable-approval tracer through an SSH context. It requires
 `ORCHIGRAM_TEST_SSH_DESTINATION` and never embeds a test host address.
+
+## Retention and garbage collection
+
+Retention is an explicit operator action and defaults to an explainable dry-run:
+
+```console
+orchigram system retention --older-than 720h --keep-recent 100
+orchigram system retention --older-than 720h --keep-recent 100 \
+  --keep-recent-backups 3 --inactive-plugins --collect
+```
+
+Only terminal Runs older than the cutoff and outside the preserved recent set
+are eligible. Active Runs and Runs with incomplete outbox work cannot be
+selected. Collection first removes finished durable-framework history, then the
+product evidence transaction, then owned artifacts and the Run workspace.
+Full receipt payloads may be collected, but a minimal occurrence tombstone is
+retained permanently so provider replay cannot create a second Run for an
+already accepted occurrence.
+
+Backup collection preserves the configured newest archives. Inactive plugin
+versions require the explicit `--inactive-plugins` flag and remain ineligible
+while active, selected by a `PluginInstallation`, or pinned by any retained
+execution plan. Every invocation is limited to a bounded number of candidates.
 
 ## Backup and offline restore
 
@@ -193,10 +242,13 @@ Create an online snapshot while the daemon continues to serve requests:
 orchigram system backup
 ```
 
-The daemon uses SQLite `VACUUM INTO` for both databases, includes immutable
-plugin installations, stores the archive below `/var/lib/orchigram/backups`,
-and returns its SHA-256. A custom destination is accepted only when it remains
-inside the configured state directory.
+The daemon uses SQLite `VACUUM INTO` for both databases, snapshots durable
+workflow history before product state, includes immutable plugin installations,
+stores the archive below `/var/lib/orchigram/backups`, and returns its SHA-256.
+If an activity finishes between the two snapshots, product evidence can only be
+ahead of history; restart replays the terminal attempt by stable identity without
+repeating its external call. A custom destination is accepted only when it
+remains inside the configured state directory.
 
 Restore is deliberately offline and never overwrites an existing directory:
 

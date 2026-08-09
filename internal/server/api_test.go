@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	controlv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/control/v1alpha1"
 	"github.com/alexrett/orchigram/internal/engine"
@@ -24,6 +25,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"gopkg.in/yaml.v3"
 )
 
@@ -51,6 +53,42 @@ func TestInfoAdvertisesDeclarativePluginsOnlyWithController(t *testing.T) {
 	}
 	if !slices.Contains(info.GetCapabilities(), "plugins.declarative.v1") {
 		t.Fatalf("capabilities with controller=%v", info.GetCapabilities())
+	}
+}
+
+func TestSystemRetentionIsDryRunUnlessCollectIsExplicit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	state, err := store.Open(filepath.Join(root, "orchigram.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	plan := flow.ExecutionPlan{FlowUID: "flow-retention", FlowGeneration: 1, PlanHash: "plan-retention", InterpreterVersion: flow.InterpreterVersion}
+	if _, err := state.EnsureRun(ctx, store.StartPayload{RunUID: "run-retention", Input: json.RawMessage(`{}`)}, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.AppendRunEvent(ctx, "run-retention", "", "run.succeeded", "succeeded", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	api := NewAPI(state, flow.NewCompiler(nil), nil, missingWorkflowEngine{}, nil, nil, root)
+	time.Sleep(2 * time.Millisecond)
+	request := &controlv1alpha1.RetentionRequest{CompletedBefore: timestamppb.New(time.Now().Add(-time.Millisecond)), Limit: 10}
+	preview, err := api.Retention(ctx, request)
+	if err != nil || !preview.GetDryRun() || len(preview.GetItems()) != 1 || preview.GetCollectedRuns() != 0 {
+		t.Fatalf("preview=%+v err=%v", preview, err)
+	}
+	if _, err := state.GetRun(ctx, "run-retention"); err != nil {
+		t.Fatalf("dry-run removed Run: %v", err)
+	}
+	request.Collect = true
+	collected, err := api.Retention(ctx, request)
+	if err != nil || collected.GetDryRun() || collected.GetCollectedRuns() != 1 {
+		t.Fatalf("collected=%+v err=%v", collected, err)
+	}
+	if _, err := state.GetRun(ctx, "run-retention"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("collected Run remains: %v", err)
 	}
 }
 

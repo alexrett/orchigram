@@ -24,11 +24,19 @@ const (
 
 // Config is the strict daemon configuration loaded from /etc/orchigram.
 type Config struct {
-	StateDir   string     `yaml:"stateDir"`
-	RuntimeDir string     `yaml:"runtimeDir"`
-	SocketPath string     `yaml:"socketPath"`
-	HTTP       HTTPConfig `yaml:"http"`
-	Logging    LogConfig  `yaml:"logging"`
+	StateDir   string           `yaml:"stateDir"`
+	RuntimeDir string           `yaml:"runtimeDir"`
+	SocketPath string           `yaml:"socketPath"`
+	HTTP       HTTPConfig       `yaml:"http"`
+	Logging    LogConfig        `yaml:"logging"`
+	Operations OperationsConfig `yaml:"operations"`
+}
+
+// OperationsConfig bounds the single-node scheduler and external processes.
+type OperationsConfig struct {
+	MaxActiveRuns           int `yaml:"maxActiveRuns"`
+	MaxConcurrentActivities int `yaml:"maxConcurrentActivities"`
+	MaxAgentProcesses       int `yaml:"maxAgentProcesses"`
 }
 
 // HTTPConfig controls the optional webhook listener.
@@ -49,6 +57,7 @@ func Default() Config {
 		RuntimeDir: DefaultRuntimeDir,
 		SocketPath: DefaultSocketPath,
 		Logging:    LogConfig{Level: "info", Format: "json"},
+		Operations: OperationsConfig{MaxActiveRuns: 8, MaxConcurrentActivities: 4, MaxAgentProcesses: 2},
 	}
 }
 
@@ -90,6 +99,15 @@ func (c Config) Validate() error {
 	if c.Logging.Format != "json" && c.Logging.Format != "text" {
 		return fmt.Errorf("unsupported logging.format %q", c.Logging.Format)
 	}
+	if c.Operations.MaxActiveRuns < 1 || c.Operations.MaxActiveRuns > 1024 {
+		return errors.New("operations.maxActiveRuns must be between 1 and 1024")
+	}
+	if c.Operations.MaxConcurrentActivities < 1 || c.Operations.MaxConcurrentActivities > 1024 {
+		return errors.New("operations.maxConcurrentActivities must be between 1 and 1024")
+	}
+	if c.Operations.MaxAgentProcesses < 1 || c.Operations.MaxAgentProcesses > c.Operations.MaxConcurrentActivities {
+		return errors.New("operations.maxAgentProcesses must be between 1 and operations.maxConcurrentActivities")
+	}
 	return nil
 }
 
@@ -101,5 +119,6 @@ func Development(root string) Config {
 		RuntimeDir: runtimeDir,
 		SocketPath: filepath.Join(runtimeDir, "orchigram.sock"),
 		Logging:    LogConfig{Level: "debug", Format: "text"},
+		Operations: OperationsConfig{MaxActiveRuns: 8, MaxConcurrentActivities: 4, MaxAgentProcesses: 2},
 	}
 }

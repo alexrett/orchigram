@@ -3,6 +3,8 @@
 Orchigram v0.1 is single-node, single-operator software for trusted plugins.
 
 - The daemon runs as a dedicated non-root user with a hardened systemd namespace.
+- The installed cgroup has CPU, memory, and task limits; daemon configuration
+  separately bounds admitted Runs, concurrent activities, and agent processes.
 - The default transport is a mode-restricted Unix socket. Remote access inherits OpenSSH authentication and authorization.
 - The daemon opens no network listener by default. Generic webhook ingress is explicit opt-in.
 - Secret resources identify environment or file references in v0.1; their values are never ordinary configuration. Additional backends can be added without changing Flow schemas.
@@ -15,6 +17,10 @@ Orchigram v0.1 is single-node, single-operator software for trusted plugins.
 - Online backups may be written only below the configured state directory;
   offline restore validates paths, entry types, size limits, and SQLite
   integrity before exposing the restored tree.
+- Retention is dry-run by default, rejects path escapes and symlink trees, never
+  selects active work, and retains compact occurrence identities for deduplication.
+- Installer upgrades snapshot core files and plugin activations and restore the
+  previous healthy set after a failed restart or partial plugin activation.
 - Every release includes SHA-256 checksums, SPDX JSON SBOMs, a dependency
   license inventory, and independent digest-pinned plugin bundles.
 

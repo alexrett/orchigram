@@ -81,6 +81,63 @@ func TestApprovalSignalCompletesWithoutPendingTimer(t *testing.T) {
 	}
 }
 
+func TestRemoveFinishedRunPrunesOnlyFrameworkHistory(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	state, err := store.Open(filepath.Join(root, "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	adapter, err := Open(ctx, filepath.Join(root, "workflows.sqlite"), state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = adapter.Close() }()
+	plan := flow.ExecutionPlan{
+		APIVersion: "orchigram.dev/v1alpha1", FlowUID: "flow-retention", FlowGeneration: 1,
+		InterpreterVersion: flow.InterpreterVersion, Timeout: "1m0s", MaxParallel: 1, PlanHash: "plan-retention",
+		Nodes: []flow.PlanNode{{ID: "done", Name: "done", Uses: "core.noop", Timeout: "1m0s", RetryBackoff: "1ms"}},
+	}
+	payload := store.StartPayload{RunUID: "run-retention", ReceiptUID: "receipt-retention", Input: json.RawMessage(`{}`)}
+	if _, err := state.EnsureRun(ctx, payload, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Start(ctx, payload.RunUID, plan, payload.Input); err != nil {
+		t.Fatal(err)
+	}
+	waitForPhase(ctx, t, state, payload.RunUID, "succeeded")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		instance, findErr := adapter.findInstance(ctx, payload.RunUID)
+		if findErr != nil {
+			t.Fatal(findErr)
+		}
+		frameworkState, stateErr := adapter.client.GetWorkflowInstanceState(ctx, instance)
+		if stateErr != nil {
+			t.Fatal(stateErr)
+		}
+		if frameworkState == core.WorkflowInstanceStateFinished {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("framework state remained %v", frameworkState)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := adapter.RemoveFinishedRun(ctx, payload.RunUID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.findInstance(ctx, payload.RunUID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("workflow history survived: %v", err)
+	}
+	if _, err := state.GetRun(ctx, payload.RunUID); err != nil {
+		t.Fatalf("product evidence was removed by framework prune: %v", err)
+	}
+}
+
 func TestExternalEventsResumeSameRunAndDeduplicateRedeliveryAcrossLoopIterations(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())

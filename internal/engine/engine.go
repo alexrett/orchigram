@@ -111,13 +111,21 @@ type Adapter struct {
 	once      sync.Once
 }
 
+// OpenOptions bounds durable worker concurrency for one daemon process.
+type OpenOptions struct {
+	MaxConcurrentActivities int
+}
+
 // Open starts the go-workflows worker against its private SQLite history database.
-func Open(ctx context.Context, workflowDBPath string, state *store.Store, executor TaskExecutor) (*Adapter, error) {
+func Open(ctx context.Context, workflowDBPath string, state *store.Store, executor TaskExecutor, options ...OpenOptions) (*Adapter, error) {
 	b, err := openWorkflowBackend(workflowDBPath)
 	if err != nil {
 		return nil, err
 	}
 	workerOptions := worker.DefaultOptions
+	if len(options) > 0 && options[0].MaxConcurrentActivities > 0 {
+		workerOptions.MaxParallelActivityTasks = options[0].MaxConcurrentActivities
+	}
 	workerOptions.WorkflowHeartbeatInterval = 500 * time.Millisecond
 	workerOptions.ActivityHeartbeatInterval = 500 * time.Millisecond
 	w := worker.New(b, &workerOptions)
@@ -280,6 +288,21 @@ func (a *Adapter) Reconcile(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// RemoveFinishedRun deletes one terminal workflow history after product
+// retention has selected the corresponding immutable Run evidence.
+func (a *Adapter) RemoveFinishedRun(ctx context.Context, runUID string) error {
+	a.lifecycle.Lock()
+	defer a.lifecycle.Unlock()
+	instance, err := a.findInstance(ctx, runUID)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return a.client.RemoveWorkflowInstance(ctx, instance)
 }
 
 // Describe returns the framework-independent run projection.

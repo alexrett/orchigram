@@ -990,11 +990,15 @@ func receiptByOccurrence(ctx context.Context, tx *sql.Tx, triggerUID, occurrence
 	var receipt Receipt
 	var deduplicated int
 	var accepted string
-	if err := tx.QueryRowContext(ctx, `SELECT uid,trigger_uid,occurrence_id,run_uid,deduplicated,accepted_at FROM trigger_receipts WHERE trigger_uid=? AND occurrence_id=?`, triggerUID, occurrenceID).Scan(&receipt.UID, &receipt.TriggerUID, &receipt.OccurrenceID, &receipt.RunUID, &deduplicated, &accepted); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return Receipt{}, ErrNotFound
-		}
+	if err := tx.QueryRowContext(ctx, `SELECT uid,trigger_uid,occurrence_id,run_uid,deduplicated,accepted_at FROM trigger_receipts WHERE trigger_uid=? AND occurrence_id=?`, triggerUID, occurrenceID).Scan(&receipt.UID, &receipt.TriggerUID, &receipt.OccurrenceID, &receipt.RunUID, &deduplicated, &accepted); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return Receipt{}, err
+	} else if errors.Is(err, sql.ErrNoRows) {
+		if err := tx.QueryRowContext(ctx, `SELECT receipt_uid,trigger_uid,occurrence_id,run_uid,deduplicated,accepted_at FROM occurrence_tombstones WHERE trigger_uid=? AND occurrence_id=?`, triggerUID, occurrenceID).Scan(&receipt.UID, &receipt.TriggerUID, &receipt.OccurrenceID, &receipt.RunUID, &deduplicated, &accepted); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return Receipt{}, ErrNotFound
+			}
+			return Receipt{}, err
+		}
 	}
 	receipt.Deduplicated = deduplicated == 1
 	receipt.AcceptedAt, _ = time.Parse(time.RFC3339Nano, accepted)
@@ -1008,11 +1012,15 @@ func (s *Store) ReceiptByOccurrence(ctx context.Context, triggerUID, occurrenceI
 	var receipt Receipt
 	var deduplicated int
 	var accepted string
-	if err := s.db.QueryRowContext(ctx, `SELECT uid,trigger_uid,occurrence_id,run_uid,deduplicated,accepted_at FROM trigger_receipts WHERE trigger_uid=? AND occurrence_id=?`, triggerUID, occurrenceID).Scan(&receipt.UID, &receipt.TriggerUID, &receipt.OccurrenceID, &receipt.RunUID, &deduplicated, &accepted); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return Receipt{}, ErrNotFound
-		}
+	if err := s.db.QueryRowContext(ctx, `SELECT uid,trigger_uid,occurrence_id,run_uid,deduplicated,accepted_at FROM trigger_receipts WHERE trigger_uid=? AND occurrence_id=?`, triggerUID, occurrenceID).Scan(&receipt.UID, &receipt.TriggerUID, &receipt.OccurrenceID, &receipt.RunUID, &deduplicated, &accepted); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return Receipt{}, err
+	} else if errors.Is(err, sql.ErrNoRows) {
+		if err := s.db.QueryRowContext(ctx, `SELECT receipt_uid,trigger_uid,occurrence_id,run_uid,deduplicated,accepted_at FROM occurrence_tombstones WHERE trigger_uid=? AND occurrence_id=?`, triggerUID, occurrenceID).Scan(&receipt.UID, &receipt.TriggerUID, &receipt.OccurrenceID, &receipt.RunUID, &deduplicated, &accepted); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return Receipt{}, ErrNotFound
+			}
+			return Receipt{}, err
+		}
 	}
 	receipt.Deduplicated = deduplicated == 1
 	receipt.AcceptedAt, _ = time.Parse(time.RFC3339Nano, accepted)
@@ -1239,6 +1247,14 @@ func (s *Store) GetRun(ctx context.Context, uid string) (Run, error) {
 // ListRuns returns newest runs first.
 func (s *Store) ListRuns(ctx context.Context, limit int) ([]Run, error) {
 	return s.ListRunsFiltered(ctx, "", "", limit)
+}
+
+// CountActiveRunsExcluding reports admitted non-terminal Runs other than one
+// idempotent retry identity. Accepted receipts without a local Run do not count.
+func (s *Store) CountActiveRunsExcluding(ctx context.Context, runUID string) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE uid!=? AND phase NOT IN ('succeeded','failed','rejected','cancelled')`, runUID).Scan(&count)
+	return count, err
 }
 
 // ListRunsFiltered returns newest runs first after composing optional pinned

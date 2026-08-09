@@ -31,6 +31,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"gopkg.in/yaml.v3"
 )
 
@@ -168,6 +169,24 @@ func newSystemCommand(opts *options) *cobra.Command {
 			return nil
 		})
 	}}
+	doctorCommand := &cobra.Command{Use: "doctor", Short: "Check storage, executables, profiles, and active plugins", RunE: func(cmd *cobra.Command, _ []string) error {
+		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error {
+			response, err := client.System.Doctor(cmd.Context(), &emptypb.Empty{})
+			if err != nil {
+				return err
+			}
+			for _, diagnostic := range response.GetDiagnostics() {
+				if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "%s: %s (%s)\n", diagnostic.GetPath(), diagnostic.GetMessage(), diagnostic.GetCode()); err != nil {
+					return err
+				}
+			}
+			if len(response.GetDiagnostics()) > 0 {
+				return errors.New("system doctor found operational failures")
+			}
+			_, err = fmt.Fprintln(cmd.OutOrStdout(), "ok")
+			return err
+		})
+	}}
 	var destination string
 	backupCommand := &cobra.Command{Use: "backup", Short: "Create an online state backup", RunE: func(cmd *cobra.Command, _ []string) error {
 		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error {
@@ -200,7 +219,35 @@ func newSystemCommand(opts *options) *cobra.Command {
 		return err
 	}}
 	restoreCommand.Flags().StringVar(&restoreDestination, "destination", "", "new state directory; it must not already exist")
-	command.AddCommand(info, healthCommand, backupCommand, restoreCommand)
+	var retentionOlderThan time.Duration
+	var retentionKeep, retentionKeepBackups, retentionLimit uint32
+	var retentionCollect, retentionInactivePlugins bool
+	retentionCommand := &cobra.Command{Use: "retention", Short: "Preview or collect old terminal execution evidence", RunE: func(cmd *cobra.Command, _ []string) error {
+		if retentionOlderThan <= 0 {
+			return errors.New("--older-than must be positive")
+		}
+		return withClient(cmd.Context(), opts, func(client *clientpkg.Client, _ string) error {
+			response, err := client.System.Retention(cmd.Context(), &controlv1alpha1.RetentionRequest{
+				CompletedBefore: timestamppb.New(time.Now().Add(-retentionOlderThan)), KeepRecentRuns: retentionKeep, KeepRecentBackups: retentionKeepBackups,
+				Limit: retentionLimit, Collect: retentionCollect, CollectInactivePlugins: retentionInactivePlugins,
+			})
+			if err != nil {
+				return err
+			}
+			encoded, err := json.Marshal(response)
+			if err != nil {
+				return err
+			}
+			return printDocument(cmd.OutOrStdout(), encoded, opts.output)
+		})
+	}}
+	retentionCommand.Flags().DurationVar(&retentionOlderThan, "older-than", 30*24*time.Hour, "collect terminal Runs older than this duration")
+	retentionCommand.Flags().Uint32Var(&retentionKeep, "keep-recent", 100, "always preserve this many newest terminal Runs")
+	retentionCommand.Flags().Uint32Var(&retentionKeepBackups, "keep-recent-backups", 3, "always preserve this many newest backups")
+	retentionCommand.Flags().Uint32Var(&retentionLimit, "limit", 100, "maximum Runs in one bounded collection")
+	retentionCommand.Flags().BoolVar(&retentionCollect, "collect", false, "perform collection; the default is a dry-run")
+	retentionCommand.Flags().BoolVar(&retentionInactivePlugins, "inactive-plugins", false, "include old inactive plugin versions that have no retained reference")
+	command.AddCommand(info, healthCommand, doctorCommand, backupCommand, restoreCommand, retentionCommand)
 	return command
 }
 

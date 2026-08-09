@@ -38,15 +38,20 @@ type Result struct {
 }
 
 type manifest struct {
-	Format    int      `json:"format"`
-	CreatedAt string   `json:"createdAt"`
-	Files     []string `json:"files"`
+	Format        int      `json:"format"`
+	CreatedAt     string   `json:"createdAt"`
+	SnapshotOrder []string `json:"snapshotOrder,omitempty"`
+	Files         []string `json:"files"`
 }
 
 // Create snapshots both SQLite databases and immutable plugin installations.
 // Destination must remain under stateDir so the hardened service cannot be
 // used as an arbitrary filesystem writer.
 func Create(ctx context.Context, stateDir, destination string) (Result, error) {
+	return create(ctx, stateDir, destination, nil)
+}
+
+func create(ctx context.Context, stateDir, destination string, afterWorkflowSnapshot func() error) (Result, error) {
 	stateDir = filepath.Clean(stateDir)
 	if !filepath.IsAbs(stateDir) {
 		return Result{}, errors.New("state directory must be absolute")
@@ -75,9 +80,18 @@ func Create(ctx context.Context, stateDir, destination string) (Result, error) {
 		return Result{}, err
 	}
 	defer func() { _ = os.RemoveAll(working) }()
-	for _, name := range []string{"orchigram.sqlite", "workflows.sqlite"} {
+	// Snapshot durable history first and product state second. A concurrent
+	// activity can therefore make product state ahead of history, which the
+	// idempotent attempt replay contract reconciles. The inverse ordering could
+	// restore history ahead of its authoritative product evidence.
+	for index, name := range []string{"workflows.sqlite", "orchigram.sqlite"} {
 		if err := snapshotSQLite(ctx, filepath.Join(stateDir, name), filepath.Join(working, name)); err != nil {
 			return Result{}, fmt.Errorf("snapshot %s: %w", name, err)
+		}
+		if index == 0 && afterWorkflowSnapshot != nil {
+			if err := afterWorkflowSnapshot(); err != nil {
+				return Result{}, err
+			}
 		}
 	}
 	temporary, err := os.CreateTemp(filepath.Dir(finalPath), ".backup-*.tar.gz")
@@ -115,7 +129,7 @@ func Create(ctx context.Context, stateDir, destination string) (Result, error) {
 		return Result{}, err
 	}
 	files = append(files, pluginFiles...)
-	metadata, err := json.Marshal(manifest{Format: formatVersion, CreatedAt: time.Now().UTC().Format(time.RFC3339), Files: files})
+	metadata, err := json.Marshal(manifest{Format: formatVersion, CreatedAt: time.Now().UTC().Format(time.RFC3339), SnapshotOrder: []string{"workflows.sqlite", "orchigram.sqlite"}, Files: files})
 	if err != nil {
 		return Result{}, err
 	}

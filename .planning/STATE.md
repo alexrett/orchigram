@@ -2,10 +2,10 @@
 
 Status: active recovery milestone
 Current milestone: v0.1.0 First Real Release
-Current phase: 10 of 12
-Progress: 2/5 release phases
+Current phase: 11 of 12
+Progress: 3/5 release phases
 Last activity: 2026-08-09
-Current focus: implement durable GitHub pull-request review events and same-branch changes-requested rework
+Current focus: bound single-node execution, retention, recovery, and upgrades
 
 ## Reality check
 
@@ -66,10 +66,14 @@ shipped binary. Phase 9 is complete.
 
 ## Active phase gate
 
-Phase 10 is complete only when stable GitHub issue and pull-request review
-events drive one durable public issue-to-PR workflow through changes-requested
-rework, repeated checks, later approval, merge-ready notification, and a
-human-controlled merge without duplicate mutations or leaked credentials.
+Phase 10 completed through public Issue #48 and PR #49. Two independent
+changes-requested reviews drove same-Run rework; a later exact-head approval
+resumed the provider signal Flow, verified the configured GitHub check, posted
+an idempotent merge-ready comment, and ended in a human-controlled merge.
+
+Phase 11 is complete only when small-host concurrency and process bounds,
+retention/GC, backup recovery, staged upgrade rollback, doctor diagnostics, and
+the hardened installer pass both automated failure gates and the demo host.
 
 ## Blockers
 

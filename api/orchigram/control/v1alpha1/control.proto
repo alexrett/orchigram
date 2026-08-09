@@ -205,6 +205,28 @@ message SystemInfo {
 message HealthResponse { bool ready = 1; repeated Diagnostic diagnostics = 2; }
 message BackupRequest { string destination = 1; }
 message BackupResponse { string path = 1; string sha256 = 2; }
+message RetentionRequest {
+  google.protobuf.Timestamp completed_before = 1;
+  uint32 keep_recent_runs = 2;
+  uint32 limit = 3;
+  bool collect = 4;
+  uint32 keep_recent_backups = 5;
+  bool collect_inactive_plugins = 6;
+}
+message RetentionItem {
+  string kind = 1;
+  string identity = 2;
+  int64 size_bytes = 3;
+  string reason = 4;
+}
+message RetentionResponse {
+  bool dry_run = 1;
+  google.protobuf.Timestamp completed_before = 2;
+  repeated RetentionItem items = 3;
+  uint32 collected_runs = 4;
+  uint32 collected_files = 5;
+  int64 reclaimed_bytes = 6;
+}
 
 service ResourceService {
   rpc Apply(ApplyRequest) returns (ApplyResponse);
@@ -250,5 +272,7 @@ service PluginService {
 service SystemService {
   rpc Info(google.protobuf.Empty) returns (SystemInfo);
   rpc Health(google.protobuf.Empty) returns (HealthResponse);
+  rpc Doctor(google.protobuf.Empty) returns (DoctorResponse);
   rpc Backup(BackupRequest) returns (BackupResponse);
+  rpc Retention(RetentionRequest) returns (RetentionResponse);
 }

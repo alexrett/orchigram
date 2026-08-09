@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -27,6 +28,7 @@ import (
 	"github.com/alexrett/orchigram/internal/pluginmanager"
 	"github.com/alexrett/orchigram/internal/references"
 	"github.com/alexrett/orchigram/internal/resource"
+	"github.com/alexrett/orchigram/internal/retention"
 	"github.com/alexrett/orchigram/internal/store"
 	triggercontroller "github.com/alexrett/orchigram/internal/trigger"
 	"github.com/alexrett/orchigram/internal/version"
@@ -622,7 +624,7 @@ func (a *API) Reconcile(ctx context.Context, request *controlv1alpha1.ReconcileR
 // Info reports protocol negotiation and process identity.
 func (a *API) Info(context.Context, *emptypb.Empty) (*controlv1alpha1.SystemInfo, error) {
 	hostname, _ := os.Hostname()
-	capabilities := []string{"resources.v1alpha1", "flows.compile", "runs.approval", "plugins.grpc.v1", "plugins.automtls", "transport.uds"}
+	capabilities := []string{"resources.v1alpha1", "flows.compile", "runs.approval", "plugins.grpc.v1", "plugins.automtls", "system.doctor.v1", "system.retention.v1", "transport.uds"}
 	if a.pluginState != nil {
 		capabilities = append(capabilities, "plugins.declarative.v1")
 	}
@@ -666,6 +668,81 @@ func (a *API) Backup(ctx context.Context, request *controlv1alpha1.BackupRequest
 		return nil, rpcError(err)
 	}
 	return &controlv1alpha1.BackupResponse{Path: result.Path, Sha256: result.SHA256}, nil
+}
+
+// Doctor performs bounded, secret-safe operational checks through the same UDS
+// used by the caller.
+func (a *API) Doctor(ctx context.Context, _ *emptypb.Empty) (*controlv1alpha1.DoctorResponse, error) {
+	diagnostics := make([]*controlv1alpha1.Diagnostic, 0)
+	temporary, err := os.CreateTemp(a.stateDir, ".doctor-*")
+	if err != nil {
+		diagnostics = append(diagnostics, systemDiagnostic("storage", "not_writable", "daemon state storage is not writable"))
+	} else {
+		name := temporary.Name()
+		if closeErr := temporary.Close(); closeErr != nil {
+			diagnostics = append(diagnostics, systemDiagnostic("storage", "sync_failed", "daemon state storage check could not be completed"))
+		}
+		_ = os.Remove(name)
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		diagnostics = append(diagnostics, systemDiagnostic("executables/git", "not_found", "system git is not available on the daemon PATH"))
+	}
+	if a.plugins != nil {
+		records, listErr := a.plugins.List(ctx)
+		if listErr != nil {
+			diagnostics = append(diagnostics, systemDiagnostic("plugins", "state_unavailable", "plugin installation state is unavailable"))
+		} else {
+			for _, record := range records {
+				if !record.Active {
+					continue
+				}
+				doctorContext, cancel := context.WithTimeout(ctx, 45*time.Second)
+				doctorErr := a.plugins.Doctor(doctorContext, record.Name, record.Version)
+				cancel()
+				if doctorErr != nil {
+					diagnostics = append(diagnostics, systemDiagnostic("plugins/"+record.Name, "doctor_failed", "active plugin or one of its configured profiles failed its doctor check; inspect daemon logs"))
+				}
+			}
+		}
+	}
+	sort.Slice(diagnostics, func(i, j int) bool { return diagnostics[i].GetPath() < diagnostics[j].GetPath() })
+	return &controlv1alpha1.DoctorResponse{Diagnostics: diagnostics}, nil
+}
+
+func systemDiagnostic(path, code, message string) *controlv1alpha1.Diagnostic {
+	return &controlv1alpha1.Diagnostic{Severity: controlv1alpha1.Diagnostic_SEVERITY_ERROR, Path: path, Code: code, Message: message}
+}
+
+// Retention returns an explainable dry-run by default and collects only when
+// the operator explicitly sets collect.
+func (a *API) Retention(ctx context.Context, request *controlv1alpha1.RetentionRequest) (*controlv1alpha1.RetentionResponse, error) {
+	if request.GetCompletedBefore() == nil || !request.GetCompletedBefore().IsValid() {
+		return nil, status.Error(codes.InvalidArgument, "completed_before is required")
+	}
+	cutoff := request.GetCompletedBefore().AsTime()
+	if !cutoff.Before(time.Now()) {
+		return nil, status.Error(codes.InvalidArgument, "completed_before must be in the past")
+	}
+	limit := int(request.GetLimit())
+	if limit == 0 {
+		limit = 100
+	}
+	var pruner retention.FinishedRunPruner
+	if candidate, ok := a.engine.(retention.FinishedRunPruner); ok {
+		pruner = candidate
+	}
+	report, err := retention.Apply(ctx, a.store, a.stateDir, cutoff, int(request.GetKeepRecentRuns()), int(request.GetKeepRecentBackups()), limit, request.GetCollect(), request.GetCollectInactivePlugins(), pruner)
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	response := &controlv1alpha1.RetentionResponse{
+		DryRun: report.DryRun, CompletedBefore: timestamppb.New(report.CompletedBefore), CollectedRuns: uint32(report.CollectedRuns), //nolint:gosec // One bounded request can select at most 1000 Runs.
+		CollectedFiles: uint32(report.CollectedFiles), ReclaimedBytes: report.ReclaimedBytes, //nolint:gosec // Bounded Runs, backups, and plugins remain far below uint32.
+	}
+	for _, item := range report.Items {
+		response.Items = append(response.Items, &controlv1alpha1.RetentionItem{Kind: item.Kind, Identity: item.Identity, SizeBytes: item.SizeBytes, Reason: item.Reason})
+	}
+	return response, nil
 }
 
 // InstallPlugin receives one bounded bundle and closes with its verified identity.
@@ -1017,6 +1094,12 @@ func (s *systemService) Info(ctx context.Context, request *emptypb.Empty) (*cont
 func (s *systemService) Health(ctx context.Context, request *emptypb.Empty) (*controlv1alpha1.HealthResponse, error) {
 	return s.api.Health(ctx, request)
 }
+func (s *systemService) Doctor(ctx context.Context, request *emptypb.Empty) (*controlv1alpha1.DoctorResponse, error) {
+	return s.api.Doctor(ctx, request)
+}
 func (s *systemService) Backup(ctx context.Context, request *controlv1alpha1.BackupRequest) (*controlv1alpha1.BackupResponse, error) {
 	return s.api.Backup(ctx, request)
+}
+func (s *systemService) Retention(ctx context.Context, request *controlv1alpha1.RetentionRequest) (*controlv1alpha1.RetentionResponse, error) {
+	return s.api.Retention(ctx, request)
 }
