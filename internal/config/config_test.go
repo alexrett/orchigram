@@ -25,3 +25,21 @@ func TestDevelopmentConfigIsValid(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestOperationsBoundsAreStrict(t *testing.T) {
+	t.Parallel()
+	for name, mutate := range map[string]func(*Config){
+		"zero active Runs":         func(cfg *Config) { cfg.Operations.MaxActiveRuns = 0 },
+		"zero activities":          func(cfg *Config) { cfg.Operations.MaxConcurrentActivities = 0 },
+		"agents exceed activities": func(cfg *Config) { cfg.Operations.MaxAgentProcesses = cfg.Operations.MaxConcurrentActivities + 1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			cfg := Default()
+			mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("expected invalid operations bounds")
+			}
+		})
+	}
+}

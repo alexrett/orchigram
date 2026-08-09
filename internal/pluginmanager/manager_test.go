@@ -3,6 +3,7 @@ package pluginmanager
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -381,6 +382,50 @@ spec: {backend: env, key: ORCHIGRAM_TEST_GITHUB_PROVIDER_TOKEN}
 		ID: "recover", Uses: "exec.run", Timeout: "10s", With: map[string]any{"argv": []string{"/bin/echo", "recovered"}},
 	}, json.RawMessage(`{}`), nil, "stable-recovery-key"); err != nil {
 		t.Fatalf("daemon-side manager did not recover plugin: %v", err)
+	}
+}
+
+func TestLaunchAdoptsActiveLegacyInstallation(t *testing.T) {
+	t.Parallel()
+	statePath := filepath.Join(t.TempDir(), "state.sqlite")
+	state, err := store.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	manager := New(state, t.TempDir())
+	defer manager.Close()
+	record, err := manager.Install(context.Background(), conformanceBundle(t, "exec", 1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Enable(context.Background(), record.Name, record.Version); err != nil {
+		t.Fatal(err)
+	}
+	database, err := sql.Open("sqlite", statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(context.Background(), `UPDATE plugin_installations SET contract_json=NULL,contract_digest='' WHERE name=? AND version=?`, record.Name, record.Version); err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := manager.List(context.Background())
+	if err != nil || len(legacy) != 1 || len(legacy[0].ContractJSON) != 0 {
+		t.Fatalf("legacy list=%+v err=%v", legacy, err)
+	}
+	if err := manager.Disable(context.Background(), record.Name); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Enable(context.Background(), record.Name, record.Version); err != nil {
+		t.Fatal(err)
+	}
+	adopted, err := state.Plugin(context.Background(), record.Name, record.Version)
+	if err != nil || len(adopted.ContractJSON) == 0 || adopted.ContractDigest == "" {
+		t.Fatalf("adopted=%+v err=%v", adopted, err)
 	}
 }
 

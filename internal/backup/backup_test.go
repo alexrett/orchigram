@@ -129,6 +129,38 @@ func TestRestoreRejectsManifestMismatch(t *testing.T) {
 	}
 }
 
+func TestCreateSnapshotsWorkflowBeforePossiblyAheadProductState(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	state := filepath.Join(root, "state")
+	if err := os.MkdirAll(state, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	workflowPath := filepath.Join(state, "workflows.sqlite")
+	productPath := filepath.Join(state, "orchigram.sqlite")
+	createValueDatabase(t, workflowPath, "scheduled")
+	createValueDatabase(t, productPath, "pending")
+	result, err := create(context.Background(), state, "", func() error {
+		if err := updateValueDatabase(productPath, "completed"); err != nil {
+			return err
+		}
+		return updateValueDatabase(workflowPath, "completed")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored := filepath.Join(root, "restored")
+	if err := Restore(context.Background(), result.Path, restored); err != nil {
+		t.Fatal(err)
+	}
+	if value := readValueDatabase(t, filepath.Join(restored, "workflows.sqlite")); value != "scheduled" {
+		t.Fatalf("workflow snapshot=%q", value)
+	}
+	if value := readValueDatabase(t, filepath.Join(restored, "orchigram.sqlite")); value != "completed" {
+		t.Fatalf("product snapshot=%q", value)
+	}
+}
+
 func createTestDatabase(t *testing.T, path string) {
 	t.Helper()
 	database, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
@@ -139,4 +171,40 @@ func createTestDatabase(t *testing.T, path string) {
 	if _, err := database.ExecContext(context.Background(), "CREATE TABLE evidence(value TEXT); INSERT INTO evidence(value) VALUES ('ok')"); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func createValueDatabase(t *testing.T, path, value string) {
+	t.Helper()
+	database, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = database.Close() }()
+	if _, err := database.ExecContext(context.Background(), "CREATE TABLE evidence(value TEXT); INSERT INTO evidence(value) VALUES (?)", value); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func updateValueDatabase(path, value string) error {
+	database, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = database.Close() }()
+	_, err = database.ExecContext(context.Background(), "UPDATE evidence SET value=?", value)
+	return err
+}
+
+func readValueDatabase(t *testing.T, path string) string {
+	t.Helper()
+	database, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = database.Close() }()
+	var value string
+	if err := database.QueryRowContext(context.Background(), "SELECT value FROM evidence").Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	return value
 }

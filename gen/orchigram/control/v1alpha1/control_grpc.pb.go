@@ -1523,9 +1523,11 @@ var PluginService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	SystemService_Info_FullMethodName   = "/orchigram.control.v1alpha1.SystemService/Info"
-	SystemService_Health_FullMethodName = "/orchigram.control.v1alpha1.SystemService/Health"
-	SystemService_Backup_FullMethodName = "/orchigram.control.v1alpha1.SystemService/Backup"
+	SystemService_Info_FullMethodName      = "/orchigram.control.v1alpha1.SystemService/Info"
+	SystemService_Health_FullMethodName    = "/orchigram.control.v1alpha1.SystemService/Health"
+	SystemService_Doctor_FullMethodName    = "/orchigram.control.v1alpha1.SystemService/Doctor"
+	SystemService_Backup_FullMethodName    = "/orchigram.control.v1alpha1.SystemService/Backup"
+	SystemService_Retention_FullMethodName = "/orchigram.control.v1alpha1.SystemService/Retention"
 )
 
 // SystemServiceClient is the client API for SystemService service.
@@ -1534,7 +1536,9 @@ const (
 type SystemServiceClient interface {
 	Info(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*SystemInfo, error)
 	Health(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*HealthResponse, error)
+	Doctor(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*DoctorResponse, error)
 	Backup(ctx context.Context, in *BackupRequest, opts ...grpc.CallOption) (*BackupResponse, error)
+	Retention(ctx context.Context, in *RetentionRequest, opts ...grpc.CallOption) (*RetentionResponse, error)
 }
 
 type systemServiceClient struct {
@@ -1565,10 +1569,30 @@ func (c *systemServiceClient) Health(ctx context.Context, in *emptypb.Empty, opt
 	return out, nil
 }
 
+func (c *systemServiceClient) Doctor(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*DoctorResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DoctorResponse)
+	err := c.cc.Invoke(ctx, SystemService_Doctor_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *systemServiceClient) Backup(ctx context.Context, in *BackupRequest, opts ...grpc.CallOption) (*BackupResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(BackupResponse)
 	err := c.cc.Invoke(ctx, SystemService_Backup_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *systemServiceClient) Retention(ctx context.Context, in *RetentionRequest, opts ...grpc.CallOption) (*RetentionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RetentionResponse)
+	err := c.cc.Invoke(ctx, SystemService_Retention_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1581,7 +1605,9 @@ func (c *systemServiceClient) Backup(ctx context.Context, in *BackupRequest, opt
 type SystemServiceServer interface {
 	Info(context.Context, *emptypb.Empty) (*SystemInfo, error)
 	Health(context.Context, *emptypb.Empty) (*HealthResponse, error)
+	Doctor(context.Context, *emptypb.Empty) (*DoctorResponse, error)
 	Backup(context.Context, *BackupRequest) (*BackupResponse, error)
+	Retention(context.Context, *RetentionRequest) (*RetentionResponse, error)
 	mustEmbedUnimplementedSystemServiceServer()
 }
 
@@ -1598,8 +1624,14 @@ func (UnimplementedSystemServiceServer) Info(context.Context, *emptypb.Empty) (*
 func (UnimplementedSystemServiceServer) Health(context.Context, *emptypb.Empty) (*HealthResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Health not implemented")
 }
+func (UnimplementedSystemServiceServer) Doctor(context.Context, *emptypb.Empty) (*DoctorResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Doctor not implemented")
+}
 func (UnimplementedSystemServiceServer) Backup(context.Context, *BackupRequest) (*BackupResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Backup not implemented")
+}
+func (UnimplementedSystemServiceServer) Retention(context.Context, *RetentionRequest) (*RetentionResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Retention not implemented")
 }
 func (UnimplementedSystemServiceServer) mustEmbedUnimplementedSystemServiceServer() {}
 func (UnimplementedSystemServiceServer) testEmbeddedByValue()                       {}
@@ -1658,6 +1690,24 @@ func _SystemService_Health_Handler(srv interface{}, ctx context.Context, dec fun
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SystemService_Doctor_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SystemServiceServer).Doctor(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SystemService_Doctor_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SystemServiceServer).Doctor(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _SystemService_Backup_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(BackupRequest)
 	if err := dec(in); err != nil {
@@ -1672,6 +1722,24 @@ func _SystemService_Backup_Handler(srv interface{}, ctx context.Context, dec fun
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SystemServiceServer).Backup(ctx, req.(*BackupRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SystemService_Retention_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RetentionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SystemServiceServer).Retention(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SystemService_Retention_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SystemServiceServer).Retention(ctx, req.(*RetentionRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1692,8 +1760,16 @@ var SystemService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _SystemService_Health_Handler,
 		},
 		{
+			MethodName: "Doctor",
+			Handler:    _SystemService_Doctor_Handler,
+		},
+		{
 			MethodName: "Backup",
 			Handler:    _SystemService_Backup_Handler,
+		},
+		{
+			MethodName: "Retention",
+			Handler:    _SystemService_Retention_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

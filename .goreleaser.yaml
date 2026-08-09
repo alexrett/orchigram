@@ -124,4 +124,6 @@ release:
     - glob: ./.release/plugin-bundles/*.spdx.json
     - glob: ./.release/dependency-licenses.csv
     - glob: ./dist/*.sbom.json
-  include_meta: true
+  # GoReleaser metadata embeds invocation time and builder OS/architecture.
+  # It is useful locally but is not a reproducible release asset.
+  include_meta: false

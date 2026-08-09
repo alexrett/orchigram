@@ -34,22 +34,36 @@ type FaultHook func(Boundary) error
 
 // Orchestrator is the single-node control loop.
 type Orchestrator struct {
-	store           *store.Store
-	compiler        *flow.Compiler
-	engine          engine.DurableEngine
-	fault           FaultHook
-	wake            chan struct{}
-	done            chan struct{}
-	claimStaleAfter time.Duration
-	health          *health.Tracker
+	store              *store.Store
+	compiler           *flow.Compiler
+	engine             engine.DurableEngine
+	fault              FaultHook
+	wake               chan struct{}
+	done               chan struct{}
+	claimStaleAfter    time.Duration
+	health             *health.Tracker
+	maxActiveRuns      int
+	capacityRetryAfter time.Duration
+}
+
+var errRunCapacity = errors.New("configured active Run capacity is saturated")
+
+// Options bounds local Run admission while preserving accepted receipts in
+// the durable outbox until capacity becomes available.
+type Options struct {
+	MaxActiveRuns int
 }
 
 // New constructs a control loop from product-owned interfaces.
-func New(state *store.Store, compiler *flow.Compiler, durable engine.DurableEngine) *Orchestrator {
+func New(state *store.Store, compiler *flow.Compiler, durable engine.DurableEngine, options ...Options) *Orchestrator {
 	tracker := health.NewTracker()
 	tracker.Set("engine", health.Diagnostic{Path: "engine", Code: "starting", Message: "durable engine reconciliation has not completed"})
 	tracker.Set("outbox", health.Diagnostic{Path: "outbox", Code: "starting", Message: "outbox reconciliation has not completed"})
-	return &Orchestrator{store: state, compiler: compiler, engine: durable, wake: make(chan struct{}, 1), done: make(chan struct{}), claimStaleAfter: 5 * time.Second, health: tracker}
+	maxActiveRuns := 1024
+	if len(options) > 0 && options[0].MaxActiveRuns > 0 {
+		maxActiveRuns = options[0].MaxActiveRuns
+	}
+	return &Orchestrator{store: state, compiler: compiler, engine: durable, wake: make(chan struct{}, 1), done: make(chan struct{}), claimStaleAfter: 5 * time.Second, health: tracker, maxActiveRuns: maxActiveRuns, capacityRetryAfter: time.Second}
 }
 
 // SetFaultHook installs a deterministic test-only boundary hook.
@@ -166,6 +180,22 @@ func (o *Orchestrator) reconcileStart(ctx context.Context, command store.OutboxC
 		_ = o.store.RetryOutbox(ctx, command.ID, err, time.Second)
 		return err
 	}
+	if _, getErr := o.store.GetRun(ctx, command.Payload.RunUID); errors.Is(getErr, store.ErrNotFound) {
+		active, countErr := o.store.CountActiveRunsExcluding(ctx, command.Payload.RunUID)
+		if countErr != nil {
+			_ = o.store.RetryOutbox(ctx, command.ID, countErr, time.Second)
+			return countErr
+		}
+		if active >= o.maxActiveRuns {
+			o.health.Set("capacity", health.Diagnostic{Path: "capacity/runs", Code: "saturated", Message: "configured active Run capacity is saturated; accepted work remains queued"})
+			_ = o.store.RetryOutbox(ctx, command.ID, errRunCapacity, o.capacityRetryAfter)
+			return errRunCapacity
+		}
+	} else if getErr != nil {
+		_ = o.store.RetryOutbox(ctx, command.ID, getErr, time.Second)
+		return getErr
+	}
+	o.health.Clear("capacity")
 	created, err := o.store.EnsureRun(ctx, command.Payload, plan)
 	if err != nil {
 		_ = o.store.RetryOutbox(ctx, command.ID, err, time.Second)
@@ -265,6 +295,8 @@ func (o *Orchestrator) observeOutbox(ctx context.Context, reconcileErr error) {
 	switch {
 	case reconcileErr == nil:
 		o.health.Clear("outbox")
+		return
+	case errors.Is(reconcileErr, errRunCapacity):
 		return
 	case !errors.Is(reconcileErr, store.ErrNotFound):
 		if !errors.Is(reconcileErr, context.Canceled) {

@@ -58,7 +58,10 @@ func Open(ctx context.Context, cfg config.Config, executor engine.TaskExecutor) 
 	if err != nil {
 		return nil, err
 	}
-	plugins := pluginmanager.New(state, cfg.StateDir)
+	plugins := pluginmanager.NewWithLimits(state, cfg.StateDir, pluginmanager.Limits{
+		MaxConcurrentActivities: cfg.Operations.MaxConcurrentActivities,
+		MaxAgentProcesses:       cfg.Operations.MaxAgentProcesses,
+	})
 	pluginsOwnedByDaemon := false
 	defer func() {
 		if !pluginsOwnedByDaemon {
@@ -77,7 +80,7 @@ func Open(ctx context.Context, cfg config.Config, executor engine.TaskExecutor) 
 		_ = state.Close()
 		return nil, fmt.Errorf("reconcile plugin installations: %w", err)
 	}
-	durable, err := engine.Open(ctx, filepath.Join(cfg.StateDir, "workflows.sqlite"), state, executor)
+	durable, err := engine.Open(ctx, filepath.Join(cfg.StateDir, "workflows.sqlite"), state, executor, engine.OpenOptions{MaxConcurrentActivities: cfg.Operations.MaxConcurrentActivities})
 	if err != nil {
 		_ = state.Close()
 		return nil, err
@@ -96,7 +99,7 @@ func Open(ctx context.Context, cfg config.Config, executor engine.TaskExecutor) 
 		return nil, fmt.Errorf("set unix socket mode: %w", err)
 	}
 	compiler := flow.NewCompiler(plugins)
-	control := orchestrator.New(state, compiler, durable)
+	control := orchestrator.New(state, compiler, durable, orchestrator.Options{MaxActiveRuns: cfg.Operations.MaxActiveRuns})
 	triggers := triggercontroller.NewController(state, plugins, control)
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(2<<20),

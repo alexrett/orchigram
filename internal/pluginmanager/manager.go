@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -63,6 +64,21 @@ type Manager struct {
 	mu         sync.Mutex
 	processes  map[string]*pluginhost.Process
 	active     map[string]*activeProviderCall
+	activities *callLimiter
+	agents     *callLimiter
+}
+
+// Limits bounds concurrent external activities and heavyweight agent calls.
+type Limits struct {
+	MaxConcurrentActivities int
+	MaxAgentProcesses       int
+}
+
+type callLimiter struct {
+	name    string
+	tokens  chan struct{}
+	active  atomic.Int64
+	waiting atomic.Int64
 }
 
 type activeProviderCall struct {
@@ -76,9 +92,40 @@ type activeProviderCall struct {
 
 // New creates a manager rooted under the daemon's private state directory.
 func New(state *store.Store, stateRoot string) *Manager {
+	return NewWithLimits(state, stateRoot, Limits{MaxConcurrentActivities: 64, MaxAgentProcesses: 16})
+}
+
+// NewWithLimits creates a manager with explicit single-node call bounds.
+func NewWithLimits(state *store.Store, stateRoot string, limits Limits) *Manager {
+	if limits.MaxConcurrentActivities < 1 {
+		limits.MaxConcurrentActivities = 1
+	}
+	if limits.MaxAgentProcesses < 1 || limits.MaxAgentProcesses > limits.MaxConcurrentActivities {
+		limits.MaxAgentProcesses = limits.MaxConcurrentActivities
+	}
 	return &Manager{
 		store: state, root: filepath.Join(stateRoot, "plugins"),
 		artifacts: filepath.Join(stateRoot, "artifacts"), workspaces: filepath.Join(stateRoot, "workspaces"), processes: map[string]*pluginhost.Process{}, active: map[string]*activeProviderCall{},
+		activities: newCallLimiter("activities", limits.MaxConcurrentActivities), agents: newCallLimiter("agents", limits.MaxAgentProcesses),
+	}
+}
+
+func newCallLimiter(name string, maximum int) *callLimiter {
+	return &callLimiter{name: name, tokens: make(chan struct{}, maximum)}
+}
+
+func (l *callLimiter) acquire(ctx context.Context) (func(), error) {
+	l.waiting.Add(1)
+	defer l.waiting.Add(-1)
+	select {
+	case l.tokens <- struct{}{}:
+		l.active.Add(1)
+		return func() {
+			<-l.tokens
+			l.active.Add(-1)
+		}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
@@ -248,9 +295,15 @@ func (m *Manager) List(ctx context.Context) ([]store.PluginRecord, error) {
 // secret-free aggregate probe. A process observed as exited is reported once
 // before a later probe is allowed to restart it.
 func (m *Manager) HealthDiagnostics(ctx context.Context) []health.Diagnostic {
+	diagnostics := make([]health.Diagnostic, 0)
+	for _, limiter := range []*callLimiter{m.activities, m.agents} {
+		if limiter != nil && limiter.waiting.Load() > 0 {
+			diagnostics = append(diagnostics, health.Diagnostic{Path: "capacity/" + limiter.name, Code: "saturated", Message: "configured execution capacity is saturated; queued work is waiting"})
+		}
+	}
 	records, err := m.store.ListPlugins(ctx)
 	if err != nil {
-		return []health.Diagnostic{{Path: "plugins", Code: "state_unavailable", Message: "plugin activation state is unavailable; inspect daemon logs"}}
+		return append(diagnostics, health.Diagnostic{Path: "plugins", Code: "state_unavailable", Message: "plugin activation state is unavailable; inspect daemon logs"})
 	}
 	active := make([]store.PluginRecord, 0, len(records))
 	for _, record := range records {
@@ -259,7 +312,7 @@ func (m *Manager) HealthDiagnostics(ctx context.Context) []health.Diagnostic {
 		}
 	}
 	if len(active) == 0 {
-		return nil
+		return diagnostics
 	}
 	probeContext, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
@@ -270,7 +323,6 @@ func (m *Manager) HealthDiagnostics(ctx context.Context) []health.Diagnostic {
 			results <- diagnostic
 		}()
 	}
-	diagnostics := make([]health.Diagnostic, 0, len(active))
 	for range active {
 		select {
 		case diagnostic := <-results:
@@ -747,6 +799,11 @@ func (m *Manager) Doctor(ctx context.Context, name, version string) error {
 
 // Execute implements engine.TaskExecutor for non-core Flow nodes.
 func (m *Manager) Execute(ctx context.Context, runUID string, node flow.PlanNode, input json.RawMessage, nodes map[string]any, idempotencyKey string) (json.RawMessage, error) {
+	releaseActivity, acquireActivityErr := m.activities.acquire(ctx)
+	if acquireActivityErr != nil {
+		return nil, acquireActivityErr
+	}
+	defer releaseActivity()
 	pluginName := strings.SplitN(node.Uses, ".", 2)[0]
 	var process *pluginhost.Process
 	var record store.PluginRecord
@@ -782,6 +839,11 @@ func (m *Manager) Execute(ctx context.Context, runUID string, node flow.PlanNode
 	call := m.registerActiveCall(callContext, process, callMeta, kind, cancel)
 	defer m.releaseActiveCall(callMeta.GetRequestId(), call)
 	if pluginName == "agent-command" {
+		releaseAgent, acquireErr := m.agents.acquire(callContext)
+		if acquireErr != nil {
+			return nil, acquireErr
+		}
+		defer releaseAgent()
 		output, executeErr := m.executeAgent(callContext, process, callMeta, node, input, nodes)
 		if executeErr != nil && process.Exited() {
 			m.evict(installationKey(record.Name, record.Version))
@@ -1244,6 +1306,18 @@ func (m *Manager) processForRecord(ctx context.Context, record store.PluginRecor
 }
 
 func (m *Manager) launch(ctx context.Context, record store.PluginRecord) (*pluginhost.Process, error) {
+	legacyContract := len(record.ContractJSON) == 0 && record.ContractDigest == ""
+	if !legacyContract && (len(record.ContractJSON) == 0 || record.ContractDigest == "") {
+		return nil, errors.New("installed plugin action contract metadata is incomplete")
+	}
+	if legacyContract {
+		// Pre-contract installations remain executable for already pinned Runs.
+		// Adopt a complete descriptor when possible; otherwise new Flow compilation
+		// still rejects the empty contract until the installer activates a new bundle.
+		if adopted, err := m.ensureContract(ctx, record); err == nil {
+			record, legacyContract = adopted, false
+		}
+	}
 	var manifest pluginbundle.Manifest
 	if err := json.Unmarshal(record.ManifestJSON, &manifest); err != nil {
 		return nil, err
@@ -1261,6 +1335,13 @@ func (m *Manager) launch(ctx context.Context, record store.PluginRecord) (*plugi
 		process.Close()
 		return nil, errors.New("running plugin identity does not match installation")
 	}
+	if !sameCapabilities(description.GetCapabilities(), manifest.Capabilities) {
+		process.Close()
+		return nil, errors.New("running plugin capabilities do not match installation")
+	}
+	if legacyContract {
+		return process, nil
+	}
 	_, contractDigest, err := pluginsdk.ValidateDescription(description)
 	if err != nil {
 		process.Close()
@@ -1271,6 +1352,48 @@ func (m *Manager) launch(ctx context.Context, record store.PluginRecord) (*plugi
 		return nil, errors.New("running plugin action contract does not match the immutable installation")
 	}
 	return process, nil
+}
+
+func (m *Manager) ensureContract(ctx context.Context, record store.PluginRecord) (store.PluginRecord, error) {
+	if len(record.ContractJSON) > 0 && record.ContractDigest != "" {
+		return record, nil
+	}
+	if len(record.ContractJSON) > 0 || record.ContractDigest != "" {
+		return store.PluginRecord{}, errors.New("installed plugin action contract metadata is incomplete")
+	}
+	var manifest pluginbundle.Manifest
+	if err := json.Unmarshal(record.ManifestJSON, &manifest); err != nil {
+		return store.PluginRecord{}, err
+	}
+	platform, err := manifest.CurrentPlatform()
+	if err != nil {
+		return store.PluginRecord{}, err
+	}
+	executable := filepath.Join(m.root, record.Name, record.Version, "plugin")
+	process, description, err := pluginhost.Launch(ctx, executable, platform.SHA256)
+	if err != nil {
+		return store.PluginRecord{}, err
+	}
+	process.Close()
+	if description.GetName() != record.Name || description.GetVersion() != record.Version {
+		return store.PluginRecord{}, errors.New("running plugin identity does not match installation")
+	}
+	if !sameCapabilities(description.GetCapabilities(), manifest.Capabilities) {
+		return store.PluginRecord{}, errors.New("running plugin capabilities do not match installation")
+	}
+	contract, digest, err := pluginsdk.ValidateDescription(description)
+	if err != nil {
+		return store.PluginRecord{}, fmt.Errorf("validate running plugin action contract: %w", err)
+	}
+	contractJSON, err := json.Marshal(contract)
+	if err != nil {
+		return store.PluginRecord{}, err
+	}
+	record.ContractJSON, record.ContractDigest = contractJSON, digest
+	if err := m.store.PutPlugin(ctx, record); err != nil {
+		return store.PluginRecord{}, err
+	}
+	return m.store.Plugin(ctx, record.Name, record.Version)
 }
 
 func (m *Manager) resolveNodeSecretsInNamespace(ctx context.Context, namespace string, config map[string]any, bindingSets ...[]flow.ResourceBinding) (map[string][]byte, error) {
