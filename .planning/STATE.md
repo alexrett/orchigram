@@ -80,6 +80,14 @@ and automatic core/config/state/plugin rollback. The same host then passed
 aggregate health, doctor, security exposure `1.3 OK`, and a local-client SSH
 StreamLocal exec/approval tracer without publishing host coordinates.
 
+Phase 12 now has a 42-file double-build reproducibility gate and a completed
+local native schedule tracer. The accepted occurrence ran a deterministic
+command AgentProfile, resolved the Slack webhook only through a configured
+environment SecretRef, received `200 ok`, and completed successfully. No
+endpoint or credential was persisted in resources, events, logs, planning, or
+public evidence. Publication remains gated on exact-head review, release CI,
+tagged provenance attestations, and verification of the draft release assets.
+
 ## Blockers
 
 No design or authorization blocker. Live external actions remain explicit gates and must use protected runtime secrets.

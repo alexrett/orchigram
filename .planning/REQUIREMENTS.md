@@ -48,7 +48,7 @@ The existing code is a prototype baseline. A checked requirement below means its
 
 - [ ] REL-01: `make check`, race, lint, Buf lint/breaking, secret/history scan, dependency licenses, SPDX SBOM, and reproducibility checks run in the release workflow.
 - [ ] REL-02: Signed checksums, provenance/attestations, core archives, and independent first-party plugin bundles are produced for supported macOS/Linux amd64/arm64 targets.
-- [ ] REL-03: A local native schedule-to-Slack-compatible webhook tracer passes with fake-receiver CI coverage and an explicitly authorized real delivery.
+- [x] REL-03: A local native schedule-to-Slack-compatible webhook tracer passes with fake-receiver CI coverage and an explicitly authorized real delivery.
 - [x] REL-04: The demo server passes clean install, SSH TUI reconnect, restart/crash recovery, resource limits, backup/restore, and upgrade/rollback without publishing its address or credentials.
 - [ ] REL-05: English documentation reproduces the notification and full GitHub review tracers; only then is v0.1.0 tagged and the release published.
 
