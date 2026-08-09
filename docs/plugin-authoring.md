@@ -77,11 +77,15 @@ or `Config.Agent`. Trigger watches participate in the same shutdown admission,
 cancellation, and drain accounting. Daemon, resource, bundle, and
 workflow-engine internals are not public APIs.
 
-A trigger plugin publishes exactly one `TriggerDescriptor` in v0.1, containing
-Draft 2020-12 config and event schemas. The daemon resolves the Trigger's
+A trigger plugin publishes one or more named `TriggerDescriptor` values, each
+containing Draft 2020-12 config and event schemas and matching a declared
+`trigger.<source>` capability. `spec.provider.source` selects the descriptor;
+it may be omitted only when the installed plugin publishes exactly one source.
+The selected source is repeated in `WatchStart.source`, so a multi-source
+runtime does not infer behavior from configuration shape. The daemon resolves the Trigger's
 namespace-local `secretRefs`, removes that host-only map, and validates the
 remaining config before opening a watch. It validates every emitted payload
-against the immutable event schema before durable acceptance and acknowledgement.
+against the selected immutable event schema before durable acceptance and acknowledgement.
 Schema failures stop the watch with path/code diagnostics and never include the
 rejected config, event payload, or secret values.
 

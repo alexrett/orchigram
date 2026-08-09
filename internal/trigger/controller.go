@@ -24,7 +24,7 @@ var cronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month 
 
 // Provider watches one active TriggerProvider and acknowledges callback success.
 type Provider interface {
-	WatchTrigger(context.Context, string, string, string, map[string]any, string, time.Time, func(*pluginv1alpha1.TriggerEvent) error) error
+	WatchTrigger(context.Context, string, string, string, string, map[string]any, string, time.Time, func(*pluginv1alpha1.TriggerEvent) error) error
 }
 
 // Acceptor owns compilation and the durable receipt/plan/outbox boundary.
@@ -288,7 +288,7 @@ func (c *Controller) watchProvider(ctx context.Context, trigger resource.Trigger
 		watchMessage := "provider subscription failed and is waiting to retry"
 		if stateErr == nil && err == nil {
 			c.health.Clear(providerHealthKey(trigger.Metadata.UID))
-			watchErr := c.provider.WatchTrigger(ctx, trigger.Spec.Provider.Plugin, trigger.Metadata.UID, trigger.Metadata.Namespace, trigger.Spec.Provider.Config, cursor, state.CursorAt, func(event *pluginv1alpha1.TriggerEvent) error {
+			watchErr := c.provider.WatchTrigger(ctx, trigger.Spec.Provider.Plugin, trigger.Spec.Provider.Source, trigger.Metadata.UID, trigger.Metadata.Namespace, trigger.Spec.Provider.Config, cursor, state.CursorAt, func(event *pluginv1alpha1.TriggerEvent) error {
 				if event.GetProviderEventId() == "" || event.GetCursor() == "" || !json.Valid(event.GetPayloadJson()) {
 					return errors.New("provider event identity, cursor, and JSON payload are required")
 				}

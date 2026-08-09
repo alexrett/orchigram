@@ -22,7 +22,7 @@ type Lookup interface {
 // ProviderValidator validates an installed provider contract and its metadata
 // references without launching the provider process.
 type ProviderValidator interface {
-	ValidateTriggerProvider(context.Context, string, string, map[string]any) []flow.Diagnostic
+	ValidateTriggerProvider(context.Context, string, string, string, map[string]any) []flow.Diagnostic
 }
 
 // Resolver owns the stable cross-resource diagnostic vocabulary.
@@ -70,7 +70,7 @@ func (r *Resolver) Diagnostics(ctx context.Context, document resource.Document) 
 			if r.providers == nil {
 				diagnostics = append(diagnostics, flow.Diagnostic{Path: "spec.provider.plugin", Code: "provider_unavailable", Message: "provider validation is unavailable"})
 			} else {
-				for _, diagnostic := range r.providers.ValidateTriggerProvider(ctx, namespace, trigger.Spec.Provider.Plugin, trigger.Spec.Provider.Config) {
+				for _, diagnostic := range r.providers.ValidateTriggerProvider(ctx, namespace, trigger.Spec.Provider.Plugin, trigger.Spec.Provider.Source, trigger.Spec.Provider.Config) {
 					diagnostic.Path = "spec.provider." + strings.TrimPrefix(diagnostic.Path, ".")
 					diagnostics = append(diagnostics, diagnostic)
 				}

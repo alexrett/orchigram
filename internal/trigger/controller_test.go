@@ -157,9 +157,11 @@ type fakeProvider struct {
 type signalProvider struct {
 	accepted chan struct{}
 	cancel   context.CancelFunc
+	source   string
 }
 
-func (p *signalProvider) WatchTrigger(ctx context.Context, _, _, _ string, _ map[string]any, _ string, _ time.Time, accept func(*pluginv1alpha1.TriggerEvent) error) error {
+func (p *signalProvider) WatchTrigger(ctx context.Context, _, source, _, _ string, _ map[string]any, _ string, _ time.Time, accept func(*pluginv1alpha1.TriggerEvent) error) error {
+	p.source = source
 	event := &pluginv1alpha1.TriggerEvent{
 		ProviderEventId: "review-event-1", Cursor: "1", OccurredAt: timestamppb.Now(),
 		PayloadJson: []byte(`{"review":{"state":"changes_requested"}}`), TargetRunUid: "run-1",
@@ -197,7 +199,7 @@ type recoveringProvider struct {
 	secondCall chan struct{}
 }
 
-func (p *recoveringProvider) WatchTrigger(ctx context.Context, _, _, _ string, _ map[string]any, _ string, _ time.Time, _ func(*pluginv1alpha1.TriggerEvent) error) error {
+func (p *recoveringProvider) WatchTrigger(ctx context.Context, _, _, _, _ string, _ map[string]any, _ string, _ time.Time, _ func(*pluginv1alpha1.TriggerEvent) error) error {
 	p.mu.Lock()
 	p.calls++
 	call := p.calls
@@ -250,7 +252,7 @@ spec:
 	}
 }
 
-func (f *fakeProvider) WatchTrigger(ctx context.Context, _, _, _ string, _ map[string]any, cursor string, activatedAt time.Time, accept func(*pluginv1alpha1.TriggerEvent) error) error {
+func (f *fakeProvider) WatchTrigger(ctx context.Context, _, _, _, _ string, _ map[string]any, cursor string, activatedAt time.Time, accept func(*pluginv1alpha1.TriggerEvent) error) error {
 	if cursor != "" {
 		return ctx.Err()
 	}
@@ -318,7 +320,7 @@ kind: Trigger
 metadata: {name: reviews}
 spec:
   flow: target
-  provider: {plugin: fake, config: {repository: example}}
+  provider: {plugin: fake, source: fake.reviews, config: {repository: example}}
   delivery: {mode: signal, node: wait_review}
 `)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -333,6 +335,9 @@ spec:
 	}
 	if acceptor.runUID != "run-1" || acceptor.nodeID != "wait_review" || string(acceptor.payload) != `{"review":{"state":"changes_requested"}}` {
 		t.Fatalf("signal target run=%q node=%q payload=%s", acceptor.runUID, acceptor.nodeID, acceptor.payload)
+	}
+	if provider.source != "fake.reviews" {
+		t.Fatalf("provider source=%q", provider.source)
 	}
 }
 

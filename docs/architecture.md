@@ -47,7 +47,9 @@ protobuf package. Every task action publishes config/input/output schemas. The
 SDK and daemon validate those schemas independently, installation persists a
 canonical contract digest, and a later process restart must reproduce it.
 Arbitrary plugin streams are still validated independently by the daemon before
-their output is trusted.
+their output is trusted. A provider plugin may publish multiple trigger
+sources; the Trigger selects one descriptor explicitly, and its config and
+every emitted event are validated against only that descriptor.
 
 The interpreter schedules the compiled component DAG, not individual plugin
 processes. `maxParallel` bounds active components; stable topological admission

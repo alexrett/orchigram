@@ -22,6 +22,7 @@ func (f fixtureLookup) Get(_ context.Context, kind, namespace, name string) (res
 
 type fixtureProvider struct {
 	namespace   string
+	source      string
 	diagnostics []flow.Diagnostic
 }
 
@@ -31,8 +32,9 @@ func (failingLookup) Get(context.Context, string, string, string) (resource.Docu
 	return resource.Document{}, errors.New("storage offline")
 }
 
-func (f *fixtureProvider) ValidateTriggerProvider(_ context.Context, namespace, _ string, _ map[string]any) []flow.Diagnostic {
+func (f *fixtureProvider) ValidateTriggerProvider(_ context.Context, namespace, _, source string, _ map[string]any) []flow.Diagnostic {
 	f.namespace = namespace
+	f.source = source
 	return append([]flow.Diagnostic(nil), f.diagnostics...)
 }
 
@@ -55,6 +57,7 @@ spec:
   flow: target
   provider:
     plugin: github
+    source: github.reviews
     config: {secretRefs: {token: token}}
 `)
 	provider := &fixtureProvider{diagnostics: []flow.Diagnostic{{Path: "config.owner", Code: "required", Message: "config does not satisfy the installed provider schema"}}}
@@ -64,6 +67,9 @@ spec:
 	diagnostics := resolver.Diagnostics(context.Background(), trigger)
 	if provider.namespace != "team-a" {
 		t.Fatalf("provider namespace=%q", provider.namespace)
+	}
+	if provider.source != "github.reviews" {
+		t.Fatalf("provider source=%q", provider.source)
 	}
 	if len(diagnostics) != 1 || diagnostics[0].Path != "spec.provider.config.owner" || diagnostics[0].Code != "required" {
 		t.Fatalf("diagnostics=%+v", diagnostics)

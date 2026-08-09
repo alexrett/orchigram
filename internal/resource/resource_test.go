@@ -111,6 +111,34 @@ spec:
 	}
 }
 
+func TestTriggerProviderSourceIsStrictAndProjected(t *testing.T) {
+	t.Parallel()
+	document, err := DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata: {name: reviews}
+spec:
+  flow: demo
+  provider: {plugin: github, source: github.reviews}
+  delivery: {mode: signal, node: review}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	trigger, err := DecodeTrigger(document.JSON)
+	if err != nil || trigger.Spec.Provider == nil || trigger.Spec.Provider.Source != "github.reviews" {
+		t.Fatalf("trigger=%+v err=%v", trigger, err)
+	}
+	if _, err := DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata: {name: bad}
+spec:
+  flow: demo
+  provider: {plugin: github, source: " github.reviews "}
+`)); err == nil || !strings.Contains(err.Error(), "surrounding whitespace") {
+		t.Fatalf("source whitespace error=%v", err)
+	}
+}
+
 func TestWithServerStatusRemovesClientProjection(t *testing.T) {
 	t.Parallel()
 	doc, err := DecodeStrict([]byte(strings.Replace(validFlow, "spec:\n", "status: {state: client-controlled}\nspec:\n", 1)))

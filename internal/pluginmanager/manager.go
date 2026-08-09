@@ -39,7 +39,19 @@ import (
 
 const maxSecretSize = 1 << 20
 
-var templateExpression = regexp.MustCompile(`\$\{([^{}]+)\}`)
+var (
+	templateExpression        = regexp.MustCompile(`\$\{([^{}]+)\}`)
+	errProviderSourceRequired = errors.New("provider source is required when the plugin publishes multiple trigger sources")
+)
+
+type providerSourceNotFoundError struct {
+	Source string
+	Plugin string
+}
+
+func (e *providerSourceNotFoundError) Error() string {
+	return fmt.Sprintf("provider source %q is not published by plugin %q", e.Source, e.Plugin)
+}
 
 // Manager is both the plugin control plane and engine TaskExecutor.
 type Manager struct {
@@ -347,13 +359,20 @@ func (m *Manager) ValidateAction(action string, config map[string]any) []flow.Di
 
 // ValidateTriggerProvider resolves one active provider contract and all of its
 // SecretRef metadata without launching the plugin process.
-func (m *Manager) ValidateTriggerProvider(ctx context.Context, namespace, pluginName string, config map[string]any) []flow.Diagnostic {
+func (m *Manager) ValidateTriggerProvider(ctx context.Context, namespace, pluginName, source string, config map[string]any) []flow.Diagnostic {
 	record, err := m.store.Plugin(ctx, pluginName, "")
 	if err != nil {
 		return []flow.Diagnostic{{Path: "plugin", Code: "provider_unavailable", Message: fmt.Sprintf("provider plugin %q is not active", pluginName)}}
 	}
-	descriptor, err := triggerDescriptor(record)
+	descriptor, err := triggerDescriptor(record, source)
 	if err != nil {
+		if errors.Is(err, errProviderSourceRequired) {
+			return []flow.Diagnostic{{Path: "source", Code: "required", Message: err.Error()}}
+		}
+		var notFound *providerSourceNotFoundError
+		if errors.As(err, &notFound) {
+			return []flow.Diagnostic{{Path: "source", Code: "source_not_found", Message: err.Error()}}
+		}
 		return []flow.Diagnostic{{Path: "plugin", Code: "provider_contract_invalid", Message: err.Error()}}
 	}
 	configCopy, err := cloneConfig(config)
@@ -523,15 +542,23 @@ func actionDescriptor(contract pluginsdk.Contract, action string) (pluginsdk.Act
 	return pluginsdk.ActionDescriptor{}, false
 }
 
-func triggerDescriptor(record store.PluginRecord) (pluginsdk.TriggerDescriptor, error) {
+func triggerDescriptor(record store.PluginRecord, source string) (pluginsdk.TriggerDescriptor, error) {
 	contract, err := pluginsdk.DecodeContract(record.ContractJSON)
 	if err != nil {
 		return pluginsdk.TriggerDescriptor{}, errors.New("installed provider contract is invalid")
 	}
-	if len(contract.Triggers) != 1 {
-		return pluginsdk.TriggerDescriptor{}, errors.New("provider plugin must publish exactly one trigger source in v0.1")
+	if source == "" {
+		if len(contract.Triggers) == 1 {
+			return contract.Triggers[0], nil
+		}
+		return pluginsdk.TriggerDescriptor{}, errProviderSourceRequired
 	}
-	return contract.Triggers[0], nil
+	for _, descriptor := range contract.Triggers {
+		if descriptor.Source == source {
+			return descriptor, nil
+		}
+	}
+	return pluginsdk.TriggerDescriptor{}, &providerSourceNotFoundError{Source: source, Plugin: record.Name}
 }
 
 type triggerContractError struct {
@@ -770,12 +797,12 @@ func (m *Manager) Execute(ctx context.Context, runUID string, node flow.PlanNode
 
 // WatchTrigger runs one bidirectional provider stream and acknowledges an
 // event only after the controller callback has durably persisted it.
-func (m *Manager) WatchTrigger(ctx context.Context, pluginName, triggerUID, namespace string, config map[string]any, cursor string, activatedAt time.Time, accept func(*pluginv1alpha1.TriggerEvent) error) error {
+func (m *Manager) WatchTrigger(ctx context.Context, pluginName, source, triggerUID, namespace string, config map[string]any, cursor string, activatedAt time.Time, accept func(*pluginv1alpha1.TriggerEvent) error) error {
 	process, record, err := m.activeProcess(ctx, pluginName)
 	if err != nil {
 		return err
 	}
-	descriptor, err := triggerDescriptor(record)
+	descriptor, err := triggerDescriptor(record, source)
 	if err != nil {
 		return err
 	}
@@ -801,7 +828,7 @@ func (m *Manager) WatchTrigger(ctx context.Context, pluginName, triggerUID, name
 	if err != nil {
 		return err
 	}
-	start := &pluginv1alpha1.WatchStart{InstallationUid: triggerUID, Cursor: cursor, ConfigJson: configJSON, Secrets: secrets}
+	start := &pluginv1alpha1.WatchStart{InstallationUid: triggerUID, Source: descriptor.Source, Cursor: cursor, ConfigJson: configJSON, Secrets: secrets}
 	if !activatedAt.IsZero() {
 		start.ActivatedAt = timestamppb.New(activatedAt)
 	}

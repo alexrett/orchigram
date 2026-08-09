@@ -803,6 +803,9 @@ func openTriggerDetail(ctx context.Context, application *tview.Application, page
 		source = "webhook (bearer SecretRef: " + trigger.Spec.Webhook.BearerSecretRef + ")"
 	case trigger.Spec.Provider != nil:
 		source = "provider " + trigger.Spec.Provider.Plugin
+		if trigger.Spec.Provider.Source != "" {
+			source += "/" + trigger.Spec.Provider.Source
+		}
 	}
 	detail := fmt.Sprintf("[yellow::b]%s[-:-:-]\n\n[gray]UID[-]     %s\n[gray]Flow[-]    %s\n[gray]Source[-]  %s", escape(trigger.Metadata.Name), escape(trigger.Metadata.UID), escape(trigger.Spec.Flow), escape(source))
 	if trigger.Spec.Schedule != nil {

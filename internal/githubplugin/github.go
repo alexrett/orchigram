@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,9 +30,12 @@ import (
 
 const (
 	defaultAPIBase    = "https://api.github.com"
+	githubAPIVersion  = "2026-03-10"
 	maxResponse       = 4 << 20
 	activationOverlap = time.Minute
 )
+
+var orchigramRunMarker = regexp.MustCompile(`<!-- orchigram:run=([A-Za-z0-9][A-Za-z0-9._:-]{0,127});node=[A-Za-z0-9][A-Za-z0-9._:-]{0,127};idempotency=[0-9a-f]{64} -->`)
 
 // Capabilities are declared by the first-party GitHub bundle.
 var Capabilities = func() []string {
@@ -56,6 +60,12 @@ type repositoryConfig struct {
 type watchConfig struct {
 	repositoryConfig
 	Label          string `json:"label,omitempty"`
+	PollInterval   string `json:"pollInterval,omitempty"`
+	ReplayExisting bool   `json:"replayExisting,omitempty"`
+}
+
+type reviewWatchConfig struct {
+	repositoryConfig
 	PollInterval   string `json:"pollInterval,omitempty"`
 	ReplayExisting bool   `json:"replayExisting,omitempty"`
 }
@@ -111,6 +121,39 @@ type issueEvent struct {
 	Label     struct {
 		Name string `json:"name"`
 	} `json:"label"`
+}
+
+type pullRecord struct {
+	Number  int    `json:"number"`
+	HTMLURL string `json:"html_url"`
+	Body    string `json:"body"`
+	State   string `json:"state"`
+	Head    struct {
+		SHA string `json:"sha"`
+	} `json:"head"`
+}
+
+type reviewRecord struct {
+	ID          int64     `json:"id"`
+	State       string    `json:"state"`
+	Body        string    `json:"body"`
+	SubmittedAt time.Time `json:"submitted_at"`
+	CommitID    string    `json:"commit_id"`
+	User        struct {
+		Login string `json:"login"`
+	} `json:"user"`
+}
+
+type reviewCursor struct {
+	SubmittedAt time.Time `json:"submittedAt"`
+	ReviewID    int64     `json:"reviewID"`
+}
+
+type submittedReview struct {
+	Cursor reviewCursor
+	RunUID string
+	Pull   pullRecord
+	Review reviewRecord
 }
 
 // ValidateAction validates action-specific JSON without network access.
@@ -186,7 +229,7 @@ func (r *Runtime) Execute(ctx context.Context, request pluginsdk.TaskRequest, si
 	return output, err
 }
 
-// Watch polls stable repository issue events and waits for each durable daemon ack.
+// Watch selects one declared source and waits for each durable daemon ack.
 func (r *Runtime) Watch(stream pluginv1alpha1.TriggerProvider_WatchServer) error {
 	command, err := stream.Recv()
 	if err != nil {
@@ -196,6 +239,17 @@ func (r *Runtime) Watch(stream pluginv1alpha1.TriggerProvider_WatchServer) error
 	if start == nil {
 		return status.Error(codes.InvalidArgument, "first trigger command must be start")
 	}
+	switch start.GetSource() {
+	case "", "github.issues":
+		return r.watchIssues(stream, start)
+	case "github.reviews":
+		return r.watchReviews(stream, start)
+	default:
+		return status.Errorf(codes.InvalidArgument, "unsupported trigger source %q", start.GetSource())
+	}
+}
+
+func (r *Runtime) watchIssues(stream pluginv1alpha1.TriggerProvider_WatchServer, start *pluginv1alpha1.WatchStart) error {
 	var config watchConfig
 	if err := decodeStrict(start.GetConfigJson(), &config); err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
@@ -206,12 +260,9 @@ func (r *Runtime) Watch(stream pluginv1alpha1.TriggerProvider_WatchServer) error
 	if config.Label == "" {
 		config.Label = "orchigram:ready"
 	}
-	interval := 30 * time.Second
-	if config.PollInterval != "" {
-		interval, err = time.ParseDuration(config.PollInterval)
-		if err != nil || interval <= 0 {
-			return status.Error(codes.InvalidArgument, "pollInterval must be positive")
-		}
+	interval, err := providerPollInterval(config.PollInterval)
+	if err != nil {
+		return err
 	}
 	token, err := secret(start.GetSecrets(), config.TokenSecret)
 	if err != nil {
@@ -221,7 +272,7 @@ func (r *Runtime) Watch(stream pluginv1alpha1.TriggerProvider_WatchServer) error
 	if err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
-	activatedAt, err := providerActivation(start, config.ReplayExisting, cursor)
+	activatedAt, err := providerActivation(start, config.ReplayExisting, cursor > 0)
 	if err != nil {
 		return err
 	}
@@ -237,41 +288,227 @@ func (r *Runtime) Watch(stream pluginv1alpha1.TriggerProvider_WatchServer) error
 			}
 			providerID := fmt.Sprintf("github:%s/%s:issue-label-event:%d", config.Owner, config.Repository, event.ID)
 			eventCursor := strconv.FormatInt(event.ID, 10)
-			if err := stream.Send(&pluginv1alpha1.TriggerEvent{ProviderEventId: providerID, Cursor: eventCursor, OccurredAt: timestamppb.New(event.CreatedAt), PayloadJson: payload}); err != nil {
+			if err := sendAndAwaitAck(stream, &pluginv1alpha1.TriggerEvent{ProviderEventId: providerID, Cursor: eventCursor, OccurredAt: timestamppb.New(event.CreatedAt), PayloadJson: payload}); err != nil {
 				return err
-			}
-			ackCommand, receiveErr := stream.Recv()
-			if receiveErr != nil {
-				return receiveErr
-			}
-			ack := ackCommand.GetAck()
-			if ack == nil || ack.GetProviderEventId() != providerID || ack.GetCursor() != eventCursor {
-				return status.Error(codes.FailedPrecondition, "trigger acknowledgement does not match emitted event")
 			}
 			cursor = event.ID
 		}
-		timer := time.NewTimer(interval)
-		select {
-		case <-stream.Context().Done():
-			timer.Stop()
-			return stream.Context().Err()
-		case <-timer.C:
+		if err := waitForProviderPoll(stream.Context(), interval); err != nil {
+			return err
 		}
 	}
 }
 
-func providerActivation(start *pluginv1alpha1.WatchStart, replayExisting bool, cursor int64) (time.Time, error) {
+func providerActivation(start *pluginv1alpha1.WatchStart, replayExisting, hasCursor bool) (time.Time, error) {
 	activatedAt := start.GetActivatedAt()
 	if activatedAt != nil && !activatedAt.IsValid() {
 		return time.Time{}, status.Error(codes.InvalidArgument, "activated_at must be a valid timestamp")
 	}
-	if replayExisting || cursor > 0 {
+	if replayExisting || hasCursor {
 		return time.Time{}, nil
 	}
 	if activatedAt == nil {
 		return time.Time{}, status.Error(codes.FailedPrecondition, "activated_at is required for an empty-cursor non-replay subscription")
 	}
 	return activatedAt.AsTime(), nil
+}
+
+func providerPollInterval(value string) (time.Duration, error) {
+	if value == "" {
+		return 30 * time.Second, nil
+	}
+	interval, err := time.ParseDuration(value)
+	if err != nil || interval <= 0 {
+		return 0, status.Error(codes.InvalidArgument, "pollInterval must be positive")
+	}
+	return interval, nil
+}
+
+func sendAndAwaitAck(stream pluginv1alpha1.TriggerProvider_WatchServer, event *pluginv1alpha1.TriggerEvent) error {
+	if err := stream.Send(event); err != nil {
+		return err
+	}
+	command, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	ack := command.GetAck()
+	if ack == nil || ack.GetProviderEventId() != event.GetProviderEventId() || ack.GetCursor() != event.GetCursor() {
+		return status.Error(codes.FailedPrecondition, "trigger acknowledgement does not match emitted event")
+	}
+	return nil
+}
+
+func waitForProviderPoll(ctx context.Context, interval time.Duration) error {
+	timer := time.NewTimer(interval)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (r *Runtime) watchReviews(stream pluginv1alpha1.TriggerProvider_WatchServer, start *pluginv1alpha1.WatchStart) error {
+	var config reviewWatchConfig
+	if err := decodeStrict(start.GetConfigJson(), &config); err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	if err := validateRepository(config.repositoryConfig); err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	interval, err := providerPollInterval(config.PollInterval)
+	if err != nil {
+		return err
+	}
+	token, err := secret(start.GetSecrets(), config.TokenSecret)
+	if err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	cursor, err := parseReviewCursor(start.GetCursor())
+	if err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	activatedAt, err := providerActivation(start, config.ReplayExisting, !cursor.SubmittedAt.IsZero())
+	if err != nil {
+		return err
+	}
+	for {
+		events, listErr := r.listSubmittedReviews(stream.Context(), config, token, cursor, activatedAt)
+		if listErr != nil {
+			return listErr
+		}
+		for _, event := range events {
+			payload, marshalErr := json.Marshal(map[string]any{
+				"repository": map[string]any{"owner": config.Owner, "name": config.Repository},
+				"pull":       map[string]any{"number": event.Pull.Number, "html_url": event.Pull.HTMLURL, "head_sha": event.Pull.Head.SHA},
+				"review": map[string]any{
+					"id": event.Review.ID, "state": strings.ToUpper(event.Review.State), "body": event.Review.Body,
+					"author": event.Review.User.Login, "submitted_at": event.Review.SubmittedAt.UTC().Format(time.RFC3339Nano), "commit_id": event.Review.CommitID,
+				},
+			})
+			if marshalErr != nil {
+				return marshalErr
+			}
+			encodedCursor, marshalErr := encodeReviewCursor(event.Cursor)
+			if marshalErr != nil {
+				return marshalErr
+			}
+			providerID := fmt.Sprintf("github:%s/%s:pull-review:%d", config.Owner, config.Repository, event.Review.ID)
+			triggerEvent := &pluginv1alpha1.TriggerEvent{
+				ProviderEventId: providerID, Cursor: encodedCursor, OccurredAt: timestamppb.New(event.Review.SubmittedAt),
+				PayloadJson: payload, TargetRunUid: event.RunUID,
+			}
+			if err := sendAndAwaitAck(stream, triggerEvent); err != nil {
+				return err
+			}
+			cursor = event.Cursor
+		}
+		if err := waitForProviderPoll(stream.Context(), interval); err != nil {
+			return err
+		}
+	}
+}
+
+func (r *Runtime) listSubmittedReviews(ctx context.Context, config reviewWatchConfig, token []byte, cursor reviewCursor, activatedAt time.Time) ([]submittedReview, error) {
+	if !activatedAt.IsZero() {
+		activatedAt = activatedAt.UTC().Truncate(time.Second).Add(-activationOverlap)
+	}
+	base := apiBase(config.APIBase)
+	next := fmt.Sprintf("%s/repos/%s/%s/pulls?state=all&sort=updated&direction=desc&per_page=100", base, url.PathEscape(config.Owner), url.PathEscape(config.Repository))
+	result := []submittedReview{}
+	pullPages := 0
+	for ; next != "" && pullPages < 100; pullPages++ {
+		var pulls []pullRecord
+		headers, err := r.getJSON(ctx, next, token, &pulls)
+		if err != nil {
+			return nil, err
+		}
+		next = nextLink(headers.Get("Link"))
+		for _, pull := range pulls {
+			runUID, ok := targetRunFromMarker(pull.Body)
+			if !ok {
+				continue
+			}
+			if pull.Number <= 0 || pull.Head.SHA == "" {
+				return nil, status.Error(codes.FailedPrecondition, "GitHub returned an invalid managed pull request")
+			}
+			reviewsNext := fmt.Sprintf("%s/repos/%s/%s/pulls/%d/reviews?per_page=100", base, url.PathEscape(config.Owner), url.PathEscape(config.Repository), pull.Number)
+			reviewPages := 0
+			for ; reviewsNext != "" && reviewPages < 100; reviewPages++ {
+				var reviews []reviewRecord
+				reviewHeaders, reviewErr := r.getJSON(ctx, reviewsNext, token, &reviews)
+				if reviewErr != nil {
+					return nil, reviewErr
+				}
+				reviewsNext = nextLink(reviewHeaders.Get("Link"))
+				for _, review := range reviews {
+					state := strings.ToUpper(review.State)
+					if review.ID <= 0 || review.SubmittedAt.IsZero() || (state != "APPROVED" && state != "CHANGES_REQUESTED") {
+						continue
+					}
+					if review.CommitID == "" || review.User.Login == "" {
+						return nil, status.Errorf(codes.FailedPrecondition, "GitHub review %d is missing required identity fields", review.ID)
+					}
+					review.State = state
+					eventCursor := reviewCursor{SubmittedAt: review.SubmittedAt.UTC(), ReviewID: review.ID}
+					if !reviewCursorAfter(eventCursor, cursor) || (!activatedAt.IsZero() && review.SubmittedAt.Before(activatedAt)) {
+						continue
+					}
+					result = append(result, submittedReview{Cursor: eventCursor, RunUID: runUID, Pull: pull, Review: review})
+				}
+			}
+			if reviewsNext != "" {
+				return nil, status.Errorf(codes.ResourceExhausted, "GitHub review pagination for pull request %d exceeds 100 pages", pull.Number)
+			}
+		}
+	}
+	if next != "" {
+		return nil, status.Error(codes.ResourceExhausted, "GitHub pull-request pagination exceeds 100 pages")
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Cursor.SubmittedAt.Equal(result[j].Cursor.SubmittedAt) {
+			return result[i].Cursor.ReviewID < result[j].Cursor.ReviewID
+		}
+		return result[i].Cursor.SubmittedAt.Before(result[j].Cursor.SubmittedAt)
+	})
+	return result, nil
+}
+
+func targetRunFromMarker(body string) (string, bool) {
+	match := orchigramRunMarker.FindStringSubmatch(body)
+	if len(match) != 2 {
+		return "", false
+	}
+	return match[1], true
+}
+
+func parseReviewCursor(value string) (reviewCursor, error) {
+	if value == "" {
+		return reviewCursor{}, nil
+	}
+	var cursor reviewCursor
+	if err := json.Unmarshal([]byte(value), &cursor); err != nil || cursor.SubmittedAt.IsZero() || cursor.ReviewID <= 0 {
+		return reviewCursor{}, errors.New("GitHub review cursor must contain a submitted timestamp and positive review ID")
+	}
+	cursor.SubmittedAt = cursor.SubmittedAt.UTC()
+	return cursor, nil
+}
+
+func encodeReviewCursor(cursor reviewCursor) (string, error) {
+	data, err := json.Marshal(cursor)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func reviewCursorAfter(candidate, cursor reviewCursor) bool {
+	if cursor.SubmittedAt.IsZero() {
+		return true
+	}
+	return candidate.SubmittedAt.After(cursor.SubmittedAt) || (candidate.SubmittedAt.Equal(cursor.SubmittedAt) && candidate.ReviewID > cursor.ReviewID)
 }
 
 type readyEvent struct {
@@ -530,7 +767,7 @@ func (r *Runtime) do(ctx context.Context, method, endpoint string, token, body [
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	request.Header.Set("Accept", "application/vnd.github+json")
-	request.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	request.Header.Set("X-GitHub-Api-Version", githubAPIVersion)
 	request.Header.Set("User-Agent", "orchigram-plugin-github")
 	if len(body) > 0 {
 		request.Header.Set("Content-Type", "application/json")

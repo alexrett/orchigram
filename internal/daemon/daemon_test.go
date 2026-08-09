@@ -1170,6 +1170,102 @@ spec:
 	}
 }
 
+func TestGitHubReviewProviderResumesWaitingRunThroughDaemon(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "orchigram-github-review-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	var mu sync.Mutex
+	runUID := ""
+	reviewSubmittedAt := time.Now().UTC().Add(-time.Second).Format(time.RFC3339Nano)
+	reviewServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer fixture-token" {
+			http.Error(writer, `{"message":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		mu.Lock()
+		currentRunUID := runUID
+		mu.Unlock()
+		switch request.URL.Path {
+		case "/repos/acme/widget/pulls":
+			marker := "<!-- orchigram:run=" + currentRunUID + ";node=create-pr;idempotency=" + strings.Repeat("d", 64) + " -->"
+			_ = json.NewEncoder(writer).Encode([]map[string]any{{
+				"number": 17, "state": "closed", "html_url": "https://example.invalid/pulls/17", "body": marker,
+				"head": map[string]any{"sha": "review-head"},
+			}})
+		case "/repos/acme/widget/pulls/17/reviews":
+			_ = json.NewEncoder(writer).Encode([]map[string]any{{
+				"id": 1701, "state": "APPROVED", "body": "approved fixture", "submitted_at": reviewSubmittedAt,
+				"commit_id": "reviewed-head", "user": map[string]any{"login": "reviewer"},
+			}})
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer reviewServer.Close()
+	t.Setenv("ORCHIGRAM_TEST_GITHUB_REVIEW_TOKEN", "fixture-token")
+	cfg := config.Development(filepath.Join(root, "state"))
+	stop := serveTestDaemon(t, cfg)
+	defer stop()
+	client := dialReadyClient(t, cfg.SocketPath)
+	defer func() { _ = client.Close() }()
+	installDaemonPlugin(t, client, daemonPluginBundle(t, "github", githubplugin.Capabilities), "github")
+	applyClientResource(t, client, `apiVersion: orchigram.dev/v1alpha1
+kind: SecretRef
+metadata: {name: github-review-token}
+spec: {backend: env, key: ORCHIGRAM_TEST_GITHUB_REVIEW_TOKEN}
+`)
+	applyClientResource(t, client, `apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: review-resume}
+spec:
+  policies: {timeout: 2m, maxParallel: 1}
+  nodes:
+    - {id: prepare, uses: core.noop}
+    - {id: wait_review, uses: core.event, timeout: 1m}
+  edges:
+    - {from: prepare, to: wait_review}
+`)
+	started, err := client.Runs.Start(context.Background(), &controlv1alpha1.StartRunRequest{Flow: "review-resume", InputJson: []byte(`{}`), IdempotencyKey: "review-resume-fixture"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	runUID = started.GetUid()
+	mu.Unlock()
+	waitForRunEvent(t, client, started.GetUid(), 0, "event.waiting")
+	trigger := applyClientResource(t, client, fmt.Sprintf(`apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata: {name: github-review-resume}
+spec:
+  flow: review-resume
+  provider:
+    plugin: github
+    source: github.reviews
+    config:
+      owner: acme
+      repository: widget
+      apiBase: %q
+      pollInterval: 10ms
+      replayExisting: true
+      tokenSecret: token
+      secretRefs: {token: github-review-token}
+  delivery: {mode: signal, node: wait_review}
+`, reviewServer.URL))
+	receipt := waitForTriggerReceipt(t, client, trigger.GetKey().GetUid())
+	if receipt.GetRunUid() != started.GetUid() || receipt.GetOccurrenceId() != "github:acme/widget:pull-review:1701" {
+		t.Fatalf("review receipt=%+v started=%s", receipt, started.GetUid())
+	}
+	waitForRunEvent(t, client, started.GetUid(), 0, "run.succeeded")
+	time.Sleep(50 * time.Millisecond)
+	receipts, err := client.Triggers.Receipts(context.Background(), &controlv1alpha1.ReceiptRequest{TriggerUid: trigger.GetKey().GetUid(), Limit: 10})
+	if err != nil || len(receipts.GetReceipts()) != 1 {
+		t.Fatalf("deduplicated review receipts=%+v err=%v", receipts, err)
+	}
+}
+
 func TestGitHubIssueApprovalToPullRequestTracer(t *testing.T) {
 	root, err := os.MkdirTemp("/tmp", "orchigram-github-tracer-")
 	if err != nil {
@@ -1383,6 +1479,7 @@ spec:
   flow: github-fixture
   provider:
     plugin: github
+    source: github.issues
     config:
       owner: acme
       repository: widget
