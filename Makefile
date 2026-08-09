@@ -7,7 +7,7 @@ SYFT_VERSION := v1.50.0
 BIN_DIR := $(CURDIR)/bin
 COMMANDS := orchigram orchigram-plugin-agent-command orchigram-plugin-exec orchigram-plugin-http orchigram-plugin-github
 
-.PHONY: tools release-tools generate generate-check fmt vet test race lint buf-check secret-scan history-scan dependency-licenses plugin-sboms build cross-build check release-check clean
+.PHONY: tools release-tools generate generate-check fmt vet test race lint buf-check actions-pinned secret-scan history-scan dependency-licenses plugin-sboms build cross-build check release-check clean
 
 tools:
 	GOBIN=$(BIN_DIR) $(GO) install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
@@ -41,6 +41,9 @@ buf-check:
 	$(BUF) lint
 	$(BUF) build
 
+actions-pinned:
+	./scripts/check-actions-pinned.sh
+
 secret-scan:
 	$(GO) run github.com/zricethezav/gitleaks/v8@v8.28.0 detect --no-git --source . --redact --no-banner
 
@@ -66,7 +69,7 @@ cross-build:
 		done; \
 	done
 
-check: generate-check fmt vet test race lint buf-check secret-scan build
+check: generate-check fmt vet test race lint buf-check actions-pinned secret-scan build
 
 release-check: check history-scan cross-build release-tools
 	PATH="$(BIN_DIR):$$PATH" $(GO) run github.com/goreleaser/goreleaser/v2@v2.12.7 release --snapshot --clean --parallelism 1

@@ -10,6 +10,8 @@ make release-check
 It runs generated-code checks, formatting, vet, unit and race suites, lint,
 Buf lint/build, worktree and full-history secret scans, local and cross builds,
 license classification, SPDX SBOM generation, and a GoReleaser snapshot.
+All third-party GitHub Actions are pinned to full commit SHAs; their release
+aliases remain comments for human update review.
 
 ## Artifacts
 
