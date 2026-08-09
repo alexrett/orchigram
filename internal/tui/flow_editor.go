@@ -28,7 +28,7 @@ type actionConfigField struct {
 // without ever retrying across a desired-state generation or replacement UID.
 const maxFlowStatusRevisionRetries = 8
 
-func openFlowNodeForm(ctx context.Context, application *tview.Application, pages *tview.Pages, client *clientpkg.Client, document *controlv1alpha1.ResourceDocument, planNode flow.PlanNode, notifications *tview.TextView, returnFocus tview.Primitive) {
+func openFlowNodeForm(ctx context.Context, application *tview.Application, pages *tview.Pages, client *clientpkg.Client, document *controlv1alpha1.ResourceDocument, planNode flow.PlanNode, notifications *tview.TextView, returnFocus tview.Primitive, onApplied func(*controlv1alpha1.ResourceDocument)) {
 	definition, err := resource.DecodeFlow(document.GetJson())
 	if err != nil {
 		notifications.SetText("[red]Unable to decode the selected Flow")
@@ -141,6 +141,9 @@ func openFlowNodeForm(ctx context.Context, application *tview.Application, pages
 		if !applyFlowDefinition(ctx, client, document, definition, notifications) {
 			return
 		}
+		if onApplied != nil {
+			onApplied(document)
+		}
 		updateFlowGraph(ctx, client, returnFocus, document, notifications)
 		pages.RemovePage("flow-node-form")
 		application.SetFocus(returnFocus)
@@ -152,7 +155,7 @@ func openFlowNodeForm(ctx context.Context, application *tview.Application, pages
 	application.SetFocus(form)
 }
 
-func openFlowEdgeForm(ctx context.Context, application *tview.Application, pages *tview.Pages, client *clientpkg.Client, document *controlv1alpha1.ResourceDocument, planEdge flow.PlanEdge, planIndex int, notifications *tview.TextView, returnFocus tview.Primitive) {
+func openFlowEdgeForm(ctx context.Context, application *tview.Application, pages *tview.Pages, client *clientpkg.Client, document *controlv1alpha1.ResourceDocument, planEdge flow.PlanEdge, planIndex int, notifications *tview.TextView, returnFocus tview.Primitive, onApplied func(*controlv1alpha1.ResourceDocument)) {
 	definition, err := resource.DecodeFlow(document.GetJson())
 	if err != nil {
 		notifications.SetText("[red]Unable to decode the selected Flow")
@@ -170,6 +173,9 @@ func openFlowEdgeForm(ctx context.Context, application *tview.Application, pages
 		definition.Spec.Edges[index] = resource.FlowEdge{From: formText(form, "From"), To: formText(form, "To"), When: formText(form, "When (CEL)")}
 		if !applyFlowDefinition(ctx, client, document, definition, notifications) {
 			return
+		}
+		if onApplied != nil {
+			onApplied(document)
 		}
 		updateFlowGraph(ctx, client, returnFocus, document, notifications)
 		pages.RemovePage("flow-edge-form")
