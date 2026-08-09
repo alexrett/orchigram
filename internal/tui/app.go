@@ -303,6 +303,11 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 				selectedGeneration := currentResource.GetGeneration()
 				key := resourceLiveKey(currentResource.GetKey())
 				if updated := snapshot.Resources[key]; updated != nil {
+					if updated.GetResourceVersion() < currentResource.GetResourceVersion() {
+						showLiveStatus(liveStatus, snapshot, currentRun)
+						rebuild(currentFilter)
+						return
+					}
 					currentResource = cloneMessage(updated)
 					if currentResource.GetKey().GetKind() == "Flow" && currentResource.GetGeneration() != selectedGeneration {
 						plan, compileErr := compileFlowPlan(ctx, client, currentResource)
