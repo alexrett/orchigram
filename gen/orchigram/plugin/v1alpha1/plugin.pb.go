@@ -950,6 +950,7 @@ type WatchStart struct {
 	ConfigJson      []byte                 `protobuf:"bytes,3,opt,name=config_json,json=configJson,proto3" json:"config_json,omitempty"`
 	Secrets         map[string][]byte      `protobuf:"bytes,4,rep,name=secrets,proto3" json:"secrets,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	ActivatedAt     *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=activated_at,json=activatedAt,proto3" json:"activated_at,omitempty"`
+	Source          string                 `protobuf:"bytes,6,opt,name=source,proto3" json:"source,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -1017,6 +1018,13 @@ func (x *WatchStart) GetActivatedAt() *timestamppb.Timestamp {
 		return x.ActivatedAt
 	}
 	return nil
+}
+
+func (x *WatchStart) GetSource() string {
+	if x != nil {
+		return x.Source
+	}
+	return ""
 }
 
 type TriggerAck struct {
@@ -1432,7 +1440,7 @@ const file_orchigram_plugin_v1alpha1_plugin_proto_rawDesc = "" +
 	"\x06reason\x18\x02 \x01(\tR\x06reason\"F\n" +
 	"\x0eCancelResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12\x18\n" +
-	"\aoutcome\x18\x02 \x01(\tR\aoutcome\"\xb9\x02\n" +
+	"\aoutcome\x18\x02 \x01(\tR\aoutcome\"\xd1\x02\n" +
 	"\n" +
 	"WatchStart\x12)\n" +
 	"\x10installation_uid\x18\x01 \x01(\tR\x0finstallationUid\x12\x16\n" +
@@ -1440,7 +1448,8 @@ const file_orchigram_plugin_v1alpha1_plugin_proto_rawDesc = "" +
 	"\vconfig_json\x18\x03 \x01(\fR\n" +
 	"configJson\x12L\n" +
 	"\asecrets\x18\x04 \x03(\v22.orchigram.plugin.v1alpha1.WatchStart.SecretsEntryR\asecrets\x12=\n" +
-	"\factivated_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\vactivatedAt\x1a:\n" +
+	"\factivated_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\vactivatedAt\x12\x16\n" +
+	"\x06source\x18\x06 \x01(\tR\x06source\x1a:\n" +
 	"\fSecretsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value:\x028\x01\"P\n" +

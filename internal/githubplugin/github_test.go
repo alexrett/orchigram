@@ -3,6 +3,7 @@ package githubplugin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	pluginv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/plugin/v1alpha1"
 	pluginsdk "github.com/alexrett/orchigram/sdk/plugin"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -45,6 +47,10 @@ func TestPollingFixturesCoverPaginationRateLimitAndStableOrder(t *testing.T) {
 	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Header.Get("Authorization") != "Bearer fixture-token" {
 			http.Error(writer, `{"message":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		if request.Header.Get("X-GitHub-Api-Version") != githubAPIVersion {
+			http.Error(writer, `{"message":"wrong API version"}`, http.StatusBadRequest)
 			return
 		}
 		switch request.URL.Path {
@@ -143,29 +149,200 @@ func TestInitialSubscriptionUsesBoundedOverlapForSecondPrecisionAndClockSkew(t *
 
 func TestProviderActivationFailsClosedForOlderHost(t *testing.T) {
 	t.Parallel()
-	if _, err := providerActivation(&pluginv1alpha1.WatchStart{}, false, 0); status.Code(err) != codes.FailedPrecondition {
+	if _, err := providerActivation(&pluginv1alpha1.WatchStart{}, false, false); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("missing activation error=%v", err)
 	}
 	activation := time.Date(2026, 8, 8, 10, 30, 0, 0, time.UTC)
-	actual, err := providerActivation(&pluginv1alpha1.WatchStart{ActivatedAt: timestamppb.New(activation)}, false, 0)
+	actual, err := providerActivation(&pluginv1alpha1.WatchStart{ActivatedAt: timestamppb.New(activation)}, false, false)
 	if err != nil || !actual.Equal(activation) {
 		t.Fatalf("activation=%s err=%v", actual, err)
 	}
 	for name, test := range map[string]struct {
-		replay bool
-		cursor int64
+		replay    bool
+		hasCursor bool
 	}{
 		"explicit replay": {replay: true},
-		"durable cursor":  {cursor: 77},
+		"durable cursor":  {hasCursor: true},
 	} {
 		t.Run(name, func(t *testing.T) {
-			actual, err := providerActivation(&pluginv1alpha1.WatchStart{}, test.replay, test.cursor)
+			actual, err := providerActivation(&pluginv1alpha1.WatchStart{}, test.replay, test.hasCursor)
 			if err != nil || !actual.IsZero() {
 				t.Fatalf("activation=%s err=%v", actual, err)
 			}
 		})
 	}
 }
+
+func TestReviewPollingSelectsManagedPullsAndOrdersStableSubmittedReviews(t *testing.T) {
+	t.Parallel()
+	marker := func(run string) string {
+		return "<!-- orchigram:run=" + run + ";node=create-pr;idempotency=" + strings.Repeat("a", 64) + " -->"
+	}
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/repos/acme/widget/pulls":
+			if request.URL.Query().Get("state") != "all" {
+				t.Errorf("pull state=%q", request.URL.Query().Get("state"))
+			}
+			if request.URL.Query().Get("page") == "2" {
+				_, _ = fmt.Fprintf(writer, `[{"number":8,"html_url":"https://example.invalid/pull/8","body":%q,"head":{"sha":"head-8"}}]`, marker("run-eight"))
+				return
+			}
+			writer.Header().Set("Link", "<"+server.URL+"/repos/acme/widget/pulls?page=2&state=all>; rel=\"next\"")
+			_, _ = fmt.Fprintf(writer, `[
+                  {"number":6,"html_url":"https://example.invalid/pull/6","body":"ordinary pull request","head":{"sha":"head-6"}},
+                  {"number":7,"html_url":"https://example.invalid/pull/7","state":"closed","body":%q,"head":{"sha":"head-7"}},
+                  {"number":9,"html_url":"https://example.invalid/pull/9","body":"<!-- orchigram:run=broken -->","head":{"sha":"head-9"}}
+                ]`, marker("run-seven"))
+		case "/repos/acme/widget/pulls/7/reviews":
+			if request.URL.Query().Get("page") == "2" {
+				_, _ = writer.Write([]byte(`[{"id":22,"state":"CHANGES_REQUESTED","body":"rework","submitted_at":"2026-08-08T11:00:00Z","commit_id":"commit-7","user":{"login":"reviewer"}}]`))
+				return
+			}
+			writer.Header().Set("Link", "<"+server.URL+"/repos/acme/widget/pulls/7/reviews?page=2>; rel=\"next\"")
+			_, _ = writer.Write([]byte(`[
+                  {"id":10,"state":"APPROVED","body":"historical","submitted_at":"2026-08-08T10:00:00Z","commit_id":"old","user":{"login":"reviewer"}},
+                  {"id":23,"state":"COMMENTED","body":"note","submitted_at":"2026-08-08T11:01:00Z","commit_id":"commit-7","user":{"login":"reviewer"}},
+                  {"id":24,"state":"PENDING","body":"draft","submitted_at":null,"commit_id":"commit-7","user":{"login":"reviewer"}}
+                ]`))
+		case "/repos/acme/widget/pulls/8/reviews":
+			_, _ = writer.Write([]byte(`[{"id":21,"state":"APPROVED","body":"ship","submitted_at":"2026-08-08T11:00:00Z","commit_id":"commit-8","user":{"login":"approver"}}]`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	runtime := &Runtime{Client: server.Client()}
+	config := reviewWatchConfig{repositoryConfig: repositoryConfig{Owner: "acme", Repository: "widget", APIBase: server.URL, TokenSecret: "token"}}
+	events, err := runtime.listSubmittedReviews(context.Background(), config, []byte("fixture-token"), reviewCursor{}, time.Date(2026, 8, 8, 10, 30, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].Review.ID != 21 || events[0].RunUID != "run-eight" || events[1].Review.ID != 22 || events[1].RunUID != "run-seven" {
+		t.Fatalf("review events=%+v", events)
+	}
+	resumed, err := runtime.listSubmittedReviews(context.Background(), config, []byte("fixture-token"), events[0].Cursor, time.Time{})
+	if err != nil || len(resumed) != 1 || resumed[0].Review.ID != 22 {
+		t.Fatalf("resumed reviews=%+v err=%v", resumed, err)
+	}
+	completed, err := runtime.listSubmittedReviews(context.Background(), config, []byte("fixture-token"), events[1].Cursor, time.Time{})
+	if err != nil || len(completed) != 0 {
+		t.Fatalf("completed cursor replay=%+v err=%v", completed, err)
+	}
+	encoded, err := encodeReviewCursor(events[1].Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := parseReviewCursor(encoded)
+	if err != nil || decoded.ReviewID != 22 || !decoded.SubmittedAt.Equal(events[1].Cursor.SubmittedAt) {
+		t.Fatalf("decoded cursor=%+v err=%v", decoded, err)
+	}
+}
+
+func TestReviewMarkerAndCursorValidationFailClosed(t *testing.T) {
+	t.Parallel()
+	valid := "prefix <!-- orchigram:run=run-123;node=create-pr;idempotency=" + strings.Repeat("f", 64) + " --> suffix"
+	if runUID, ok := targetRunFromMarker(valid); !ok || runUID != "run-123" {
+		t.Fatalf("marker run=%q ok=%t", runUID, ok)
+	}
+	for _, value := range []string{"", "<!-- orchigram:run=run-123;node=create-pr;idempotency=short -->", "<!-- orchigram:run=<bad>;node=create-pr;idempotency=" + strings.Repeat("f", 64) + " -->"} {
+		if runUID, ok := targetRunFromMarker(value); ok || runUID != "" {
+			t.Fatalf("invalid marker %q resolved run=%q", value, runUID)
+		}
+	}
+	for _, value := range []string{`{}`, `{"submittedAt":"2026-08-08T11:00:00Z","reviewID":0}`, `not-json`} {
+		if _, err := parseReviewCursor(value); err == nil {
+			t.Fatalf("invalid cursor %q was accepted", value)
+		}
+	}
+}
+
+func TestReviewPollingFailsClosedAtPaginationBound(t *testing.T) {
+	t.Parallel()
+	requests := 0
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests++
+		header := http.Header{"Content-Type": []string{"application/json"}, "Link": []string{"<https://api.example.invalid/repos/acme/widget/pulls?page=next>; rel=\"next\""}}
+		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(`[]`)), Request: request}, nil
+	})}
+	runtime := &Runtime{Client: client}
+	config := reviewWatchConfig{repositoryConfig: repositoryConfig{Owner: "acme", Repository: "widget", APIBase: "https://api.example.invalid", TokenSecret: "token"}}
+	_, err := runtime.listSubmittedReviews(context.Background(), config, []byte("fixture-token"), reviewCursor{}, time.Time{})
+	if status.Code(err) != codes.ResourceExhausted || requests != 100 {
+		t.Fatalf("pagination requests=%d error=%v", requests, err)
+	}
+}
+
+func TestReviewWatchEmitsTargetRunAndAcknowledgesStableReview(t *testing.T) {
+	t.Parallel()
+	marker := "<!-- orchigram:run=run-review;node=create-pr;idempotency=" + strings.Repeat("b", 64) + " -->"
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/repos/acme/widget/pulls":
+			_, _ = fmt.Fprintf(writer, `[{"number":12,"html_url":"https://example.invalid/pull/12","body":%q,"head":{"sha":"head-12"}}]`, marker)
+		case "/repos/acme/widget/pulls/12/reviews":
+			_, _ = writer.Write([]byte(`[{"id":301,"state":"CHANGES_REQUESTED","body":"fix it","submitted_at":"2026-08-08T12:00:00Z","commit_id":"commit-12","user":{"login":"reviewer"}}]`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	config, err := json.Marshal(reviewWatchConfig{repositoryConfig: repositoryConfig{Owner: "acme", Repository: "widget", APIBase: server.URL, TokenSecret: "token"}, PollInterval: "1h", ReplayExisting: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	stream := &reviewWatchStream{ctx: ctx, cancel: cancel, start: &pluginv1alpha1.WatchStart{
+		Source: "github.reviews", ConfigJson: config, Secrets: map[string][]byte{"token": []byte("fixture-token")},
+	}}
+	err = (&Runtime{Client: server.Client()}).Watch(stream)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("watch error=%v", err)
+	}
+	if len(stream.events) != 1 {
+		t.Fatalf("events=%+v", stream.events)
+	}
+	event := stream.events[0]
+	if event.GetProviderEventId() != "github:acme/widget:pull-review:301" || event.GetTargetRunUid() != "run-review" || event.GetCursor() == "" || !strings.Contains(string(event.GetPayloadJson()), `"state":"CHANGES_REQUESTED"`) {
+		t.Fatalf("review event=%+v payload=%s", event, event.GetPayloadJson())
+	}
+}
+
+type reviewWatchStream struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	start  *pluginv1alpha1.WatchStart
+	events []*pluginv1alpha1.TriggerEvent
+	recvs  int
+}
+
+func (s *reviewWatchStream) Send(event *pluginv1alpha1.TriggerEvent) error {
+	s.events = append(s.events, event)
+	return nil
+}
+
+func (s *reviewWatchStream) Recv() (*pluginv1alpha1.TriggerCommand, error) {
+	if s.recvs == 0 {
+		s.recvs++
+		return &pluginv1alpha1.TriggerCommand{Value: &pluginv1alpha1.TriggerCommand_Start{Start: s.start}}, nil
+	}
+	if len(s.events) == 0 {
+		return nil, errors.New("acknowledgement requested before an event was sent")
+	}
+	event := s.events[len(s.events)-1]
+	s.cancel()
+	return &pluginv1alpha1.TriggerCommand{Value: &pluginv1alpha1.TriggerCommand_Ack{Ack: &pluginv1alpha1.TriggerAck{ProviderEventId: event.GetProviderEventId(), Cursor: event.GetCursor()}}}, nil
+}
+
+func (*reviewWatchStream) SetHeader(metadata.MD) error  { return nil }
+func (*reviewWatchStream) SendHeader(metadata.MD) error { return nil }
+func (*reviewWatchStream) SetTrailer(metadata.MD)       {}
+func (s *reviewWatchStream) Context() context.Context   { return s.ctx }
+func (*reviewWatchStream) SendMsg(any) error            { return nil }
+func (*reviewWatchStream) RecvMsg(any) error            { return nil }
 
 func TestCommentAndPullRequestReconcileByIdempotencyMarker(t *testing.T) {
 	t.Parallel()

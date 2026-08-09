@@ -6,6 +6,7 @@ spec:
   flow: self-sdlc-issue-to-pr
   provider:
     plugin: github
+    source: github.issues
     config:
       owner: REPLACE_WITH_GITHUB_OWNER
       repository: REPLACE_WITH_REPOSITORY

@@ -109,6 +109,7 @@ type WebhookTrigger struct {
 // ProviderTrigger defines a plugin subscription.
 type ProviderTrigger struct {
 	Plugin string         `json:"plugin" yaml:"plugin"`
+	Source string         `json:"source,omitempty" yaml:"source,omitempty"`
 	Config map[string]any `json:"config,omitempty" yaml:"config,omitempty"`
 }
 
@@ -493,6 +494,9 @@ func validateKind(value any) error {
 		}
 		if v.Spec.Provider != nil && strings.TrimSpace(v.Spec.Provider.Plugin) == "" {
 			return errors.New("trigger provider plugin is required")
+		}
+		if v.Spec.Provider != nil && v.Spec.Provider.Source != strings.TrimSpace(v.Spec.Provider.Source) {
+			return errors.New("trigger provider source must not have surrounding whitespace")
 		}
 		if v.Spec.Delivery != nil {
 			switch v.Spec.Delivery.Mode {

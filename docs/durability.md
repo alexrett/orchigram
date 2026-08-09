@@ -21,6 +21,12 @@ delivery but before outbox completion may redeliver the command; the interpreter
 deduplicates its stable provider event ID before evaluating edges. Signals sent
 before the wait channel is reached are retained by durable workflow history,
 and pending waits resume after daemon restart.
+Multi-source providers persist the selected source in desired Trigger state and
+receive it on every watch start. The GitHub review cursor combines the submitted
+timestamp with the stable review ID, while the receipt identity uses that review
+ID. Pull-request closure between persistence and restart therefore cannot hide
+an unacknowledged event: polling includes marked closed PRs and resumes after
+the last durably acknowledged review tuple.
 
 Each non-core plan node pins the installed plugin name, version, bundle digest,
 negotiated protocol, canonical action schemas, and installed contract digest.

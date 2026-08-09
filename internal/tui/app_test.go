@@ -342,6 +342,26 @@ func TestTUIKeyboardCreatesEditsStartsAndDeletesFlow(t *testing.T) {
 	}
 }
 
+func TestFlowCASRetryRequiresSameUIDAndGeneration(t *testing.T) {
+	t.Parallel()
+	document := func(uid string, generation, version uint64) *controlv1alpha1.ResourceDocument {
+		return &controlv1alpha1.ResourceDocument{
+			Key:        &controlv1alpha1.ResourceKey{Kind: "Flow", Namespace: "default", Name: "demo", Uid: uid},
+			Generation: generation, ResourceVersion: version,
+		}
+	}
+	selected := document("flow-uid", 2, 4)
+	if !sameFlowGeneration(selected, document("flow-uid", 2, 5)) {
+		t.Fatal("status-only revision was not retryable")
+	}
+	if sameFlowGeneration(selected, document("flow-uid", 3, 5)) {
+		t.Fatal("spec generation change was retryable")
+	}
+	if sameFlowGeneration(selected, document("replacement-uid", 2, 5)) {
+		t.Fatal("replacement resource was retryable")
+	}
+}
+
 func TestTUIKeyboardInstallsActivatesRollsBackAndDisablesPlugin(t *testing.T) {
 	root, err := os.MkdirTemp("/tmp", "orchigram-tui-plugins-")
 	if err != nil {

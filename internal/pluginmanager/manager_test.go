@@ -206,15 +206,24 @@ spec: {backend: env, key: ORCHIGRAM_TEST_GITHUB_PROVIDER_TOKEN}
 		"owner": "acme", "repository": "widget", "tokenSecret": "token",
 		"secretRefs": map[string]any{"token": "github-provider-token"},
 	}
-	if diagnostics := manager.ValidateTriggerProvider(context.Background(), resource.DefaultNamespace, "github", providerConfig); len(diagnostics) != 0 {
+	if diagnostics := manager.ValidateTriggerProvider(context.Background(), resource.DefaultNamespace, "github", "github.issues", providerConfig); len(diagnostics) != 0 {
 		t.Fatalf("valid provider diagnostics=%+v", diagnostics)
 	}
+	if diagnostics := manager.ValidateTriggerProvider(context.Background(), resource.DefaultNamespace, "github", "github.reviews", providerConfig); len(diagnostics) != 0 {
+		t.Fatalf("valid review provider diagnostics=%+v", diagnostics)
+	}
+	if diagnostics := manager.ValidateTriggerProvider(context.Background(), resource.DefaultNamespace, "github", "", providerConfig); len(diagnostics) != 1 || diagnostics[0].Path != "source" || diagnostics[0].Code != "required" {
+		t.Fatalf("ambiguous provider diagnostics=%+v", diagnostics)
+	}
+	if diagnostics := manager.ValidateTriggerProvider(context.Background(), resource.DefaultNamespace, "github", "github.unknown", providerConfig); len(diagnostics) != 1 || diagnostics[0].Path != "source" || diagnostics[0].Code != "source_not_found" {
+		t.Fatalf("unknown provider diagnostics=%+v", diagnostics)
+	}
 	invalidProviderConfig := map[string]any{"repository": "widget", "tokenSecret": "token", "secretRefs": map[string]any{"token": "github-provider-token"}}
-	if diagnostics := manager.ValidateTriggerProvider(context.Background(), resource.DefaultNamespace, "github", invalidProviderConfig); len(diagnostics) != 1 || diagnostics[0].Code != "required" {
+	if diagnostics := manager.ValidateTriggerProvider(context.Background(), resource.DefaultNamespace, "github", "github.issues", invalidProviderConfig); len(diagnostics) != 1 || diagnostics[0].Code != "required" {
 		t.Fatalf("invalid provider diagnostics=%+v", diagnostics)
 	}
 	missingSecretConfig := map[string]any{"owner": "acme", "repository": "widget", "tokenSecret": "token", "secretRefs": map[string]any{"token": "missing-token"}}
-	if diagnostics := manager.ValidateTriggerProvider(context.Background(), resource.DefaultNamespace, "github", missingSecretConfig); len(diagnostics) != 1 || diagnostics[0].Code != "reference_not_found" {
+	if diagnostics := manager.ValidateTriggerProvider(context.Background(), resource.DefaultNamespace, "github", "github.issues", missingSecretConfig); len(diagnostics) != 1 || diagnostics[0].Code != "reference_not_found" {
 		t.Fatalf("missing provider SecretRef diagnostics=%+v", diagnostics)
 	}
 	var providerServer *httptest.Server
@@ -244,6 +253,11 @@ spec: {backend: env, key: ORCHIGRAM_TEST_GITHUB_PROVIDER_TOKEN}
 			providerComments = append(providerComments, created)
 			writer.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(writer).Encode(created)
+		case "/repos/acme/widget/pulls":
+			marker := "<!-- orchigram:run=run-review;node=create-pr;idempotency=" + strings.Repeat("c", 64) + " -->"
+			_, _ = fmt.Fprintf(writer, `[{"number":12,"html_url":"https://example.invalid/pull/12","body":%q,"head":{"sha":"head-review"}}]`, marker)
+		case "/repos/acme/widget/pulls/12/reviews":
+			_, _ = writer.Write([]byte(`[{"id":301,"state":"CHANGES_REQUESTED","body":"rework","submitted_at":"2026-08-08T11:00:00Z","commit_id":"reviewed-commit","user":{"login":"reviewer"}}]`))
 		default:
 			http.NotFound(writer, request)
 		}
@@ -254,7 +268,7 @@ spec: {backend: env, key: ORCHIGRAM_TEST_GITHUB_PROVIDER_TOKEN}
 	providerDone := make(chan error, 1)
 	providerActivation := time.Date(2026, 8, 8, 10, 0, 30, 0, time.UTC)
 	go func() {
-		providerDone <- manager.WatchTrigger(providerContext, "github", "trigger-fixture", resource.DefaultNamespace, map[string]any{
+		providerDone <- manager.WatchTrigger(providerContext, "github", "github.issues", "trigger-fixture", resource.DefaultNamespace, map[string]any{
 			"owner": "acme", "repository": "widget", "apiBase": providerServer.URL, "label": "orchigram:ready", "pollInterval": "1h", "tokenSecret": "token",
 			"secretRefs": map[string]any{"token": "github-provider-token"},
 		}, "", providerActivation, func(event *pluginv1alpha1.TriggerEvent) error {
@@ -276,6 +290,33 @@ spec: {backend: env, key: ORCHIGRAM_TEST_GITHUB_PROVIDER_TOKEN}
 	case <-providerDone:
 	case <-time.After(5 * time.Second):
 		t.Fatal("GitHub provider stream did not stop")
+	}
+	reviewContext, stopReviews := context.WithCancel(context.Background())
+	reviewAccepted := make(chan *pluginv1alpha1.TriggerEvent, 1)
+	reviewDone := make(chan error, 1)
+	go func() {
+		reviewDone <- manager.WatchTrigger(reviewContext, "github", "github.reviews", "review-trigger-fixture", resource.DefaultNamespace, map[string]any{
+			"owner": "acme", "repository": "widget", "apiBase": providerServer.URL, "pollInterval": "1h", "replayExisting": true, "tokenSecret": "token",
+			"secretRefs": map[string]any{"token": "github-provider-token"},
+		}, "", time.Time{}, func(event *pluginv1alpha1.TriggerEvent) error {
+			reviewAccepted <- event
+			return nil
+		})
+	}()
+	select {
+	case event := <-reviewAccepted:
+		if event.GetProviderEventId() != "github:acme/widget:pull-review:301" || event.GetTargetRunUid() != "run-review" || !strings.Contains(string(event.GetPayloadJson()), `"state":"CHANGES_REQUESTED"`) {
+			t.Fatalf("review provider event=%+v payload=%s", event, event.GetPayloadJson())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("GitHub review provider did not emit fixture event")
+	}
+	time.Sleep(100 * time.Millisecond)
+	stopReviews()
+	select {
+	case <-reviewDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("GitHub review provider stream did not stop")
 	}
 	githubCommentNode := flow.PlanNode{ID: "publish", Namespace: resource.DefaultNamespace, Uses: "github.issue.comment", Timeout: "10s", With: map[string]any{
 		"owner": "acme", "repository": "widget", "apiBase": providerServer.URL, "tokenSecret": "token", "number": 42, "body": "Reconciled plan",
@@ -344,17 +385,40 @@ spec: {backend: env, key: ORCHIGRAM_TEST_GITHUB_PROVIDER_TOKEN}
 func TestProviderEventContractRejectsMalformedPayloadBeforeAcceptance(t *testing.T) {
 	t.Parallel()
 	catalog, ok := firstparty.Find("github")
-	if !ok || len(catalog.Triggers) != 1 {
+	if !ok || len(catalog.Triggers) != 2 {
 		t.Fatalf("GitHub trigger contract=%+v found=%t", catalog.Triggers, ok)
 	}
+	var issues pluginsdk.TriggerDescriptor
+	for _, descriptor := range catalog.Triggers {
+		if descriptor.Source == "github.issues" {
+			issues = descriptor
+		}
+	}
+	if issues.Source == "" {
+		t.Fatal("GitHub issue trigger descriptor is missing")
+	}
 	invalid := []byte(`{"repository":{"owner":"acme","name":"widget"},"issue":{"number":"not-an-integer"}}`)
-	validation := validateTriggerContractJSON(catalog.Triggers[0].EventSchema, "event", invalid)
+	validation := validateTriggerContractJSON(issues.EventSchema, "event", invalid)
 	if validation == nil || validation.code != "required" && validation.code != "type_mismatch" || !strings.HasPrefix(validation.path, "event.issue") {
 		t.Fatalf("invalid event validation=%+v", validation)
 	}
 	valid := []byte(`{"repository":{"owner":"acme","name":"widget"},"issue":{"number":42,"title":"title","body":"body","html_url":"https://example.invalid/42","state":"open"}}`)
-	if validation := validateTriggerContractJSON(catalog.Triggers[0].EventSchema, "event", valid); validation != nil {
+	if validation := validateTriggerContractJSON(issues.EventSchema, "event", valid); validation != nil {
 		t.Fatalf("valid event validation=%+v", validation)
+	}
+	contractJSON, err := json.Marshal(pluginsdk.Contract{Triggers: catalog.Triggers})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := store.PluginRecord{Name: "github", ContractJSON: contractJSON}
+	if _, err := triggerDescriptor(record, ""); err == nil || !strings.Contains(err.Error(), "source is required") {
+		t.Fatalf("ambiguous provider source error=%v", err)
+	}
+	if selected, err := triggerDescriptor(record, "github.reviews"); err != nil || selected.Source != "github.reviews" {
+		t.Fatalf("selected provider=%+v err=%v", selected, err)
+	}
+	if _, err := triggerDescriptor(record, "github.unknown"); err == nil || !strings.Contains(err.Error(), "not published") {
+		t.Fatalf("unknown provider source error=%v", err)
 	}
 }
 

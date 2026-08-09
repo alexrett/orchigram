@@ -100,17 +100,36 @@ func githubActionDescriptors() []pluginsdk.ActionDescriptor {
 }
 
 func githubTriggerDescriptors() []pluginsdk.TriggerDescriptor {
-	return []pluginsdk.TriggerDescriptor{{
-		Source: "github.issues",
-		ConfigSchema: objectSchema(map[string]any{
-			"owner": nonEmptyStringSchema(), "repository": nonEmptyStringSchema(), "apiBase": stringSchema(),
-			"tokenSecret": nonEmptyStringSchema(), "label": stringSchema(), "pollInterval": stringSchema(), "replayExisting": boolSchema(),
-		}, []string{"owner", "repository", "tokenSecret"}, false),
-		EventSchema: objectSchema(map[string]any{
-			"repository": objectSchemaValue(map[string]any{"owner": stringSchema(), "name": stringSchema()}, []string{"owner", "name"}, false),
-			"issue":      issueSchema(),
-		}, []string{"repository", "issue"}, false),
-	}}
+	repository := objectSchemaValue(map[string]any{"owner": stringSchema(), "name": stringSchema()}, []string{"owner", "name"}, false)
+	providerConfig := map[string]any{
+		"owner": nonEmptyStringSchema(), "repository": nonEmptyStringSchema(), "apiBase": stringSchema(),
+		"tokenSecret": nonEmptyStringSchema(), "pollInterval": stringSchema(), "replayExisting": boolSchema(),
+	}
+	return []pluginsdk.TriggerDescriptor{
+		{
+			Source: "github.issues",
+			ConfigSchema: objectSchema(func() map[string]any {
+				properties := copyProperties(providerConfig)
+				properties["label"] = stringSchema()
+				return properties
+			}(), []string{"owner", "repository", "tokenSecret"}, false),
+			EventSchema: objectSchema(map[string]any{"repository": repository, "issue": issueSchema()}, []string{"repository", "issue"}, false),
+		},
+		{
+			Source:       "github.reviews",
+			ConfigSchema: objectSchema(copyProperties(providerConfig), []string{"owner", "repository", "tokenSecret"}, false),
+			EventSchema: objectSchema(map[string]any{
+				"repository": repository,
+				"pull": objectSchemaValue(map[string]any{
+					"number": positiveIntegerSchema(), "html_url": stringSchema(), "head_sha": nonEmptyStringSchema(),
+				}, []string{"number", "html_url", "head_sha"}, false),
+				"review": objectSchemaValue(map[string]any{
+					"id": positiveIntegerSchema(), "state": nonEmptyStringSchema(), "body": stringSchema(), "author": nonEmptyStringSchema(),
+					"submitted_at": nonEmptyStringSchema(), "commit_id": nonEmptyStringSchema(),
+				}, []string{"id", "state", "body", "author", "submitted_at", "commit_id"}, false),
+			}, []string{"repository", "pull", "review"}, false),
+		},
+	}
 }
 
 func issueSchema() map[string]any {

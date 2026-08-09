@@ -8,6 +8,7 @@ spec:
   flow: github-issue-to-pr
   provider:
     plugin: github
+    source: github.issues
     config:
       owner: alexrett
       repository: orchigram-e2e

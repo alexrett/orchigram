@@ -61,6 +61,7 @@ message WatchStart {
   bytes config_json = 3;
   map<string, bytes> secrets = 4;
   google.protobuf.Timestamp activated_at = 5;
+  string source = 6;
 }
 message TriggerAck { string provider_event_id = 1; string cursor = 2; }
 message TriggerCommand { oneof value { WatchStart start = 1; TriggerAck ack = 2; } }
