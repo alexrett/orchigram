@@ -385,7 +385,7 @@ spec: {backend: env, key: ORCHIGRAM_TEST_GITHUB_PROVIDER_TOKEN}
 	}
 }
 
-func TestReconcileContractsAdoptsActiveLegacyInstallation(t *testing.T) {
+func TestLaunchAdoptsActiveLegacyInstallation(t *testing.T) {
 	t.Parallel()
 	statePath := filepath.Join(t.TempDir(), "state.sqlite")
 	state, err := store.Open(statePath)
@@ -417,7 +417,10 @@ func TestReconcileContractsAdoptsActiveLegacyInstallation(t *testing.T) {
 	if err != nil || len(legacy) != 1 || len(legacy[0].ContractJSON) != 0 {
 		t.Fatalf("legacy list=%+v err=%v", legacy, err)
 	}
-	if err := manager.ReconcileContracts(context.Background()); err != nil {
+	if err := manager.Disable(context.Background(), record.Name); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Enable(context.Background(), record.Name, record.Version); err != nil {
 		t.Fatal(err)
 	}
 	adopted, err := state.Plugin(context.Background(), record.Name, record.Version)

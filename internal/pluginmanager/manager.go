@@ -175,25 +175,6 @@ func (m *Manager) ReconcileArtifacts(ctx context.Context) error {
 	})
 }
 
-// ReconcileContracts adopts active installations created before immutable
-// action contracts were persisted. Inactive legacy versions are upgraded lazily
-// if a pinned Run or operator rollback uses them later.
-func (m *Manager) ReconcileContracts(ctx context.Context) error {
-	records, err := m.store.ListPlugins(ctx)
-	if err != nil {
-		return err
-	}
-	for _, record := range records {
-		if !record.Active || (len(record.ContractJSON) > 0 && record.ContractDigest != "") {
-			continue
-		}
-		if _, err := m.ensureContract(ctx, record); err != nil {
-			return fmt.Errorf("adopt active plugin contract %s@%s: %w", record.Name, record.Version, err)
-		}
-	}
-	return nil
-}
-
 // Install validates an archive, executes protocol negotiation, then records it.
 func (m *Manager) Install(ctx context.Context, bundle []byte) (store.PluginRecord, error) {
 	m.installMu.Lock()
@@ -1325,10 +1306,17 @@ func (m *Manager) processForRecord(ctx context.Context, record store.PluginRecor
 }
 
 func (m *Manager) launch(ctx context.Context, record store.PluginRecord) (*pluginhost.Process, error) {
-	var err error
-	record, err = m.ensureContract(ctx, record)
-	if err != nil {
-		return nil, err
+	legacyContract := len(record.ContractJSON) == 0 && record.ContractDigest == ""
+	if !legacyContract && (len(record.ContractJSON) == 0 || record.ContractDigest == "") {
+		return nil, errors.New("installed plugin action contract metadata is incomplete")
+	}
+	if legacyContract {
+		// Pre-contract installations remain executable for already pinned Runs.
+		// Adopt a complete descriptor when possible; otherwise new Flow compilation
+		// still rejects the empty contract until the installer activates a new bundle.
+		if adopted, err := m.ensureContract(ctx, record); err == nil {
+			record, legacyContract = adopted, false
+		}
 	}
 	var manifest pluginbundle.Manifest
 	if err := json.Unmarshal(record.ManifestJSON, &manifest); err != nil {
@@ -1346,6 +1334,13 @@ func (m *Manager) launch(ctx context.Context, record store.PluginRecord) (*plugi
 	if description.GetName() != record.Name || description.GetVersion() != record.Version {
 		process.Close()
 		return nil, errors.New("running plugin identity does not match installation")
+	}
+	if !sameCapabilities(description.GetCapabilities(), manifest.Capabilities) {
+		process.Close()
+		return nil, errors.New("running plugin capabilities do not match installation")
+	}
+	if legacyContract {
+		return process, nil
 	}
 	_, contractDigest, err := pluginsdk.ValidateDescription(description)
 	if err != nil {
