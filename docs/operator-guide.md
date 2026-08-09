@@ -70,10 +70,12 @@ Run `orchigram` to open the English-only interface. The core bindings are:
 
 - `:` command palette, `/` resource filter, and `?` help;
 - `Enter` drill-down and `Esc` back;
-- arrows or `h/j/k/l` to select graph nodes;
+- arrows or `h/j/k/l` to move through graph nodes, `Tab`/`Shift-Tab` to traverse nodes and edges, and `H/J/K/L` to pan;
 - `g` graph, `e` structured events, `t` attempts, `f` artifacts, and `l` logs;
 - `y` read-only YAML and `d` describe;
-- `E` edit the schema-derived projection;
+- `n` create from a strict YAML template, `E` edit the schema-derived projection, and `x` CAS-delete;
+- `S` start the selected Flow with JSON input and an optional idempotency key;
+- `i` upload and install a plugin bundle; plugin detail activates, disables, diagnoses, or rolls back immutable versions;
 - `a` approve, `r` reject, and `c` cancel the selected run;
 - `q` quit.
 
@@ -83,9 +85,19 @@ expose only backend and reference key/path; status shows `Configured` or
 `Missing`, never the value.
 
 The graph view is shared by Flow definitions, live run status, and historical
-event replay. Mouse click selects a node, double-click opens it, and the wheel
-pans the viewport. Every operation required for approval and inspection also
-has a keyboard path.
+event replay. On a Flow definition, `Enter` opens the selected node or edge as
+an editable projection. Scalar plugin configuration comes from the action's
+pinned JSON Schema; nested configuration uses a strict JSON-object fallback.
+The daemon compiles and validates the resulting Flow before a resourceVersion
+CAS apply, so a stale form or invalid CEL/reference cannot partially mutate the
+resource. Mouse click selects a node or edge, double-click opens it, and the
+wheel pans the viewport. Every operation has a keyboard path at 80x24 and
+larger.
+
+Selecting another Context asks for confirmation, closes the current gRPC/SSH
+transport, persists only the local context choice, and reconnects the stateless
+TUI through the same public API. No server resource is changed by a context
+switch.
 
 The resource tree is a live projection, not a startup snapshot. The TUI loads
 one revision-bound all-resource snapshot and resumes one durable global watch

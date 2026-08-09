@@ -2,9 +2,13 @@ package tui
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -12,9 +16,15 @@ import (
 	controlv1alpha1 "github.com/alexrett/orchigram/gen/orchigram/control/v1alpha1"
 	clientpkg "github.com/alexrett/orchigram/internal/client"
 	"github.com/alexrett/orchigram/internal/config"
+	"github.com/alexrett/orchigram/internal/contextcfg"
 	"github.com/alexrett/orchigram/internal/daemon"
+	"github.com/alexrett/orchigram/internal/firstparty"
+	"github.com/alexrett/orchigram/internal/pluginbundle"
+	"github.com/alexrett/orchigram/internal/resource"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -89,7 +99,376 @@ spec: {nodes: [{id: changed-live, uses: core.noop}]}
 	if _, err := client.Resources.Delete(context.Background(), &controlv1alpha1.DeleteRequest{Key: updated.GetResource().GetKey(), ExpectedResourceVersion: updated.GetResource().GetResourceVersion()}); err != nil {
 		t.Fatal(err)
 	}
-	waitForScreenText(t, application, screen, "live-visible", false)
+	waitForScreenText(t, application, screen, "resources=0", true)
+
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyRune, 'q', tcell.ModNone))
+	stopTUI()
+	select {
+	case runErr := <-runResult:
+		if runErr != nil {
+			t.Fatal(runErr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("TUI did not stop")
+	}
+}
+
+func TestTUIRequestsContextSwitchThroughKeyboard(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "orchigram-tui-context-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	cfg := config.Development(filepath.Join(root, "state"))
+	daemonContext, stopDaemon := context.WithCancel(context.Background())
+	instance, err := daemon.Open(daemonContext, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := make(chan error, 1)
+	go func() { served <- instance.Serve(daemonContext) }()
+	defer func() {
+		stopDaemon()
+		select {
+		case serveErr := <-served:
+			if serveErr != nil {
+				t.Errorf("serve daemon: %v", serveErr)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("daemon did not stop")
+		}
+	}()
+	client, err := clientpkg.DialUnix(context.Background(), cfg.SocketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Close() }()
+	waitForTUIHealth(t, client)
+
+	screen := tcell.NewSimulationScreen("UTF-8")
+	if err := screen.Init(); err != nil {
+		t.Fatal(err)
+	}
+	screen.SetSize(80, 24)
+	application := tview.NewApplication().SetScreen(screen).EnableMouse(true)
+	contexts := contextcfg.File{Current: "alpha", Contexts: map[string]contextcfg.Context{"alpha": {Socket: cfg.SocketPath}, "beta": {Socket: cfg.SocketPath}}}
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- runWithApplicationContext(context.Background(), client, application, "alpha", &contexts)
+	}()
+	waitForScreenText(t, application, screen, "alpha  [connected]", true)
+	for range 2 {
+		postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyDown, 0, tcell.ModNone))
+	}
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForScreenText(t, application, screen, "Switch from alpha to beta?", true)
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	select {
+	case runErr := <-runResult:
+		var request *ContextSwitchError
+		if !errors.As(runErr, &request) || request.Name != "beta" {
+			t.Fatalf("context switch error=%v", runErr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("TUI did not return a context switch request")
+	}
+}
+
+func TestTUIKeyboardCreatesEditsStartsAndDeletesFlow(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "orchigram-tui-mutations-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	cfg := config.Development(filepath.Join(root, "state"))
+	daemonContext, stopDaemon := context.WithCancel(context.Background())
+	instance, err := daemon.Open(daemonContext, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := make(chan error, 1)
+	go func() { served <- instance.Serve(daemonContext) }()
+	defer func() {
+		stopDaemon()
+		select {
+		case serveErr := <-served:
+			if serveErr != nil {
+				t.Errorf("serve daemon: %v", serveErr)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("daemon did not stop")
+		}
+	}()
+	client, err := clientpkg.DialUnix(context.Background(), cfg.SocketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Close() }()
+	waitForTUIHealth(t, client)
+
+	screen := tcell.NewSimulationScreen("UTF-8")
+	if err := screen.Init(); err != nil {
+		t.Fatal(err)
+	}
+	screen.SetSize(80, 24)
+	application := tview.NewApplication().SetScreen(screen).EnableMouse(true)
+	tuiContext, stopTUI := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() { runResult <- runWithApplication(tuiContext, client, application) }()
+	waitForScreenText(t, application, screen, "Contexts", true)
+
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyRune, 'n', tcell.ModNone))
+	waitForScreenText(t, application, screen, "Create resource", true)
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyDown, 0, tcell.ModNone))
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForScreenText(t, application, screen, "New Flow (strict YAML)", true)
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyCtrlS, 0, tcell.ModNone))
+	waitForScreenText(t, application, screen, "Created Flow/new-flow", true)
+	waitForScreenText(t, application, screen, "resources=1", true)
+
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyRune, '/', tcell.ModNone))
+	waitForScreenText(t, application, screen, "Resource filter", true)
+	postTUIText(t, screen, "new-flow")
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForScreenText(t, application, screen, "Resource filter", false)
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForScreenText(t, application, screen, "Opened Flow/new-flow", true)
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForScreenText(t, application, screen, "Edit node start", true)
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
+	postTUIText(t, screen, "Edited start")
+	for range 7 {
+		postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
+	}
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForScreenText(t, application, screen, "Edited start", true)
+
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForScreenText(t, application, screen, "Edit edge start -> finish", true)
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
+	postTUIText(t, screen, "true")
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForScreenText(t, application, screen, "Applied Flow generation 3", true)
+
+	current, err := client.Resources.Get(context.Background(), &controlv1alpha1.GetRequest{Key: &controlv1alpha1.ResourceKey{Kind: "Flow", Namespace: "default", Name: "new-flow"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, err := resource.DecodeFlow(current.GetJson())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if definition.Spec.Nodes[0].Name != "Edited start" || len(definition.Spec.Edges) != 1 || definition.Spec.Edges[0].When != "true" {
+		t.Fatalf("edited Flow=%+v", definition.Spec)
+	}
+
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForScreenText(t, application, screen, "Edit node start", true)
+	externalDefinition := definition
+	externalDefinition.Status = nil
+	externalDefinition.Spec.Nodes[0].Name = "Externally updated"
+	externalJSON, err := json.Marshal(externalDefinition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	external, err := client.Resources.Apply(context.Background(), &controlv1alpha1.ApplyRequest{Document: externalJSON, ExpectedResourceVersion: current.GetResourceVersion()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 8 {
+		postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
+	}
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForScreenText(t, application, screen, "CAS conflict", true)
+	preserved, err := client.Resources.Get(context.Background(), &controlv1alpha1.GetRequest{Key: external.GetResource().GetKey()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	preservedDefinition, err := resource.DecodeFlow(preserved.GetJson())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preserved.GetResourceVersion() != external.GetResource().GetResourceVersion() || preservedDefinition.Spec.Nodes[0].Name != "Externally updated" {
+		t.Fatalf("stale edit changed server state: resource=%+v Flow=%+v", preserved, preservedDefinition.Spec)
+	}
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEsc, 0, tcell.ModNone))
+	waitForScreenText(t, application, screen, "Externally upda", true)
+
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForScreenText(t, application, screen, "Edit node start", true)
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyCtrlU, 0, tcell.ModNone))
+	postTUIText(t, screen, "INVALID")
+	for range 8 {
+		postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
+	}
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForScreenText(t, application, screen, "must match", true)
+	afterInvalid, err := client.Resources.Get(context.Background(), &controlv1alpha1.GetRequest{Key: external.GetResource().GetKey()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterInvalid.GetResourceVersion() != external.GetResource().GetResourceVersion() {
+		t.Fatalf("invalid edit advanced resource version from %d to %d", external.GetResource().GetResourceVersion(), afterInvalid.GetResourceVersion())
+	}
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEsc, 0, tcell.ModNone))
+
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyRune, 'S', tcell.ModNone))
+	waitForScreenText(t, application, screen, "Start Flow/new-flow", true)
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForScreenText(t, application, screen, "Accepted run", true)
+
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyRune, 'x', tcell.ModNone))
+	waitForScreenText(t, application, screen, "Delete Flow/new-flow?", true)
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForScreenText(t, application, screen, "Deleted Flow/new-flow", true)
+	if _, err := client.Resources.Get(context.Background(), &controlv1alpha1.GetRequest{Key: &controlv1alpha1.ResourceKey{Kind: "Flow", Namespace: "default", Name: "new-flow"}}); status.Code(err) != codes.NotFound {
+		t.Fatalf("deleted Flow get error=%v", err)
+	}
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyRune, 'q', tcell.ModNone))
+	stopTUI()
+	select {
+	case runErr := <-runResult:
+		if runErr != nil {
+			t.Fatal(runErr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("TUI did not stop")
+	}
+}
+
+func TestTUIKeyboardInstallsActivatesRollsBackAndDisablesPlugin(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "orchigram-tui-plugins-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	cfg := config.Development(filepath.Join(root, "state"))
+	daemonContext, stopDaemon := context.WithCancel(context.Background())
+	instance, err := daemon.Open(daemonContext, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := make(chan error, 1)
+	go func() { served <- instance.Serve(daemonContext) }()
+	defer func() {
+		stopDaemon()
+		select {
+		case serveErr := <-served:
+			if serveErr != nil {
+				t.Errorf("serve daemon: %v", serveErr)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("daemon did not stop")
+		}
+	}()
+	client, err := clientpkg.DialUnix(context.Background(), cfg.SocketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Close() }()
+	waitForTUIHealth(t, client)
+
+	bundleDirectory := filepath.Join(root, "bundles")
+	if err := os.MkdirAll(bundleDirectory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	versions := []string{"0.1.0", "0.2.0"}
+	paths := make(map[string]string, len(versions))
+	for _, version := range versions {
+		path := filepath.Join(bundleDirectory, "exec-"+version+".tar.gz")
+		if err := os.WriteFile(path, tuiPluginBundle(t, version), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		paths[version] = path
+	}
+
+	screen := tcell.NewSimulationScreen("UTF-8")
+	if err := screen.Init(); err != nil {
+		t.Fatal(err)
+	}
+	screen.SetSize(120, 40)
+	application := tview.NewApplication().SetScreen(screen).EnableMouse(true)
+	tuiContext, stopTUI := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() { runResult <- runWithApplication(tuiContext, client, application) }()
+	waitForScreenText(t, application, screen, "Contexts", true)
+
+	for _, version := range versions {
+		postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyRune, 'i', tcell.ModNone))
+		waitForScreenText(t, application, screen, "Install plugin bundle", true)
+		postTUIText(t, screen, paths[version])
+		postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
+		postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+		waitForScreenText(t, application, screen, "Installed exec:"+version, true)
+	}
+	waitForScreenText(t, application, screen, "exec:0.2.0 [instal", true)
+
+	openFilteredTUIEntry(t, application, screen, "exec:0.2.0", "Plugin exec")
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForScreenText(t, application, screen, "Plugin operation completed", true)
+	waitForScreenText(t, application, screen, "exec:0.2.0 [activ", true)
+	pluginFlow := []byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: plugin-flow}
+spec:
+  nodes:
+    - id: execute
+      uses: exec.run
+      with: {argv: [/usr/bin/true]}
+`)
+	pluginFlowResponse, err := client.Resources.Apply(context.Background(), &controlv1alpha1.ApplyRequest{Document: pluginFlow})
+	if err != nil || len(pluginFlowResponse.GetDiagnostics()) != 0 {
+		t.Fatalf("apply plugin Flow: response=%+v err=%v", pluginFlowResponse, err)
+	}
+	compiledPluginFlow, err := compileFlowPlan(context.Background(), client, pluginFlowResponse.GetResource())
+	if err != nil || len(compiledPluginFlow.Nodes) != 1 || compiledPluginFlow.Nodes[0].Contract == nil || len(compiledPluginFlow.Nodes[0].Contract.ConfigSchema) == 0 {
+		t.Fatalf("compiled plugin Flow did not pin its action schema: plan=%+v err=%v", compiledPluginFlow, err)
+	}
+	waitForScreenText(t, application, screen, "resources=3", true)
+	openFilteredTUIEntry(t, application, screen, "plugin-flow", "Opened Flow/plugin-flow")
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	for range 7 {
+		postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
+	}
+	waitForScreenText(t, application, screen, "Config JSON", true)
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEsc, 0, tcell.ModNone))
+
+	openFilteredTUIEntry(t, application, screen, "exec:0.2.0", "Plugin exec")
+	for range 3 {
+		postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
+	}
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForScreenText(t, application, screen, "Activate previous exec version", true)
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForScreenText(t, application, screen, "Activated exec:0.1.0", true)
+
+	openFilteredTUIEntry(t, application, screen, "exec:0.1.0", "Plugin exec")
+	for range 2 {
+		postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
+	}
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForScreenText(t, application, screen, "Plugin operation completed", true)
+	waitForScreenText(t, application, screen, "exec:0.1.0 [instal", true)
+
+	plugins, err := client.Plugins.List(context.Background(), &emptypb.Empty{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plugins.GetPlugins()) != 2 {
+		t.Fatalf("plugins=%+v", plugins.GetPlugins())
+	}
+	for _, plugin := range plugins.GetPlugins() {
+		if plugin.GetState() != "installed" {
+			t.Fatalf("plugin remained active: %+v", plugin)
+		}
+	}
 
 	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyRune, 'q', tcell.ModNone))
 	stopTUI()
@@ -201,6 +580,104 @@ spec:
 	}
 }
 
+func TestTUIRejectsAndCancelsRunsKeyboardOnlyAt80x24(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "orchigram-tui-decisions-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	cfg := config.Development(filepath.Join(root, "state"))
+	daemonContext, stopDaemon := context.WithCancel(context.Background())
+	instance, err := daemon.Open(daemonContext, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := make(chan error, 1)
+	go func() { served <- instance.Serve(daemonContext) }()
+	defer func() {
+		stopDaemon()
+		select {
+		case serveErr := <-served:
+			if serveErr != nil {
+				t.Errorf("serve daemon: %v", serveErr)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("daemon did not stop")
+		}
+	}()
+	client, err := clientpkg.DialUnix(context.Background(), cfg.SocketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Close() }()
+	waitForTUIHealth(t, client)
+	flowDocument := []byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: tui-decisions}
+spec:
+  nodes:
+    - {id: prepare, uses: core.noop}
+    - {id: approval, uses: core.approval, timeout: 1h}
+    - {id: finish, uses: core.noop}
+  edges:
+    - {from: prepare, to: approval}
+    - {from: approval, to: finish, when: result.approved}
+`)
+	response, err := client.Resources.Apply(context.Background(), &controlv1alpha1.ApplyRequest{Document: flowDocument})
+	if err != nil || len(response.GetDiagnostics()) != 0 {
+		t.Fatalf("apply Flow: response=%+v err=%v", response, err)
+	}
+	start := func(key string) *controlv1alpha1.RunRef {
+		run, startErr := client.Runs.Start(context.Background(), &controlv1alpha1.StartRunRequest{Flow: "tui-decisions", InputJson: []byte(`{}`), IdempotencyKey: key})
+		if startErr != nil {
+			t.Fatal(startErr)
+		}
+		waitForTUIRunEvent(t, client, run.GetUid(), "approval.waiting")
+		return run
+	}
+	rejected := start("tui-reject")
+
+	screen := tcell.NewSimulationScreen("UTF-8")
+	if err := screen.Init(); err != nil {
+		t.Fatal(err)
+	}
+	screen.SetSize(80, 24)
+	application := tview.NewApplication().SetScreen(screen).EnableMouse(true)
+	tuiContext, stopTUI := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() { runResult <- runWithApplication(tuiContext, client, application) }()
+	waitForScreenText(t, application, screen, short(rejected.GetUid()), true)
+
+	openFilteredTUIEntry(t, application, screen, short(rejected.GetUid()), short(rejected.GetUid()))
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyRune, 'r', tcell.ModNone))
+	waitForScreenText(t, application, screen, "Reject run", true)
+	for range 2 {
+		postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
+	}
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForTUIRunEvent(t, client, rejected.GetUid(), "run.rejected")
+
+	cancelled := start("tui-cancel")
+	waitForScreenText(t, application, screen, "runs=2", true)
+	openFilteredTUIEntry(t, application, screen, short(cancelled.GetUid()), short(cancelled.GetUid()))
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyRune, 'c', tcell.ModNone))
+	waitForScreenText(t, application, screen, "Cancel run", true)
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForTUIRunEvent(t, client, cancelled.GetUid(), "run.cancelled")
+
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyRune, 'q', tcell.ModNone))
+	stopTUI()
+	select {
+	case runErr := <-runResult:
+		if runErr != nil {
+			t.Fatal(runErr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("TUI did not stop")
+	}
+}
+
 func TestRunInspectorEscapesDynamicColorMarkup(t *testing.T) {
 	t.Parallel()
 	text := runInspectorText(&controlv1alpha1.RunSummary{Uid: "[red]", Flow: "[red]", Phase: "[red]", PlanHash: "[red]", InterpreterVersion: "[red]"})
@@ -222,6 +699,56 @@ func postTUIEvent(t *testing.T, screen tcell.SimulationScreen, event tcell.Event
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+func postTUIText(t *testing.T, screen tcell.SimulationScreen, value string) {
+	t.Helper()
+	for _, character := range value {
+		postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyRune, character, tcell.ModNone))
+	}
+}
+
+func openFilteredTUIEntry(t *testing.T, application *tview.Application, screen tcell.SimulationScreen, filter, detail string) {
+	t.Helper()
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyRune, '/', tcell.ModNone))
+	waitForScreenText(t, application, screen, "Resource filter", true)
+	postTUIText(t, screen, filter)
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForScreenText(t, application, screen, "Resource filter", false)
+	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForScreenText(t, application, screen, detail, true)
+}
+
+func tuiPluginBundle(t *testing.T, version string) []byte {
+	t.Helper()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary, err := os.ReadFile(executable) //nolint:gosec // The test intentionally bundles its own TestMain plugin mode.
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, ok := firstparty.Find("exec")
+	if !ok {
+		t.Fatal("exec first-party plugin is missing")
+	}
+	digest := sha256.Sum256(binary)
+	manifest := pluginbundle.Manifest{
+		APIVersion:   pluginbundle.APIVersion,
+		Name:         "exec",
+		Version:      version,
+		Protocol:     pluginbundle.ProtocolRange{Minimum: 1, Maximum: 1},
+		Capabilities: catalog.Capabilities,
+		Platforms: []pluginbundle.Platform{{
+			OS: runtime.GOOS, Arch: runtime.GOARCH, Path: "bin/plugin", SHA256: hex.EncodeToString(digest[:]),
+		}},
+	}
+	bundle, err := pluginbundle.Build(manifest, map[string][]byte{"bin/plugin": binary})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bundle
 }
 
 func waitForScreenText(t *testing.T, application *tview.Application, screen tcell.SimulationScreen, expected string, present bool) {

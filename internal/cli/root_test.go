@@ -12,10 +12,15 @@ import (
 	"testing"
 	"time"
 
+	clientpkg "github.com/alexrett/orchigram/internal/client"
 	"github.com/alexrett/orchigram/internal/config"
+	"github.com/alexrett/orchigram/internal/contextcfg"
+	"github.com/alexrett/orchigram/internal/contexttransport"
 	"github.com/alexrett/orchigram/internal/daemon"
+	"github.com/alexrett/orchigram/internal/tui"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 func TestOperatorCLIThroughRealUnixSocket(t *testing.T) {
@@ -159,6 +164,66 @@ spec:
 	}
 	if _, stderr, err = executeCLI(ctx, cfg.SocketPath, "", "system", "health"); err != nil {
 		t.Fatalf("system health: %v stderr=%s", err, stderr)
+	}
+}
+
+func TestTUIContextLoopClosesPreviousClientAndPersistsSwitch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	testRoot, err := os.MkdirTemp("/tmp", "orchigram-context-loop-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(testRoot) })
+	cfg := config.Development(filepath.Join(testRoot, "state"))
+	server, err := daemon.Open(ctx, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case serveErr := <-served:
+			if serveErr != nil && !errors.Is(serveErr, context.Canceled) {
+				t.Errorf("serve daemon: %v", serveErr)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("daemon did not stop")
+		}
+	})
+	waitForCLIHealth(t, cfg.SocketPath)
+
+	contextsPath := filepath.Join(testRoot, "contexts.yaml")
+	contexts := contextcfg.File{Current: "alpha", Contexts: map[string]contextcfg.Context{
+		"alpha": {Socket: cfg.SocketPath},
+		"beta":  {Socket: cfg.SocketPath},
+	}}
+	clients := make([]*clientpkg.Client, 0, 2)
+	run := func(_ context.Context, client *clientpkg.Client, name string, _ contextcfg.File) error {
+		clients = append(clients, client)
+		if name == "alpha" {
+			return &tui.ContextSwitchError{Name: "beta"}
+		}
+		return nil
+	}
+	if err := runTUIContextLoop(ctx, contextsPath, contexts, "alpha", contexttransport.Connect, run); err != nil {
+		t.Fatal(err)
+	}
+	if len(clients) != 2 {
+		t.Fatalf("TUI runs=%d want=2", len(clients))
+	}
+	for index, client := range clients {
+		if _, err := client.System.Info(context.Background(), &emptypb.Empty{}); err == nil {
+			t.Fatalf("client %d remained usable after its TUI run", index)
+		}
+	}
+	saved, err := contextcfg.Load(contextsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Current != "beta" {
+		t.Fatalf("saved current context=%q want=beta", saved.Current)
 	}
 }
 
