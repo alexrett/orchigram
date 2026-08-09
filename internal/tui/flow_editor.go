@@ -14,6 +14,8 @@ import (
 	"github.com/alexrett/orchigram/internal/flow"
 	"github.com/alexrett/orchigram/internal/resource"
 	"github.com/rivo/tview"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type actionConfigField struct {
@@ -228,7 +230,27 @@ func applyFlowDefinition(ctx context.Context, client *clientpkg.Client, document
 		notifications.SetText("[red]" + escape(diagnostic.GetPath()+": "+diagnostic.GetMessage()))
 		return false
 	}
-	applied, err := client.Resources.Apply(operationContext, request)
+	var applied *controlv1alpha1.ApplyResponse
+	for attempt := 0; attempt < 3; attempt++ {
+		applied, err = client.Resources.Apply(operationContext, request)
+		if err == nil || status.Code(err) != codes.Aborted {
+			break
+		}
+		current, getErr := client.Resources.Get(operationContext, &controlv1alpha1.GetRequest{Key: cloneMessage(document.GetKey())})
+		if getErr != nil || !sameFlowGeneration(document, current) {
+			break
+		}
+		currentDefinition, decodeErr := resource.DecodeFlow(current.GetJson())
+		if decodeErr != nil {
+			break
+		}
+		definition.Metadata = currentDefinition.Metadata
+		encoded, err = json.Marshal(definition)
+		if err != nil {
+			break
+		}
+		request = &controlv1alpha1.ApplyRequest{Document: encoded, ExpectedResourceVersion: current.GetResourceVersion()}
+	}
 	if err != nil {
 		notifications.SetText("[red]CAS conflict or validation failure: " + escape(err.Error()))
 		return false
@@ -240,6 +262,11 @@ func applyFlowDefinition(ctx context.Context, client *clientpkg.Client, document
 	*document = *cloneMessage(applied.GetResource())
 	notifications.SetText(fmt.Sprintf("[green]Applied Flow generation %d[-]", document.GetGeneration()))
 	return true
+}
+
+func sameFlowGeneration(selected, current *controlv1alpha1.ResourceDocument) bool {
+	return selected != nil && current != nil && selected.GetKey() != nil && current.GetKey() != nil &&
+		selected.GetKey().GetUid() == current.GetKey().GetUid() && selected.GetGeneration() == current.GetGeneration()
 }
 
 func actionConfigFields(node flow.PlanNode) ([]actionConfigField, bool) {
