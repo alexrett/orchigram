@@ -212,6 +212,7 @@ func compileFlowPlan(ctx context.Context, client *clientpkg.Client, document *co
 }
 
 func applyFlowDefinition(ctx context.Context, client *clientpkg.Client, document *controlv1alpha1.ResourceDocument, definition resource.Flow, notifications *tview.TextView) bool {
+	selected := cloneMessage(document)
 	definition.Status = nil
 	encoded, err := json.Marshal(definition)
 	if err != nil {
@@ -231,13 +232,14 @@ func applyFlowDefinition(ctx context.Context, client *clientpkg.Client, document
 		return false
 	}
 	var applied *controlv1alpha1.ApplyResponse
-	for attempt := 0; attempt < 3; attempt++ {
+	const maxStatusRevisionRetries = 8
+	for attempt := 0; attempt < maxStatusRevisionRetries; attempt++ {
 		applied, err = client.Resources.Apply(operationContext, request)
 		if err == nil || status.Code(err) != codes.Aborted {
 			break
 		}
 		current, getErr := client.Resources.Get(operationContext, &controlv1alpha1.GetRequest{Key: cloneMessage(document.GetKey())})
-		if getErr != nil || !sameFlowGeneration(document, current) {
+		if getErr != nil || !sameFlowGeneration(selected, current) {
 			break
 		}
 		currentDefinition, decodeErr := resource.DecodeFlow(current.GetJson())
@@ -250,6 +252,12 @@ func applyFlowDefinition(ctx context.Context, client *clientpkg.Client, document
 			break
 		}
 		request = &controlv1alpha1.ApplyRequest{Document: encoded, ExpectedResourceVersion: current.GetResourceVersion()}
+		if attempt+1 < maxStatusRevisionRetries {
+			if !waitForFlowCASRetry(operationContext, min(time.Duration(1<<attempt)*time.Millisecond, 25*time.Millisecond)) {
+				err = operationContext.Err()
+				break
+			}
+		}
 	}
 	if err != nil {
 		notifications.SetText("[red]CAS conflict or validation failure: " + escape(err.Error()))
@@ -262,6 +270,17 @@ func applyFlowDefinition(ctx context.Context, client *clientpkg.Client, document
 	*document = *cloneMessage(applied.GetResource())
 	notifications.SetText(fmt.Sprintf("[green]Applied Flow generation %d[-]", document.GetGeneration()))
 	return true
+}
+
+func waitForFlowCASRetry(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func sameFlowGeneration(selected, current *controlv1alpha1.ResourceDocument) bool {
