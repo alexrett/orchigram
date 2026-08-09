@@ -605,6 +605,57 @@ spec:
 	if cursor != "11" {
 		t.Fatalf("malformed signal advanced cursor to %q", cursor)
 	}
+	if _, err := state.AcceptProviderSignal(ctx, trigger.Metadata.UID, trigger.Metadata.Generation+1, "review-event-stale", "review-loop", "default", startReceipt.RunUID, "review", payload, "stale"); err == nil {
+		t.Fatal("stale Trigger generation accepted a signal")
+	} else {
+		var stale *StaleTriggerGenerationError
+		if !errors.As(err, &stale) {
+			t.Fatalf("stale Trigger signal error=%T %v", err, err)
+		}
+	}
+	if err := state.SetTriggerEnabled(ctx, trigger.Metadata.UID, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.AcceptProviderSignal(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, "review-event-disabled", "review-loop", "default", startReceipt.RunUID, "review", payload, "disabled"); !errors.Is(err, ErrTriggerDisabled) {
+		t.Fatalf("disabled Trigger signal error=%v", err)
+	}
+	if err := state.SetTriggerEnabled(ctx, trigger.Metadata.UID, true); err != nil {
+		t.Fatal(err)
+	}
+	otherDocument, err := resource.DecodeStrict([]byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: other-flow}
+spec:
+  nodes: [{id: review, uses: core.event}]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherFlow, err := state.Apply(ctx, otherDocument, ApplyOptions{RequestID: "other-signal-flow"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPlan := plan
+	otherPlan.FlowUID = otherFlow.Metadata.UID
+	otherPlan.FlowGeneration = otherFlow.Metadata.Generation
+	otherPlan.PlanHash = "other-signal-plan"
+	otherReceipt, err := state.AcceptTriggerWithPlan(ctx, "manual", 0, "other-signal-run", "other-flow", "default", json.RawMessage(`{}`), true, otherPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherStart, err := state.ClaimStart(ctx, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.EnsureRun(ctx, otherStart.Payload, otherPlan); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.CompleteOutbox(ctx, otherStart.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.AcceptProviderSignal(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, "review-event-wrong-flow", "review-loop", "default", otherReceipt.RunUID, "review", payload, "wrong-flow"); err == nil || !strings.Contains(err.Error(), "different Flow") {
+		t.Fatalf("wrong Flow signal error=%v", err)
+	}
 	if err := state.AppendRunEvent(ctx, startReceipt.RunUID, "review", "run.completed", "succeeded", 1, json.RawMessage(`{}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -613,7 +664,7 @@ spec:
 	}
 	cursor, _, _ = state.ProviderCursor(ctx, trigger.Metadata.UID)
 	if cursor != "11" {
-		t.Fatalf("terminal run signal advanced cursor to %q", cursor)
+		t.Fatalf("rejected signal advanced cursor to %q", cursor)
 	}
 }
 
