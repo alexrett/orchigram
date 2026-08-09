@@ -96,6 +96,9 @@ func TestRunRetentionKeepsOccurrenceDeduplicationTombstone(t *testing.T) {
 	if err := s.AppendRunEvent(ctx, receipt.RunUID, "", "run.succeeded", "succeeded", 0, nil); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO trigger_receipts(uid,trigger_uid,occurrence_id,payload_json,deduplicated,run_uid,accepted_at) VALUES(?,?,?,?,?,?,?)`, "signal-receipt", "reviews", "review-1", []byte(`{"review":true}`), 1, receipt.RunUID, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.CollectRetainedRuns(ctx, []string{receipt.RunUID}); err != nil {
 		t.Fatal(err)
 	}
@@ -108,6 +111,14 @@ func TestRunRetentionKeepsOccurrenceDeduplicationTombstone(t *testing.T) {
 	}
 	if _, err := s.ClaimStart(ctx, 0); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("retained occurrence created a second start: %v", err)
+	}
+	signal, err := s.ReceiptByOccurrence(ctx, "reviews", "review-1")
+	if err != nil || signal.UID != "signal-receipt" || signal.RunUID != receipt.RunUID {
+		t.Fatalf("signal receipt tombstone=%+v err=%v", signal, err)
+	}
+	var fullReceipts int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM trigger_receipts WHERE run_uid=?`, receipt.RunUID).Scan(&fullReceipts); err != nil || fullReceipts != 0 {
+		t.Fatalf("full receipts=%d err=%v", fullReceipts, err)
 	}
 }
 

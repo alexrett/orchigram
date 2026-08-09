@@ -149,20 +149,20 @@ func (s *Store) CollectRetainedRuns(ctx context.Context, runUIDs []string) error
 				return err
 			}
 		}
-		var receiptUID, planHash string
-		if err := tx.QueryRowContext(ctx, `SELECT trigger_receipt_uid,plan_hash FROM runs WHERE uid=?`, runUID).Scan(&receiptUID, &planHash); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM runs WHERE uid=?`, runUID); err != nil {
+		var planHash string
+		if err := tx.QueryRowContext(ctx, `SELECT plan_hash FROM runs WHERE uid=?`, runUID).Scan(&planHash); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT OR IGNORE INTO occurrence_tombstones(trigger_uid,occurrence_id,receipt_uid,run_uid,deduplicated,accepted_at,collected_at)
 			SELECT trigger_uid,occurrence_id,uid,run_uid,deduplicated,accepted_at,?
-			FROM trigger_receipts WHERE uid=?`, s.timestamp(), receiptUID); err != nil {
+			FROM trigger_receipts WHERE run_uid=?`, s.timestamp(), runUID); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM trigger_receipts WHERE uid=? AND NOT EXISTS (SELECT 1 FROM runs WHERE trigger_receipt_uid=?)`, receiptUID, receiptUID); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM runs WHERE uid=?`, runUID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM trigger_receipts WHERE run_uid=?`, runUID); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM compiled_plans WHERE plan_hash=? AND NOT EXISTS (SELECT 1 FROM runs WHERE plan_hash=?)`, planHash, planHash); err != nil {
