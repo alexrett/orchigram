@@ -175,6 +175,25 @@ func (m *Manager) ReconcileArtifacts(ctx context.Context) error {
 	})
 }
 
+// ReconcileContracts adopts active installations created before immutable
+// action contracts were persisted. Inactive legacy versions are upgraded lazily
+// if a pinned Run or operator rollback uses them later.
+func (m *Manager) ReconcileContracts(ctx context.Context) error {
+	records, err := m.store.ListPlugins(ctx)
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		if !record.Active || (len(record.ContractJSON) > 0 && record.ContractDigest != "") {
+			continue
+		}
+		if _, err := m.ensureContract(ctx, record); err != nil {
+			return fmt.Errorf("adopt active plugin contract %s@%s: %w", record.Name, record.Version, err)
+		}
+	}
+	return nil
+}
+
 // Install validates an archive, executes protocol negotiation, then records it.
 func (m *Manager) Install(ctx context.Context, bundle []byte) (store.PluginRecord, error) {
 	m.installMu.Lock()
@@ -1306,6 +1325,11 @@ func (m *Manager) processForRecord(ctx context.Context, record store.PluginRecor
 }
 
 func (m *Manager) launch(ctx context.Context, record store.PluginRecord) (*pluginhost.Process, error) {
+	var err error
+	record, err = m.ensureContract(ctx, record)
+	if err != nil {
+		return nil, err
+	}
 	var manifest pluginbundle.Manifest
 	if err := json.Unmarshal(record.ManifestJSON, &manifest); err != nil {
 		return nil, err
@@ -1333,6 +1357,48 @@ func (m *Manager) launch(ctx context.Context, record store.PluginRecord) (*plugi
 		return nil, errors.New("running plugin action contract does not match the immutable installation")
 	}
 	return process, nil
+}
+
+func (m *Manager) ensureContract(ctx context.Context, record store.PluginRecord) (store.PluginRecord, error) {
+	if len(record.ContractJSON) > 0 && record.ContractDigest != "" {
+		return record, nil
+	}
+	if len(record.ContractJSON) > 0 || record.ContractDigest != "" {
+		return store.PluginRecord{}, errors.New("installed plugin action contract metadata is incomplete")
+	}
+	var manifest pluginbundle.Manifest
+	if err := json.Unmarshal(record.ManifestJSON, &manifest); err != nil {
+		return store.PluginRecord{}, err
+	}
+	platform, err := manifest.CurrentPlatform()
+	if err != nil {
+		return store.PluginRecord{}, err
+	}
+	executable := filepath.Join(m.root, record.Name, record.Version, "plugin")
+	process, description, err := pluginhost.Launch(ctx, executable, platform.SHA256)
+	if err != nil {
+		return store.PluginRecord{}, err
+	}
+	process.Close()
+	if description.GetName() != record.Name || description.GetVersion() != record.Version {
+		return store.PluginRecord{}, errors.New("running plugin identity does not match installation")
+	}
+	if !sameCapabilities(description.GetCapabilities(), manifest.Capabilities) {
+		return store.PluginRecord{}, errors.New("running plugin capabilities do not match installation")
+	}
+	contract, digest, err := pluginsdk.ValidateDescription(description)
+	if err != nil {
+		return store.PluginRecord{}, fmt.Errorf("validate running plugin action contract: %w", err)
+	}
+	contractJSON, err := json.Marshal(contract)
+	if err != nil {
+		return store.PluginRecord{}, err
+	}
+	record.ContractJSON, record.ContractDigest = contractJSON, digest
+	if err := m.store.PutPlugin(ctx, record); err != nil {
+		return store.PluginRecord{}, err
+	}
+	return m.store.Plugin(ctx, record.Name, record.Version)
 }
 
 func (m *Manager) resolveNodeSecretsInNamespace(ctx context.Context, namespace string, config map[string]any, bindingSets ...[]flow.ResourceBinding) (map[string][]byte, error) {

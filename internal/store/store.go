@@ -2005,10 +2005,10 @@ func (s *Store) DisablePlugin(ctx context.Context, name string) error {
 
 // Plugin returns one installed version, or the active version when version is empty.
 func (s *Store) Plugin(ctx context.Context, name, version string) (PluginRecord, error) {
-	query := `SELECT p.name,p.version,p.digest,p.manifest_json,p.contract_json,p.contract_digest,p.state,p.installed_at,CASE WHEN a.version=p.version THEN 1 ELSE 0 END FROM plugin_installations p LEFT JOIN plugin_activations a ON a.name=p.name WHERE p.name=? AND p.version=?`
+	query := `SELECT p.name,p.version,p.digest,p.manifest_json,COALESCE(p.contract_json,X''),p.contract_digest,p.state,p.installed_at,CASE WHEN a.version=p.version THEN 1 ELSE 0 END FROM plugin_installations p LEFT JOIN plugin_activations a ON a.name=p.name WHERE p.name=? AND p.version=?`
 	arguments := []any{name, version}
 	if version == "" {
-		query = `SELECT p.name,p.version,p.digest,p.manifest_json,p.contract_json,p.contract_digest,p.state,p.installed_at,1 FROM plugin_activations a JOIN plugin_installations p ON p.name=a.name AND p.version=a.version WHERE p.name=?`
+		query = `SELECT p.name,p.version,p.digest,p.manifest_json,COALESCE(p.contract_json,X''),p.contract_digest,p.state,p.installed_at,1 FROM plugin_activations a JOIN plugin_installations p ON p.name=a.name AND p.version=a.version WHERE p.name=?`
 		arguments = []any{name}
 	}
 	var record PluginRecord
@@ -2027,7 +2027,7 @@ func (s *Store) Plugin(ctx context.Context, name, version string) (PluginRecord,
 
 // ListPlugins returns immutable versions in stable name/version order.
 func (s *Store) ListPlugins(ctx context.Context) ([]PluginRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT p.name,p.version,p.digest,p.manifest_json,p.contract_json,p.contract_digest,p.state,p.installed_at,CASE WHEN a.version=p.version THEN 1 ELSE 0 END FROM plugin_installations p LEFT JOIN plugin_activations a ON a.name=p.name ORDER BY p.name,p.version`)
+	rows, err := s.db.QueryContext(ctx, `SELECT p.name,p.version,p.digest,p.manifest_json,COALESCE(p.contract_json,X''),p.contract_digest,p.state,p.installed_at,CASE WHEN a.version=p.version THEN 1 ELSE 0 END FROM plugin_installations p LEFT JOIN plugin_activations a ON a.name=p.name ORDER BY p.name,p.version`)
 	if err != nil {
 		return nil, err
 	}

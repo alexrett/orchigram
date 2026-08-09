@@ -72,6 +72,10 @@ func Open(ctx context.Context, cfg config.Config, executor engine.TaskExecutor) 
 		_ = state.Close()
 		return nil, fmt.Errorf("reconcile plugin artifacts: %w", err)
 	}
+	if err := plugins.ReconcileContracts(ctx); err != nil {
+		_ = state.Close()
+		return nil, fmt.Errorf("reconcile plugin contracts: %w", err)
+	}
 	if executor == nil {
 		executor = plugins
 	}
