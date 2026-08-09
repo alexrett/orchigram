@@ -2,10 +2,10 @@
 
 Status: active recovery milestone
 Current milestone: v0.1.0 First Real Release
-Current phase: 11 of 12
-Progress: 3/5 release phases
+Current phase: 12 of 12
+Progress: 4/5 release phases
 Last activity: 2026-08-09
-Current focus: bound single-node execution, retention, recovery, and upgrades
+Current focus: release proof, tracer documentation, and publication artifacts
 
 ## Reality check
 
@@ -71,9 +71,14 @@ changes-requested reviews drove same-Run rework; a later exact-head approval
 resumed the provider signal Flow, verified the configured GitHub check, posted
 an idempotent merge-ready comment, and ended in a human-controlled merge.
 
-Phase 11 is complete only when small-host concurrency and process bounds,
-retention/GC, backup recovery, staged upgrade rollback, doctor diagnostics, and
-the hardened installer pass both automated failure gates and the demo host.
+Phase 11 is complete. Automated and real-host gates cover scheduler/activity/
+agent limits, systemd CPU/memory/task bounds, explainable retention with durable
+occurrence tombstones, causal backup/restore, secret-safe doctor diagnostics,
+and a non-root UDS-only service. A live approval survived a successful upgrade;
+a second live approval survived an intentionally broken bundled-plugin upgrade
+and automatic core/config/state/plugin rollback. The same host then passed
+aggregate health, doctor, security exposure `1.3 OK`, and a local-client SSH
+StreamLocal exec/approval tracer without publishing host coordinates.
 
 ## Blockers
 

@@ -37,19 +37,19 @@ The existing code is a prototype baseline. A checked requirement below means its
 
 ## Phase 11 — Bounded single-node operations
 
-- [ ] OPR-01: Configurable global and per-run concurrency, agent-process, memory, and CPU bounds prevent one workload from exhausting the daemon host.
-- [ ] OPR-02: Retention and garbage collection cover runs, events, receipts, artifacts, workspaces, backups, and inactive plugin versions with dry-run diagnostics and safe defaults.
-- [ ] OPR-03: Backup establishes a documented consistent barrier across resource and workflow state, and restore reconciles accepted triggers and active runs.
-- [ ] OPR-04: Core and bundled-plugin upgrade is staged and health-checked with automatic rollback on partial failure; active approvals and retry timers survive.
-- [ ] OPR-05: Installer and doctor verify system git, configured agent CLI compatibility, authentication state, writable storage, UDS access, and plugin health without printing secrets.
-- [ ] OPR-06: CI actions are commit-pinned, release history scanning is mandatory, and the hardened service remains non-root with no default TCP listener.
+- [x] OPR-01: Configurable global and per-run concurrency, agent-process, memory, and CPU bounds prevent one workload from exhausting the daemon host.
+- [x] OPR-02: Retention and garbage collection cover runs, events, receipts, artifacts, workspaces, backups, and inactive plugin versions with dry-run diagnostics and safe defaults.
+- [x] OPR-03: Backup establishes a documented consistent barrier across resource and workflow state, and restore reconciles accepted triggers and active runs.
+- [x] OPR-04: Core and bundled-plugin upgrade is staged and health-checked with automatic rollback on partial failure; active approvals and retry timers survive.
+- [x] OPR-05: Installer and doctor verify system git, configured agent CLI compatibility, authentication state, writable storage, UDS access, and plugin health without printing secrets.
+- [x] OPR-06: CI actions are commit-pinned, release history scanning is mandatory, and the hardened service remains non-root with no default TCP listener.
 
 ## Phase 12 — Release proof and publication
 
 - [ ] REL-01: `make check`, race, lint, Buf lint/breaking, secret/history scan, dependency licenses, SPDX SBOM, and reproducibility checks run in the release workflow.
 - [ ] REL-02: Signed checksums, provenance/attestations, core archives, and independent first-party plugin bundles are produced for supported macOS/Linux amd64/arm64 targets.
 - [ ] REL-03: A local native schedule-to-Slack-compatible webhook tracer passes with fake-receiver CI coverage and an explicitly authorized real delivery.
-- [ ] REL-04: The demo server passes clean install, SSH TUI reconnect, restart/crash recovery, resource limits, backup/restore, and upgrade/rollback without publishing its address or credentials.
+- [x] REL-04: The demo server passes clean install, SSH TUI reconnect, restart/crash recovery, resource limits, backup/restore, and upgrade/rollback without publishing its address or credentials.
 - [ ] REL-05: English documentation reproduces the notification and full GitHub review tracers; only then is v0.1.0 tagged and the release published.
 
 ## Deferred beyond v0.1.0
