@@ -160,16 +160,18 @@ type reviewComment struct {
 	Line         *int   `json:"line"`
 	OriginalLine *int   `json:"original_line"`
 	Side         string `json:"side"`
+	SubjectType  string `json:"subject_type"`
 	HTMLURL      string `json:"html_url"`
 }
 
 type reviewCommentPayload struct {
-	ID      int64  `json:"id"`
-	Body    string `json:"body"`
-	Path    string `json:"path"`
-	Line    int    `json:"line"`
-	Side    string `json:"side"`
-	HTMLURL string `json:"html_url"`
+	ID          int64  `json:"id"`
+	Body        string `json:"body"`
+	Path        string `json:"path"`
+	Line        *int   `json:"line"`
+	Side        string `json:"side"`
+	SubjectType string `json:"subject_type"`
+	HTMLURL     string `json:"html_url"`
 }
 
 type reviewCursor struct {
@@ -569,13 +571,24 @@ func (r *Runtime) listReviewComments(ctx context.Context, config reviewWatchConf
 			if comment.ID <= 0 || strings.TrimSpace(comment.Path) == "" {
 				return nil, status.Errorf(codes.FailedPrecondition, "GitHub review comment for review %d is missing required identity fields", reviewID)
 			}
-			line := 0
-			if comment.Line != nil {
-				line = *comment.Line
-			} else if comment.OriginalLine != nil {
-				line = *comment.OriginalLine
+			line := comment.Line
+			if line == nil && comment.OriginalLine != nil {
+				line = comment.OriginalLine
 			}
-			result = append(result, reviewCommentPayload{ID: comment.ID, Body: comment.Body, Path: comment.Path, Line: line, Side: comment.Side, HTMLURL: comment.HTMLURL})
+			subjectType := strings.ToLower(comment.SubjectType)
+			if subjectType == "" {
+				subjectType = "line"
+				if line == nil {
+					subjectType = "file"
+				}
+			}
+			if subjectType != "line" && subjectType != "file" {
+				return nil, status.Errorf(codes.FailedPrecondition, "GitHub review comment %d has unsupported subject_type %q", comment.ID, comment.SubjectType)
+			}
+			if subjectType == "line" && line == nil {
+				return nil, status.Errorf(codes.FailedPrecondition, "GitHub line review comment %d has no line location", comment.ID)
+			}
+			result = append(result, reviewCommentPayload{ID: comment.ID, Body: comment.Body, Path: comment.Path, Line: line, Side: comment.Side, SubjectType: subjectType, HTMLURL: comment.HTMLURL})
 		}
 	}
 	if next != "" {

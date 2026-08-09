@@ -213,7 +213,10 @@ func TestReviewPollingSelectsManagedPullsAndOrdersStableSubmittedReviews(t *test
 			_, _ = writer.Write([]byte(`[]`))
 		case "/repos/acme/widget/pulls/7/reviews/22/comments":
 			if request.URL.Query().Get("page") == "2" {
-				_, _ = writer.Write([]byte(`[{"id":502,"body":"keep this deterministic","path":"internal/run.go","line":null,"original_line":18,"side":"RIGHT","html_url":"https://example.invalid/comment/502"}]`))
+				_, _ = writer.Write([]byte(`[
+                  {"id":502,"body":"keep this deterministic","path":"internal/run.go","line":null,"original_line":18,"side":"RIGHT","subject_type":"line","html_url":"https://example.invalid/comment/502"},
+                  {"id":503,"body":"document this file","path":"internal/run.go","line":null,"original_line":null,"side":"","subject_type":"file","html_url":"https://example.invalid/comment/503"}
+                ]`))
 				return
 			}
 			writer.Header().Set("Link", "<"+server.URL+"/repos/acme/widget/pulls/7/reviews/22/comments?page=2>; rel=\"next\"")
@@ -232,8 +235,12 @@ func TestReviewPollingSelectsManagedPullsAndOrdersStableSubmittedReviews(t *test
 	if len(events) != 2 || events[0].Review.ID != 21 || events[0].RunUID != "run-eight" || events[1].Review.ID != 22 || events[1].RunUID != "run-seven" {
 		t.Fatalf("review events=%+v", events)
 	}
-	if len(events[1].Comments) != 2 || events[1].Comments[0].ID != 501 || events[1].Comments[1].Line != 18 {
+	if len(events[1].Comments) != 3 || events[1].Comments[0].ID != 501 || events[1].Comments[1].Line == nil || *events[1].Comments[1].Line != 18 || events[1].Comments[2].Line != nil || events[1].Comments[2].SubjectType != "file" {
 		t.Fatalf("review comments=%+v", events[1].Comments)
+	}
+	encodedComments, err := json.Marshal(events[1].Comments)
+	if err != nil || !strings.Contains(string(encodedComments), `"line":null`) || !strings.Contains(string(encodedComments), `"subject_type":"file"`) {
+		t.Fatalf("encoded comments=%s err=%v", encodedComments, err)
 	}
 	resumed, err := runtime.listSubmittedReviews(context.Background(), config, []byte("fixture-token"), events[0].Cursor, time.Time{})
 	if err != nil || len(resumed) != 1 || resumed[0].Review.ID != 22 {

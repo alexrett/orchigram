@@ -146,9 +146,9 @@ func githubTriggerDescriptors() []pluginsdk.TriggerDescriptor {
 					"id": positiveIntegerSchema(), "state": nonEmptyStringSchema(), "body": stringSchema(), "author": nonEmptyStringSchema(),
 					"submitted_at": nonEmptyStringSchema(), "commit_id": nonEmptyStringSchema(),
 					"comments": map[string]any{"type": "array", "items": objectSchemaValue(map[string]any{
-						"id": positiveIntegerSchema(), "body": stringSchema(), "path": nonEmptyStringSchema(), "line": integerSchema(),
-						"side": stringSchema(), "html_url": stringSchema(),
-					}, []string{"id", "body", "path", "line", "side", "html_url"}, false)},
+						"id": positiveIntegerSchema(), "body": stringSchema(), "path": nonEmptyStringSchema(), "line": map[string]any{"type": []string{"integer", "null"}},
+						"side": stringSchema(), "subject_type": nonEmptyStringSchema(), "html_url": stringSchema(),
+					}, []string{"id", "body", "path", "line", "side", "subject_type", "html_url"}, false)},
 				}, []string{"id", "state", "body", "author", "submitted_at", "commit_id", "comments"}, false),
 			}, []string{"repository", "pull", "review"}, false),
 		},

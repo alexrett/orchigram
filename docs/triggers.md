@@ -88,6 +88,8 @@ the strict hidden marker written by `github.pr.ensure` and emits only submitted
 `CHANGES_REQUESTED` and `APPROVED` reviews. Its cursor is ordered by GitHub's
 submission timestamp and stable review ID; the review ID also becomes the
 provider occurrence identity. Top-level review text and paginated inline review
-comments are included in the typed payload. Pending reviews, standalone
+comments are included in the typed payload. Comment locations preserve GitHub's
+`line` versus `file` subject type; file-level comments carry a JSON `null` line
+instead of an invented position. Pending reviews, standalone
 `COMMENTED` reviews, unsupported states, and unmarked PRs never enter the
 signal path.
