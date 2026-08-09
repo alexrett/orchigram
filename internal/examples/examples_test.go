@@ -49,8 +49,13 @@ func TestShippedResourcesAreStrictAndFlowsCompile(t *testing.T) {
 					t.Fatal(decodeFlowErr)
 				}
 				_, diagnostics := flow.NewCompiler(nil).Compile(flowResource)
-				if len(diagnostics) != 0 {
+				if flow.HasErrors(diagnostics) {
 					t.Fatalf("compile diagnostics: %+v", diagnostics)
+				}
+				for _, diagnostic := range diagnostics {
+					if diagnostic.Code != "dynamic_cel" {
+						t.Fatalf("unexpected compile warning: %+v", diagnostic)
+					}
 				}
 			}
 		})

@@ -77,7 +77,7 @@ commit together before acknowledgement. Missing, terminal, wrong-Flow, or
 wrong-node targets fail without advancing the cursor.
 
 `core.event` exposes the accepted JSON object as its result, so CEL edges can
-route states such as `result.review.state == "changes_requested"`. It can live
+route states such as `result.review.state == "CHANGES_REQUESTED"`. It can live
 inside a compiler-bounded cycle. Signal dispatch is at-least-once: the durable
 interpreter remembers stable provider event IDs and records `event.duplicate`
 without advancing another loop iteration after a crash-window redelivery.
@@ -87,5 +87,9 @@ including closed PRs needed for restart replay. It extracts the Run UID from
 the strict hidden marker written by `github.pr.ensure` and emits only submitted
 `CHANGES_REQUESTED` and `APPROVED` reviews. Its cursor is ordered by GitHub's
 submission timestamp and stable review ID; the review ID also becomes the
-provider occurrence identity. Pending reviews, comments, unsupported states,
-and unmarked PRs never enter the signal path.
+provider occurrence identity. Top-level review text and paginated inline review
+comments are included in the typed payload. Comment locations preserve GitHub's
+`line` versus `file` subject type; file-level comments carry a JSON `null` line
+instead of an invented position. Pending reviews, standalone
+`COMMENTED` reviews, unsupported states, and unmarked PRs never enter the
+signal path.

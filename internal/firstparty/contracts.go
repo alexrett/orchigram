@@ -65,6 +65,17 @@ func githubActionDescriptors() []pluginsdk.ActionDescriptor {
 	for _, field := range []string{"head", "base", "title", "body"} {
 		pullConfig[field] = stringSchema()
 	}
+	checksConfig := copyProperties(repository)
+	checksConfig["ref"] = nonEmptyStringSchema()
+	checksConfig["pullNumber"] = positiveIntegerSchema()
+	checksConfig["required"] = map[string]any{"type": "array", "items": nonEmptyStringSchema(), "minItems": 1, "uniqueItems": true}
+	checksConfig["pollInterval"] = stringSchema()
+	checkSummary := objectSchemaValue(map[string]any{
+		"name": nonEmptyStringSchema(), "status": nonEmptyStringSchema(), "conclusion": stringSchema(), "url": stringSchema(),
+	}, []string{"name", "status", "conclusion", "url"}, false)
+	statusSummary := objectSchemaValue(map[string]any{
+		"context": nonEmptyStringSchema(), "state": nonEmptyStringSchema(), "description": stringSchema(), "url": stringSchema(),
+	}, []string{"context", "state", "description", "url"}, false)
 	return []pluginsdk.ActionDescriptor{
 		{
 			Action: "github.issue.get", ConfigSchema: objectSchema(issueConfig, []string{"owner", "repository", "tokenSecret", "number"}, false),
@@ -96,6 +107,14 @@ func githubActionDescriptors() []pluginsdk.ActionDescriptor {
 			Action: "github.pr.ensure", ConfigSchema: objectSchema(pullConfig, []string{"owner", "repository", "tokenSecret", "head", "base", "title"}, false),
 			InputSchema: objectSchema(nil, nil, true), OutputSchema: mutationOutputSchema(true),
 		},
+		{
+			Action: "github.commit.checks.wait", ConfigSchema: objectSchema(checksConfig, []string{"owner", "repository", "tokenSecret", "ref", "pullNumber", "required"}, false),
+			InputSchema: objectSchema(nil, nil, true), OutputSchema: objectSchema(map[string]any{
+				"headSha": nonEmptyStringSchema(), "state": nonEmptyStringSchema(),
+				"checks":   map[string]any{"type": "array", "items": checkSummary},
+				"statuses": map[string]any{"type": "array", "items": statusSummary},
+			}, []string{"headSha", "state", "checks", "statuses"}, false),
+		},
 	}
 }
 
@@ -126,7 +145,11 @@ func githubTriggerDescriptors() []pluginsdk.TriggerDescriptor {
 				"review": objectSchemaValue(map[string]any{
 					"id": positiveIntegerSchema(), "state": nonEmptyStringSchema(), "body": stringSchema(), "author": nonEmptyStringSchema(),
 					"submitted_at": nonEmptyStringSchema(), "commit_id": nonEmptyStringSchema(),
-				}, []string{"id", "state", "body", "author", "submitted_at", "commit_id"}, false),
+					"comments": map[string]any{"type": "array", "items": objectSchemaValue(map[string]any{
+						"id": positiveIntegerSchema(), "body": stringSchema(), "path": nonEmptyStringSchema(), "line": map[string]any{"type": []string{"integer", "null"}},
+						"side": stringSchema(), "subject_type": nonEmptyStringSchema(), "html_url": stringSchema(),
+					}, []string{"id", "body", "path", "line", "side", "subject_type", "html_url"}, false)},
+				}, []string{"id", "state", "body", "author", "submitted_at", "commit_id", "comments"}, false),
 			}, []string{"repository", "pull", "review"}, false),
 		},
 	}

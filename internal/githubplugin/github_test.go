@@ -209,6 +209,18 @@ func TestReviewPollingSelectsManagedPullsAndOrdersStableSubmittedReviews(t *test
                 ]`))
 		case "/repos/acme/widget/pulls/8/reviews":
 			_, _ = writer.Write([]byte(`[{"id":21,"state":"APPROVED","body":"ship","submitted_at":"2026-08-08T11:00:00Z","commit_id":"commit-8","user":{"login":"approver"}}]`))
+		case "/repos/acme/widget/pulls/8/reviews/21/comments":
+			_, _ = writer.Write([]byte(`[]`))
+		case "/repos/acme/widget/pulls/7/reviews/22/comments":
+			if request.URL.Query().Get("page") == "2" {
+				_, _ = writer.Write([]byte(`[
+                  {"id":502,"body":"keep this deterministic","path":"internal/run.go","line":null,"original_line":18,"side":"RIGHT","subject_type":"line","html_url":"https://example.invalid/comment/502"},
+                  {"id":503,"body":"document this file","path":"internal/run.go","line":null,"original_line":null,"side":"","subject_type":"file","html_url":"https://example.invalid/comment/503"}
+                ]`))
+				return
+			}
+			writer.Header().Set("Link", "<"+server.URL+"/repos/acme/widget/pulls/7/reviews/22/comments?page=2>; rel=\"next\"")
+			_, _ = writer.Write([]byte(`[{"id":501,"body":"handle the retry","path":"internal/run.go","line":12,"side":"RIGHT","html_url":"https://example.invalid/comment/501"}]`))
 		default:
 			http.NotFound(writer, request)
 		}
@@ -222,6 +234,13 @@ func TestReviewPollingSelectsManagedPullsAndOrdersStableSubmittedReviews(t *test
 	}
 	if len(events) != 2 || events[0].Review.ID != 21 || events[0].RunUID != "run-eight" || events[1].Review.ID != 22 || events[1].RunUID != "run-seven" {
 		t.Fatalf("review events=%+v", events)
+	}
+	if len(events[1].Comments) != 3 || events[1].Comments[0].ID != 501 || events[1].Comments[1].Line == nil || *events[1].Comments[1].Line != 18 || events[1].Comments[2].Line != nil || events[1].Comments[2].SubjectType != "file" {
+		t.Fatalf("review comments=%+v", events[1].Comments)
+	}
+	encodedComments, err := json.Marshal(events[1].Comments)
+	if err != nil || !strings.Contains(string(encodedComments), `"line":null`) || !strings.Contains(string(encodedComments), `"subject_type":"file"`) {
+		t.Fatalf("encoded comments=%s err=%v", encodedComments, err)
 	}
 	resumed, err := runtime.listSubmittedReviews(context.Background(), config, []byte("fixture-token"), events[0].Cursor, time.Time{})
 	if err != nil || len(resumed) != 1 || resumed[0].Review.ID != 22 {
@@ -285,6 +304,8 @@ func TestReviewWatchEmitsTargetRunAndAcknowledgesStableReview(t *testing.T) {
 			_, _ = fmt.Fprintf(writer, `[{"number":12,"html_url":"https://example.invalid/pull/12","body":%q,"head":{"sha":"head-12"}}]`, marker)
 		case "/repos/acme/widget/pulls/12/reviews":
 			_, _ = writer.Write([]byte(`[{"id":301,"state":"CHANGES_REQUESTED","body":"fix it","submitted_at":"2026-08-08T12:00:00Z","commit_id":"commit-12","user":{"login":"reviewer"}}]`))
+		case "/repos/acme/widget/pulls/12/reviews/301/comments":
+			_, _ = writer.Write([]byte(`[{"id":401,"body":"fix this line","path":"internal/task.go","line":44,"side":"RIGHT","html_url":"https://example.invalid/comment/401"}]`))
 		default:
 			http.NotFound(writer, request)
 		}
@@ -306,9 +327,191 @@ func TestReviewWatchEmitsTargetRunAndAcknowledgesStableReview(t *testing.T) {
 		t.Fatalf("events=%+v", stream.events)
 	}
 	event := stream.events[0]
-	if event.GetProviderEventId() != "github:acme/widget:pull-review:301" || event.GetTargetRunUid() != "run-review" || event.GetCursor() == "" || !strings.Contains(string(event.GetPayloadJson()), `"state":"CHANGES_REQUESTED"`) {
+	if event.GetProviderEventId() != "github:acme/widget:pull-review:301" || event.GetTargetRunUid() != "run-review" || event.GetCursor() == "" || !strings.Contains(string(event.GetPayloadJson()), `"state":"CHANGES_REQUESTED"`) || !strings.Contains(string(event.GetPayloadJson()), `"fix this line"`) {
 		t.Fatalf("review event=%+v payload=%s", event, event.GetPayloadJson())
 	}
+}
+
+func TestCommitChecksWaitForExactHeadAcrossChecksAndStatuses(t *testing.T) {
+	t.Parallel()
+	headSHA := strings.Repeat("a", 40)
+	var mu sync.Mutex
+	checkPolls := 0
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer fixture-token" {
+			http.Error(writer, `{"message":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/repos/acme/widget/pulls/17":
+			_, _ = fmt.Fprintf(writer, `{"state":"open","head":{"sha":%q}}`, headSHA)
+		case "/repos/acme/widget/commits/" + headSHA + "/check-runs":
+			if request.URL.Query().Get("page") == "2" {
+				_, _ = fmt.Fprintf(writer, `{"check_runs":[{"name":"lint","status":"completed","conclusion":"success","details_url":"https://example.invalid/lint","head_sha":%q}]}`, headSHA)
+				return
+			}
+			mu.Lock()
+			checkPolls++
+			poll := checkPolls
+			mu.Unlock()
+			writer.Header().Set("Link", "<"+server.URL+"/repos/acme/widget/commits/"+headSHA+"/check-runs?filter=latest&per_page=100&page=2>; rel=\"next\"")
+			statusValue, conclusion := "queued", ""
+			if poll >= 2 {
+				statusValue, conclusion = "completed", "success"
+			}
+			_, _ = fmt.Fprintf(writer, `{"check_runs":[{"name":"test","status":%q,"conclusion":%q,"details_url":"https://example.invalid/test","head_sha":%q}]}`, statusValue, conclusion, headSHA)
+		case "/repos/acme/widget/commits/" + headSHA + "/status":
+			mu.Lock()
+			poll := checkPolls
+			mu.Unlock()
+			state := "pending"
+			if poll >= 2 {
+				state = "success"
+			}
+			_, _ = fmt.Fprintf(writer, `{"state":%q,"sha":%q,"statuses":[{"context":"legacy/build","state":%q,"description":"fixture","target_url":"https://example.invalid/status"}]}`, state, headSHA, state)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	runtime := &Runtime{Client: server.Client()}
+	request := executeRequest(t, "run-checks", "wait-checks", "github.commit.checks.wait", map[string]any{
+		"owner": "acme", "repository": "widget", "apiBase": server.URL, "tokenSecret": "token", "ref": headSHA,
+		"pullNumber": 17, "required": []string{"test", "lint"}, "pollInterval": "1ms",
+	})
+	sink := &recordingSink{}
+	output, err := runtime.Execute(context.Background(), request, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, ok := output.(checkSnapshot)
+	if !ok || snapshot.State != "success" || snapshot.HeadSHA != headSHA || len(snapshot.Checks) != 2 || len(snapshot.Statuses) != 2 {
+		t.Fatalf("check snapshot=%#v", output)
+	}
+	if checkPolls != 2 || !sink.has("github.checks.pending") || !sink.has("github.checks.succeeded") {
+		t.Fatalf("polls=%d events=%v", checkPolls, sink.events)
+	}
+}
+
+func TestCommitCheckPolicyFailsClosed(t *testing.T) {
+	t.Parallel()
+	if state := evaluateCheckSnapshot(checkSnapshot{Checks: []checkSummary{{Name: "test", Status: "completed", Conclusion: "failure"}}}, []string{"test"}); state != "failure" {
+		t.Fatalf("failed check state=%q", state)
+	}
+	if state := evaluateCheckSnapshot(checkSnapshot{Checks: []checkSummary{{Name: "test", Status: "completed", Conclusion: "success"}}, Statuses: []statusSummary{{Context: "legacy", State: "error"}}}, []string{"test"}); state != "failure" {
+		t.Fatalf("failed status state=%q", state)
+	}
+	if state := evaluateCheckSnapshot(checkSnapshot{}, []string{"missing"}); state != "pending" {
+		t.Fatalf("missing check state=%q", state)
+	}
+	runtime := &Runtime{}
+	for _, config := range []string{
+		`{"owner":"acme","repository":"widget","tokenSecret":"token","ref":"main","pullNumber":1,"required":["test"]}`,
+		`{"owner":"acme","repository":"widget","tokenSecret":"token","ref":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","pullNumber":1,"required":["test","test"]}`,
+	} {
+		issues := runtime.ValidateAction(context.Background(), "github.commit.checks.wait", json.RawMessage(config))
+		if len(issues) != 1 {
+			t.Fatalf("config=%s issues=%+v", config, issues)
+		}
+	}
+}
+
+func TestCommitChecksReturnStaleBeforePollingOldHead(t *testing.T) {
+	t.Parallel()
+	approvedSHA := strings.Repeat("a", 40)
+	currentSHA := strings.Repeat("b", 40)
+	checkRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		if request.URL.Path == "/repos/acme/widget/pulls/17" {
+			_, _ = fmt.Fprintf(writer, `{"state":"open","head":{"sha":%q}}`, currentSHA)
+			return
+		}
+		checkRequests++
+		http.NotFound(writer, request)
+	}))
+	defer server.Close()
+	request := executeRequest(t, "run-stale", "wait-checks", "github.commit.checks.wait", map[string]any{
+		"owner": "acme", "repository": "widget", "apiBase": server.URL, "tokenSecret": "token", "ref": approvedSHA,
+		"pullNumber": 17, "required": []string{"test"},
+	})
+	sink := &recordingSink{}
+	output, err := (&Runtime{Client: server.Client()}).Execute(context.Background(), request, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, ok := output.(checkSnapshot)
+	if !ok || snapshot.State != "stale" || snapshot.HeadSHA != approvedSHA || checkRequests != 0 || !sink.has("github.checks.stale") {
+		t.Fatalf("output=%#v checkRequests=%d events=%v", output, checkRequests, sink.events)
+	}
+}
+
+func TestCommitChecksRecheckPullHeadAfterSuccessfulSnapshot(t *testing.T) {
+	t.Parallel()
+	approvedSHA := strings.Repeat("a", 40)
+	newSHA := strings.Repeat("b", 40)
+	var mu sync.Mutex
+	pullRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/repos/acme/widget/pulls/17":
+			mu.Lock()
+			pullRequests++
+			currentRequest := pullRequests
+			mu.Unlock()
+			head := approvedSHA
+			if currentRequest >= 2 {
+				head = newSHA
+			}
+			_, _ = fmt.Fprintf(writer, `{"state":"open","head":{"sha":%q}}`, head)
+		case "/repos/acme/widget/commits/" + approvedSHA + "/check-runs":
+			_, _ = fmt.Fprintf(writer, `{"check_runs":[{"name":"test","status":"completed","conclusion":"success","head_sha":%q}]}`, approvedSHA)
+		case "/repos/acme/widget/commits/" + approvedSHA + "/status":
+			_, _ = fmt.Fprintf(writer, `{"state":"success","sha":%q,"statuses":[]}`, approvedSHA)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	request := executeRequest(t, "run-race", "wait-checks", "github.commit.checks.wait", map[string]any{
+		"owner": "acme", "repository": "widget", "apiBase": server.URL, "tokenSecret": "token", "ref": approvedSHA,
+		"pullNumber": 17, "required": []string{"test"},
+	})
+	sink := &recordingSink{}
+	output, err := (&Runtime{Client: server.Client()}).Execute(context.Background(), request, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, ok := output.(checkSnapshot)
+	mu.Lock()
+	observedPullRequests := pullRequests
+	mu.Unlock()
+	if !ok || snapshot.State != "stale" || observedPullRequests != 2 || !sink.has("github.checks.stale") || sink.has("github.checks.succeeded") {
+		t.Fatalf("output=%#v pullRequests=%d events=%v", output, observedPullRequests, sink.events)
+	}
+}
+
+type recordingSink struct {
+	events []string
+}
+
+func (s *recordingSink) Emit(eventType string, _ any) error {
+	s.events = append(s.events, eventType)
+	return nil
+}
+
+func (*recordingSink) Log(string, []byte) error { return nil }
+
+func (s *recordingSink) has(eventType string) bool {
+	for _, current := range s.events {
+		if current == eventType {
+			return true
+		}
+	}
+	return false
 }
 
 type reviewWatchStream struct {

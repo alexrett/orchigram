@@ -258,6 +258,8 @@ spec: {backend: env, key: ORCHIGRAM_TEST_GITHUB_PROVIDER_TOKEN}
 			_, _ = fmt.Fprintf(writer, `[{"number":12,"html_url":"https://example.invalid/pull/12","body":%q,"head":{"sha":"head-review"}}]`, marker)
 		case "/repos/acme/widget/pulls/12/reviews":
 			_, _ = writer.Write([]byte(`[{"id":301,"state":"CHANGES_REQUESTED","body":"rework","submitted_at":"2026-08-08T11:00:00Z","commit_id":"reviewed-commit","user":{"login":"reviewer"}}]`))
+		case "/repos/acme/widget/pulls/12/reviews/301/comments":
+			_, _ = writer.Write([]byte(`[]`))
 		default:
 			http.NotFound(writer, request)
 		}
@@ -599,7 +601,7 @@ func TestSelfSDLCCExampleRendersFetchedIssueRequirementsForPlanner(t *testing.T)
 		t.Fatal(err)
 	}
 	plan, diagnostics := flow.NewCompiler(nil).Compile(flowResource)
-	if len(diagnostics) != 0 {
+	if flow.HasErrors(diagnostics) {
 		t.Fatalf("compile diagnostics: %+v", diagnostics)
 	}
 	var planner map[string]any
@@ -623,6 +625,73 @@ func TestSelfSDLCCExampleRendersFetchedIssueRequirementsForPlanner(t *testing.T)
 		if !strings.Contains(prompt, requirement) {
 			t.Fatalf("rendered planner prompt omitted %q: %s", requirement, prompt)
 		}
+	}
+}
+
+func TestSelfSDLCReviewLoopCompilesAgainstInstalledContracts(t *testing.T) {
+	state, err := store.Open(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	manager := New(state, t.TempDir())
+	defer manager.Close()
+	ctx := context.Background()
+	for _, name := range []string{"github", "agent-command", "exec"} {
+		if _, err := manager.Install(ctx, conformanceBundle(t, name, 1, 1)); err != nil {
+			t.Fatalf("install %s: %v", name, err)
+		}
+		if err := manager.Enable(ctx, name, conformanceVersion); err != nil {
+			t.Fatalf("enable %s: %v", name, err)
+		}
+	}
+	for _, name := range []string{"secret-ref.yaml", "repository.yaml", "planner-profile.yaml", "implementer-profile.yaml"} {
+		data, err := os.ReadFile(filepath.Join("..", "..", "examples", "self-sdlc", name)) //nolint:gosec // Repository-owned fixture.
+		if err != nil {
+			t.Fatal(err)
+		}
+		applyResource(t, state, string(data))
+	}
+	data, err := os.ReadFile(filepath.Join("..", "..", "examples", "self-sdlc", "issue-to-pr-flow.yaml")) //nolint:gosec // Repository-owned fixture.
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err := resource.DecodeStrict(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flowResource, err := resource.DecodeFlow(document.JSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, diagnostics := flow.NewCompiler(manager).Compile(flowResource)
+	if flow.HasErrors(diagnostics) {
+		t.Fatalf("compile diagnostics: %+v", diagnostics)
+	}
+	seen := map[string]bool{}
+	for _, node := range plan.Nodes {
+		seen[node.ID] = true
+		if node.Uses == "github.pr.merge" {
+			t.Fatal("self-SDLC reference flow must never include automatic merge")
+		}
+	}
+	for _, required := range []string{"wait_review", "rework", "verify_rework", "push_rework", "wait_checks", "publish_merge_ready"} {
+		if !seen[required] {
+			t.Fatalf("compiled plan is missing %s", required)
+		}
+	}
+	cyclic := false
+	for _, component := range plan.Components {
+		members := map[string]bool{}
+		for _, nodeID := range component {
+			members[nodeID] = true
+		}
+		if members["wait_review"] && members["rework"] && members["verify_rework"] && members["push_rework"] {
+			cyclic = true
+		}
+	}
+	if !cyclic {
+		t.Fatalf("review/rework component is not a finite cycle: %+v", plan.Components)
 	}
 }
 

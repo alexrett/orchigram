@@ -26,7 +26,7 @@ spec:
     required: [repository, issue]
     additionalProperties: false
   policies:
-    timeout: 3h
+    timeout: 336h
     maxParallel: 1
   nodes:
     - id: fetch_issue
@@ -130,6 +130,85 @@ spec:
           and `make check`. Human review is required; this flow never merges.
         mappings:
           - {from: nodes.checkout.branch, to: /head}
+    - id: wait_review
+      uses: core.event
+      timeout: 168h
+      loop: {maxIterations: 8}
+    - id: rework
+      uses: agent-command.run
+      timeout: 60m
+      with:
+        profile: self-sdlc-implementer
+        workspace: .
+        prompt: |-
+          Address the submitted GitHub review for issue
+          #${nodes.fetch_issue.issue.number} in the existing checkout.
+
+          Review state: ${nodes.wait_review.review.state}
+          Reviewer: ${nodes.wait_review.review.author}
+          Review body:
+          ${nodes.wait_review.review.body}
+
+          Inline comments as JSON:
+          ${nodes.wait_review.review.comments}
+
+          Inspect the current files and apply only relevant requested changes.
+          Do not commit, push, merge, change credentials, or bypass tests.
+        mappings:
+          - {from: nodes.checkout.workspace, to: /workspace}
+    - id: verify_rework
+      uses: exec.run
+      timeout: 30m
+      with:
+        argv: [make, check]
+        directory: .
+        mappings:
+          - {from: nodes.checkout.workspace, to: /directory}
+    - id: push_rework
+      uses: github.workspace.commit-push
+      timeout: 5m
+      with:
+        workspace: .
+        branch: orchigram/issue-placeholder
+        message: "Address review ${nodes.wait_review.review.id} for issue #${nodes.fetch_issue.issue.number}"
+        tokenSecret: token
+        secretRefs: {token: self-sdlc-github-token}
+        mappings:
+          - {from: nodes.checkout.workspace, to: /workspace}
+          - {from: nodes.checkout.branch, to: /branch}
+    - id: wait_checks
+      uses: github.commit.checks.wait
+      timeout: 60m
+      with:
+        owner: REPLACE_WITH_GITHUB_OWNER
+        repository: REPLACE_WITH_REPOSITORY
+        tokenSecret: token
+        secretRefs: {token: self-sdlc-github-token}
+        ref: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        pullNumber: 1
+        required: [test]
+        pollInterval: 10s
+        mappings:
+          - {from: nodes.wait_review.pull.head_sha, to: /ref}
+          - {from: nodes.create_pr.number, to: /pullNumber}
+    - id: publish_merge_ready
+      uses: github.issue.comment
+      with:
+        owner: REPLACE_WITH_GITHUB_OWNER
+        repository: REPLACE_WITH_REPOSITORY
+        tokenSecret: token
+        secretRefs: {token: self-sdlc-github-token}
+        number: 1
+        body: |-
+          ## Merge ready
+
+          Pull request ${nodes.create_pr.url} was approved for head
+          `${nodes.wait_checks.headSha}` and the configured GitHub checks passed.
+
+          Orchigram has not merged it. A human must make the merge decision in
+          GitHub after inspecting the final diff and repository controls.
+        mappings:
+          - {from: nodes.fetch_issue.issue.number, to: /number}
   edges:
     - {from: fetch_issue, to: checkout}
     - {from: checkout, to: plan}
@@ -139,3 +218,13 @@ spec:
     - {from: implement, to: verify}
     - {from: verify, to: push}
     - {from: push, to: create_pr}
+    - {from: create_pr, to: wait_review}
+    - {from: wait_review, to: rework, when: 'result.review.state == "CHANGES_REQUESTED" && result.review.commit_id == result.pull.head_sha'}
+    - {from: rework, to: verify_rework}
+    - {from: verify_rework, to: push_rework}
+    - {from: push_rework, to: wait_review}
+    - {from: wait_review, to: wait_review, when: 'result.review.state == "CHANGES_REQUESTED" && result.review.commit_id != result.pull.head_sha'}
+    - {from: wait_review, to: wait_review, when: 'result.review.state == "APPROVED" && result.review.commit_id != result.pull.head_sha'}
+    - {from: wait_review, to: wait_checks, when: 'result.review.state == "APPROVED" && result.review.commit_id == result.pull.head_sha'}
+    - {from: wait_checks, to: wait_review, when: 'result.state == "stale"'}
+    - {from: wait_checks, to: publish_merge_ready, when: 'result.state == "success"'}

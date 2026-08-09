@@ -23,6 +23,7 @@ import (
 	"github.com/alexrett/orchigram/internal/resource"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -360,6 +361,102 @@ func TestFlowCASRetryRequiresSameUIDAndGeneration(t *testing.T) {
 	if sameFlowGeneration(selected, document("replacement-uid", 2, 5)) {
 		t.Fatal("replacement resource was retryable")
 	}
+}
+
+func TestFlowCASRetriesRepeatedStatusOnlyRevisions(t *testing.T) {
+	t.Parallel()
+	documentJSON := []byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: demo, namespace: default, uid: flow-uid, resourceVersion: 10, generation: 2}
+spec:
+  nodes: [{id: start, uses: core.noop}]
+`)
+	document := &controlv1alpha1.ResourceDocument{
+		Key:             &controlv1alpha1.ResourceKey{Kind: "Flow", Namespace: "default", Name: "demo", Uid: "flow-uid"},
+		ResourceVersion: 10, Generation: 2, Json: documentJSON,
+	}
+	definition, err := resource.DecodeFlow(documentJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition.Spec.Nodes[0].Name = "edited"
+	resources := &statusBumpResourceClient{documentJSON: documentJSON, currentVersion: 10, conflicts: 5}
+	client := &clientpkg.Client{Resources: resources}
+	notifications := tview.NewTextView()
+	if !applyFlowDefinition(context.Background(), client, document, definition, notifications) {
+		t.Fatalf("Flow edit failed after status-only revisions: %s", notifications.GetText(false))
+	}
+	if resources.applyAttempts != 6 || resources.getAttempts != 5 || document.GetResourceVersion() != 16 || document.GetGeneration() != 3 {
+		t.Fatalf("applyAttempts=%d getAttempts=%d document=%+v", resources.applyAttempts, resources.getAttempts, document)
+	}
+}
+
+func TestFlowCASStopsAtStatusRevisionRetryBound(t *testing.T) {
+	t.Parallel()
+	documentJSON := []byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: demo, namespace: default, uid: flow-uid, resourceVersion: 10, generation: 2}
+spec:
+  nodes: [{id: start, uses: core.noop}]
+`)
+	document := &controlv1alpha1.ResourceDocument{
+		Key:             &controlv1alpha1.ResourceKey{Kind: "Flow", Namespace: "default", Name: "demo", Uid: "flow-uid"},
+		ResourceVersion: 10, Generation: 2, Json: documentJSON,
+	}
+	definition, err := resource.DecodeFlow(documentJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition.Spec.Nodes[0].Name = "must-not-apply"
+	resources := &statusBumpResourceClient{documentJSON: documentJSON, currentVersion: 10, conflicts: maxFlowStatusRevisionRetries}
+	client := &clientpkg.Client{Resources: resources}
+	notifications := tview.NewTextView()
+	if applyFlowDefinition(context.Background(), client, document, definition, notifications) {
+		t.Fatal("Flow edit crossed the bounded status-revision retry limit")
+	}
+	if resources.applyAttempts != maxFlowStatusRevisionRetries || resources.getAttempts != maxFlowStatusRevisionRetries-1 || document.GetResourceVersion() != 10 || document.GetGeneration() != 2 {
+		t.Fatalf("applyAttempts=%d getAttempts=%d document=%+v", resources.applyAttempts, resources.getAttempts, document)
+	}
+	if !strings.Contains(notifications.GetText(false), "CAS conflict") {
+		t.Fatalf("notification=%q", notifications.GetText(false))
+	}
+}
+
+type statusBumpResourceClient struct {
+	controlv1alpha1.ResourceServiceClient
+	documentJSON   []byte
+	currentVersion uint64
+	conflicts      int
+	applyAttempts  int
+	getAttempts    int
+}
+
+func (c *statusBumpResourceClient) Validate(context.Context, *controlv1alpha1.ApplyRequest, ...grpc.CallOption) (*controlv1alpha1.ApplyResponse, error) {
+	return &controlv1alpha1.ApplyResponse{}, nil
+}
+
+func (c *statusBumpResourceClient) Apply(_ context.Context, request *controlv1alpha1.ApplyRequest, _ ...grpc.CallOption) (*controlv1alpha1.ApplyResponse, error) {
+	c.applyAttempts++
+	if request.GetExpectedResourceVersion() != c.currentVersion {
+		return nil, status.Errorf(codes.Internal, "expected request revision %d, got %d", c.currentVersion, request.GetExpectedResourceVersion())
+	}
+	if c.applyAttempts <= c.conflicts {
+		return nil, status.Error(codes.Aborted, "status revision advanced")
+	}
+	c.currentVersion++
+	return &controlv1alpha1.ApplyResponse{Resource: &controlv1alpha1.ResourceDocument{
+		Key:             &controlv1alpha1.ResourceKey{Kind: "Flow", Namespace: "default", Name: "demo", Uid: "flow-uid"},
+		ResourceVersion: c.currentVersion, Generation: 3, Json: request.GetDocument(),
+	}}, nil
+}
+
+func (c *statusBumpResourceClient) Get(context.Context, *controlv1alpha1.GetRequest, ...grpc.CallOption) (*controlv1alpha1.ResourceDocument, error) {
+	c.getAttempts++
+	c.currentVersion++
+	return &controlv1alpha1.ResourceDocument{
+		Key:             &controlv1alpha1.ResourceKey{Kind: "Flow", Namespace: "default", Name: "demo", Uid: "flow-uid"},
+		ResourceVersion: c.currentVersion, Generation: 2, Json: c.documentJSON,
+	}, nil
 }
 
 func TestTUIKeyboardInstallsActivatesRollsBackAndDisablesPlugin(t *testing.T) {

@@ -1178,7 +1178,10 @@ func TestGitHubReviewProviderResumesWaitingRunThroughDaemon(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	var mu sync.Mutex
 	runUID := ""
-	reviewSubmittedAt := time.Now().UTC().Add(-time.Second).Format(time.RFC3339Nano)
+	headSHA := strings.Repeat("a", 40)
+	staleSHA := strings.Repeat("b", 40)
+	reviewBase := time.Now().UTC().Add(-4 * time.Second)
+	checkPolls := 0
 	reviewServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Header.Get("Authorization") != "Bearer fixture-token" {
 			http.Error(writer, `{"message":"unauthorized"}`, http.StatusUnauthorized)
@@ -1193,13 +1196,39 @@ func TestGitHubReviewProviderResumesWaitingRunThroughDaemon(t *testing.T) {
 			marker := "<!-- orchigram:run=" + currentRunUID + ";node=create-pr;idempotency=" + strings.Repeat("d", 64) + " -->"
 			_ = json.NewEncoder(writer).Encode([]map[string]any{{
 				"number": 17, "state": "closed", "html_url": "https://example.invalid/pulls/17", "body": marker,
-				"head": map[string]any{"sha": "review-head"},
+				"head": map[string]any{"sha": headSHA},
 			}})
 		case "/repos/acme/widget/pulls/17/reviews":
-			_ = json.NewEncoder(writer).Encode([]map[string]any{{
-				"id": 1701, "state": "APPROVED", "body": "approved fixture", "submitted_at": reviewSubmittedAt,
-				"commit_id": "reviewed-head", "user": map[string]any{"login": "reviewer"},
-			}})
+			_ = json.NewEncoder(writer).Encode([]map[string]any{
+				{"id": 1701, "state": "CHANGES_REQUESTED", "body": "rework fixture", "submitted_at": reviewBase.Add(time.Second).Format(time.RFC3339Nano), "commit_id": headSHA, "user": map[string]any{"login": "reviewer"}},
+				{"id": 1702, "state": "APPROVED", "body": "stale fixture", "submitted_at": reviewBase.Add(2 * time.Second).Format(time.RFC3339Nano), "commit_id": staleSHA, "user": map[string]any{"login": "reviewer"}},
+				{"id": 1703, "state": "APPROVED", "body": "current fixture", "submitted_at": reviewBase.Add(3 * time.Second).Format(time.RFC3339Nano), "commit_id": headSHA, "user": map[string]any{"login": "reviewer"}},
+			})
+		case "/repos/acme/widget/pulls/17/reviews/1701/comments":
+			_ = json.NewEncoder(writer).Encode([]map[string]any{{"id": 9001, "body": "fix this line", "path": "internal/run.go", "line": 12, "side": "RIGHT", "html_url": "https://example.invalid/comments/9001"}})
+		case "/repos/acme/widget/pulls/17/reviews/1702/comments", "/repos/acme/widget/pulls/17/reviews/1703/comments":
+			_ = json.NewEncoder(writer).Encode([]map[string]any{})
+		case "/repos/acme/widget/pulls/17":
+			_ = json.NewEncoder(writer).Encode(map[string]any{"state": "open", "head": map[string]any{"sha": headSHA}})
+		case "/repos/acme/widget/commits/" + headSHA + "/check-runs":
+			mu.Lock()
+			checkPolls++
+			poll := checkPolls
+			mu.Unlock()
+			statusValue, conclusion := "queued", ""
+			if poll >= 2 {
+				statusValue, conclusion = "completed", "success"
+			}
+			_ = json.NewEncoder(writer).Encode(map[string]any{"check_runs": []map[string]any{{"name": "test", "status": statusValue, "conclusion": conclusion, "details_url": "https://example.invalid/checks/test", "head_sha": headSHA}}})
+		case "/repos/acme/widget/commits/" + headSHA + "/status":
+			mu.Lock()
+			poll := checkPolls
+			mu.Unlock()
+			state := "pending"
+			if poll >= 2 {
+				state = "success"
+			}
+			_ = json.NewEncoder(writer).Encode(map[string]any{"state": state, "sha": headSHA, "statuses": []map[string]any{{"context": "legacy/build", "state": state, "description": "fixture", "target_url": "https://example.invalid/status"}}})
 		default:
 			http.NotFound(writer, request)
 		}
@@ -1217,17 +1246,38 @@ kind: SecretRef
 metadata: {name: github-review-token}
 spec: {backend: env, key: ORCHIGRAM_TEST_GITHUB_REVIEW_TOKEN}
 `)
-	applyClientResource(t, client, `apiVersion: orchigram.dev/v1alpha1
+	applyClientResource(t, client, fmt.Sprintf(`apiVersion: orchigram.dev/v1alpha1
 kind: Flow
 metadata: {name: review-resume}
 spec:
   policies: {timeout: 2m, maxParallel: 1}
   nodes:
     - {id: prepare, uses: core.noop}
-    - {id: wait_review, uses: core.event, timeout: 1m}
+    - {id: wait_review, uses: core.event, timeout: 1m, loop: {maxIterations: 5}}
+    - {id: rework, uses: core.noop, with: {result: {reworked: true}}}
+    - id: wait_checks
+      uses: github.commit.checks.wait
+      timeout: 30s
+      with:
+        owner: acme
+        repository: widget
+        apiBase: %q
+        tokenSecret: token
+        secretRefs: {token: github-review-token}
+        ref: %s
+        pullNumber: 17
+        required: [test]
+        pollInterval: 10ms
+    - {id: ready, uses: core.noop}
   edges:
     - {from: prepare, to: wait_review}
-`)
+    - {from: wait_review, to: rework, when: 'result.review.state == "CHANGES_REQUESTED" && result.review.commit_id == result.pull.head_sha'}
+    - {from: rework, to: wait_review}
+    - {from: wait_review, to: wait_review, when: 'result.review.state == "CHANGES_REQUESTED" && result.review.commit_id != result.pull.head_sha'}
+    - {from: wait_review, to: wait_review, when: 'result.review.state == "APPROVED" && result.review.commit_id != result.pull.head_sha'}
+    - {from: wait_review, to: wait_checks, when: 'result.review.state == "APPROVED" && result.review.commit_id == result.pull.head_sha'}
+    - {from: wait_checks, to: ready}
+`, reviewServer.URL, headSHA))
 	started, err := client.Runs.Start(context.Background(), &controlv1alpha1.StartRunRequest{Flow: "review-resume", InputJson: []byte(`{}`), IdempotencyKey: "review-resume-fixture"})
 	if err != nil {
 		t.Fatal(err)
@@ -1254,15 +1304,58 @@ spec:
       secretRefs: {token: github-review-token}
   delivery: {mode: signal, node: wait_review}
 `, reviewServer.URL))
-	receipt := waitForTriggerReceipt(t, client, trigger.GetKey().GetUid())
+	acceptedReceipts := waitForTriggerReceipts(t, client, trigger.GetKey().GetUid(), 3)
+	var receipt *controlv1alpha1.TriggerReceipt
+	for _, candidate := range acceptedReceipts {
+		if candidate.GetOccurrenceId() == "github:acme/widget:pull-review:1701" {
+			receipt = candidate
+			break
+		}
+	}
+	if receipt == nil {
+		t.Fatalf("changes-requested receipt is missing: %+v", acceptedReceipts)
+	}
 	if receipt.GetRunUid() != started.GetUid() || receipt.GetOccurrenceId() != "github:acme/widget:pull-review:1701" {
 		t.Fatalf("review receipt=%+v started=%s", receipt, started.GetUid())
 	}
 	waitForRunEvent(t, client, started.GetUid(), 0, "run.succeeded")
 	time.Sleep(50 * time.Millisecond)
 	receipts, err := client.Triggers.Receipts(context.Background(), &controlv1alpha1.ReceiptRequest{TriggerUid: trigger.GetKey().GetUid(), Limit: 10})
-	if err != nil || len(receipts.GetReceipts()) != 1 {
+	if err != nil || len(receipts.GetReceipts()) != 3 {
 		t.Fatalf("deduplicated review receipts=%+v err=%v", receipts, err)
+	}
+	for _, current := range receipts.GetReceipts() {
+		if current.GetRunUid() != started.GetUid() {
+			t.Fatalf("review receipt targeted a different Run: %+v", current)
+		}
+	}
+	mu.Lock()
+	observedCheckPolls := checkPolls
+	mu.Unlock()
+	if observedCheckPolls != 2 {
+		t.Fatalf("check polls=%d", observedCheckPolls)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	events, err := client.Runs.WatchEvents(ctx, &controlv1alpha1.WatchRunRequest{Uid: started.GetUid()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reworked := false
+	for {
+		event, err := events.Recv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if event.GetNodeId() == "rework" && event.GetType() == "node.completed" {
+			reworked = true
+		}
+		if event.GetType() == "run.succeeded" {
+			break
+		}
+	}
+	if !reworked {
+		t.Fatal("changes-requested review did not execute the rework node")
 	}
 }
 
