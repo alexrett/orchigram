@@ -237,7 +237,7 @@ func TestTUIKeyboardCreatesEditsStartsAndDeletesFlow(t *testing.T) {
 	waitForScreenText(t, application, screen, "Edit node start", true)
 	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
 	postTUIText(t, screen, "Edited start")
-	for range 6 {
+	for range 7 {
 		postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
 	}
 	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
@@ -279,7 +279,7 @@ func TestTUIKeyboardCreatesEditsStartsAndDeletesFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for range 7 {
+	for range 8 {
 		postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
 	}
 	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
@@ -302,7 +302,7 @@ func TestTUIKeyboardCreatesEditsStartsAndDeletesFlow(t *testing.T) {
 	waitForScreenText(t, application, screen, "Edit node start", true)
 	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyCtrlU, 0, tcell.ModNone))
 	postTUIText(t, screen, "INVALID")
-	for range 7 {
+	for range 8 {
 		postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyTab, 0, tcell.ModNone))
 	}
 	postTUIEvent(t, screen, tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))

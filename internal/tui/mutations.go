@@ -191,7 +191,7 @@ func openPluginInstall(ctx context.Context, application *tview.Application, page
 		path := filepath.Clean(formText(form, "Bundle path"))
 		bundle, err := os.ReadFile(path) //nolint:gosec // The local operator explicitly selects the bundle path.
 		if err != nil {
-			notifications.SetText("[red]Unable to read plugin bundle")
+			notifications.SetText("[red]Unable to read plugin bundle: " + escape(err.Error()))
 			return
 		}
 		if len(bundle) == 0 {

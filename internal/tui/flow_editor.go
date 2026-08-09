@@ -244,7 +244,7 @@ func applyFlowDefinition(ctx context.Context, client *clientpkg.Client, document
 
 func actionConfigFields(node flow.PlanNode) ([]actionConfigField, bool) {
 	if node.Contract == nil || len(node.Contract.ConfigSchema) == 0 {
-		return nil, len(node.With) == 0
+		return nil, false
 	}
 	var schema struct {
 		Properties map[string]struct {

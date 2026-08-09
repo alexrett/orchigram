@@ -39,6 +39,14 @@ func TestActionConfigFieldsFallsBackForNestedSchema(t *testing.T) {
 	}
 }
 
+func TestActionConfigFieldsFallsBackWithoutSchema(t *testing.T) {
+	for _, node := range []flow.PlanNode{{}, {Contract: &flow.ActionContract{}}} {
+		if fields, complete := actionConfigFields(node); complete || fields != nil {
+			t.Fatalf("schema-less fields=%+v complete=%t", fields, complete)
+		}
+	}
+}
+
 func TestSourceEdgeIndexUsesStablePlanIndexForDuplicateEdges(t *testing.T) {
 	edges := []resource.FlowEdge{{From: "start", To: "finish", When: "true"}, {From: "start", To: "finish", When: "true"}}
 	selected := flow.PlanEdge{From: "start", To: "finish", Condition: "true"}
