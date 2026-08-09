@@ -81,6 +81,147 @@ func TestApprovalSignalCompletesWithoutPendingTimer(t *testing.T) {
 	}
 }
 
+func TestExternalEventsResumeSameRunAndDeduplicateRedeliveryAcrossLoopIterations(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	state, err := store.Open(filepath.Join(root, "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	adapter, err := Open(ctx, filepath.Join(root, "workflows.sqlite"), state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = adapter.Close() }()
+	plan := flow.ExecutionPlan{
+		APIVersion: resource.APIVersion, FlowUID: "flow-review-loop", FlowGeneration: 1,
+		InterpreterVersion: flow.InterpreterVersion, Timeout: "1m0s", MaxParallel: 1, PlanHash: "review-loop-plan",
+		Nodes: []flow.PlanNode{
+			{ID: "review", Name: "review", Uses: "core.event", Timeout: "20s", RetryBackoff: "1ms", LoopMaxIterations: 3},
+			{ID: "rework", Name: "rework", Uses: "core.noop", With: map[string]any{"result": map[string]any{"updated": true}}, Timeout: "20s", RetryBackoff: "1ms", LoopMaxIterations: 3},
+			{ID: "ready", Name: "ready", Uses: "core.noop", Timeout: "20s", RetryBackoff: "1ms"},
+		},
+		Edges: []flow.PlanEdge{
+			{From: "review", To: "rework", Condition: `result.review.state == "changes_requested"`},
+			{From: "rework", To: "review"},
+			{From: "review", To: "ready", Condition: `result.review.state == "approved"`},
+		},
+		Components: [][]string{{"review", "rework"}, {"ready"}},
+	}
+	payload := store.StartPayload{RunUID: "run-review-loop", ReceiptUID: "receipt-review-loop", FlowName: "review-loop", Namespace: "default", Input: json.RawMessage(`{}`)}
+	if _, err := state.EnsureRun(ctx, payload, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Start(ctx, payload.RunUID, plan, payload.Input); err != nil {
+		t.Fatal(err)
+	}
+	changes := EventSignal{ProviderEventID: "review-event-1", Payload: json.RawMessage(`{"review":{"state":"changes_requested"}}`)}
+	approved := EventSignal{ProviderEventID: "review-event-2", Payload: json.RawMessage(`{"review":{"state":"approved"}}`)}
+	waitForPhase(ctx, t, state, payload.RunUID, "waiting")
+	if err := adapter.SignalEvent(ctx, payload.RunUID, "review", changes); err != nil {
+		t.Fatal(err)
+	}
+	waitForRunEventCount(ctx, t, state, payload.RunUID, "event.waiting", 2)
+	if err := adapter.SignalEvent(ctx, payload.RunUID, "review", changes); err != nil {
+		t.Fatal(err)
+	}
+	waitForRunEventCount(ctx, t, state, payload.RunUID, "event.duplicate", 1)
+	if err := adapter.SignalEvent(ctx, payload.RunUID, "review", approved); err != nil {
+		t.Fatal(err)
+	}
+	waitForPhase(ctx, t, state, payload.RunUID, "succeeded")
+	events, err := state.RunEventsAfter(ctx, payload.RunUID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	received, reworks := 0, 0
+	for _, event := range events {
+		if event.Type == "event.received" {
+			received++
+		}
+		if event.Type == "node.completed" && event.NodeID == "rework" {
+			reworks++
+		}
+	}
+	if received != 2 || reworks != 1 {
+		t.Fatalf("event.received=%d rework completions=%d events=%+v", received, reworks, events)
+	}
+}
+
+func TestExternalEventDeliveredBeforeWaitChannelIsConsumed(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := t.TempDir()
+	state, err := store.Open(filepath.Join(root, "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	adapter, err := Open(ctx, filepath.Join(root, "workflows.sqlite"), state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = adapter.Close() }()
+	plan := flow.ExecutionPlan{
+		FlowUID: "flow-event-early", FlowGeneration: 1, InterpreterVersion: flow.InterpreterVersion, PlanHash: "event-early-plan",
+		Nodes: []flow.PlanNode{{ID: "review", Uses: "core.event", Timeout: "30s", RetryBackoff: "10ms"}},
+	}
+	payload := store.StartPayload{RunUID: "run-event-early", Input: json.RawMessage(`{}`)}
+	if _, err := state.EnsureRun(ctx, payload, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.Start(ctx, payload.RunUID, plan, payload.Input); err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.SignalEvent(ctx, payload.RunUID, "review", EventSignal{ProviderEventID: "early-review", Payload: json.RawMessage(`{"review":{"state":"approved"}}`)}); err != nil {
+		t.Fatal(err)
+	}
+	waitForPhase(ctx, t, state, payload.RunUID, "succeeded")
+}
+
+func TestExternalEventWaitSurvivesEngineRestart(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	state, err := store.Open(filepath.Join(root, "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	workflowPath := filepath.Join(root, "workflows.sqlite")
+	first, err := Open(ctx, workflowPath, state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := flow.ExecutionPlan{
+		FlowUID: "flow-event-restart", FlowGeneration: 1, InterpreterVersion: flow.InterpreterVersion, PlanHash: "event-restart-plan",
+		Nodes: []flow.PlanNode{{ID: "review", Uses: "core.event", Timeout: "30s", RetryBackoff: "10ms"}},
+	}
+	payload := store.StartPayload{RunUID: "run-event-restart", Input: json.RawMessage(`{}`)}
+	if _, err := state.EnsureRun(ctx, payload, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Start(ctx, payload.RunUID, plan, payload.Input); err != nil {
+		t.Fatal(err)
+	}
+	waitForPhase(ctx, t, state, payload.RunUID, "waiting")
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := Open(ctx, workflowPath, state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = second.Close() }()
+	if err := second.SignalEvent(ctx, payload.RunUID, "review", EventSignal{ProviderEventID: "review-after-restart", Payload: json.RawMessage(`{"review":{"state":"approved"}}`)}); err != nil {
+		t.Fatal(err)
+	}
+	waitForPhase(ctx, t, state, payload.RunUID, "succeeded")
+}
+
 func TestActivityHeartbeatsPreventConcurrentRedispatch(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -970,6 +1111,27 @@ func waitForPhase(ctx context.Context, t *testing.T, state *store.Store, runUID,
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("run did not reach %s: run=%+v err=%v", phase, run, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func waitForRunEventCount(ctx context.Context, t *testing.T, state *store.Store, runUID, eventType string, count int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		events, err := state.RunEventsAfter(ctx, runUID, 0, 1000)
+		matched := 0
+		for _, event := range events {
+			if event.Type == eventType {
+				matched++
+			}
+		}
+		if err == nil && matched >= count {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("run event %s count=%d want=%d err=%v events=%+v", eventType, matched, count, err, events)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

@@ -22,6 +22,7 @@ const (
 )
 
 var dnsName = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
+var nodeIDName = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,62}$`)
 
 // TypeMeta identifies a resource schema.
 type TypeMeta struct {
@@ -111,6 +112,13 @@ type ProviderTrigger struct {
 	Config map[string]any `json:"config,omitempty" yaml:"config,omitempty"`
 }
 
+// TriggerDelivery selects whether an occurrence starts a Run or resumes one.
+// The zero value preserves the start behavior of existing Trigger resources.
+type TriggerDelivery struct {
+	Mode string `json:"mode,omitempty" yaml:"mode,omitempty"`
+	Node string `json:"node,omitempty" yaml:"node,omitempty"`
+}
+
 // TriggerSpec maps one external source to a Flow.
 type TriggerSpec struct {
 	Flow     string           `json:"flow" yaml:"flow"`
@@ -118,6 +126,7 @@ type TriggerSpec struct {
 	Schedule *ScheduleTrigger `json:"schedule,omitempty" yaml:"schedule,omitempty"`
 	Webhook  *WebhookTrigger  `json:"webhook,omitempty" yaml:"webhook,omitempty"`
 	Provider *ProviderTrigger `json:"provider,omitempty" yaml:"provider,omitempty"`
+	Delivery *TriggerDelivery `json:"delivery,omitempty" yaml:"delivery,omitempty"`
 }
 
 // Trigger is a schedule, webhook, or provider subscription.
@@ -484,6 +493,23 @@ func validateKind(value any) error {
 		}
 		if v.Spec.Provider != nil && strings.TrimSpace(v.Spec.Provider.Plugin) == "" {
 			return errors.New("trigger provider plugin is required")
+		}
+		if v.Spec.Delivery != nil {
+			switch v.Spec.Delivery.Mode {
+			case "", "start":
+				if v.Spec.Delivery.Node != "" {
+					return errors.New("trigger start delivery must not configure a node")
+				}
+			case "signal":
+				if v.Spec.Provider == nil {
+					return errors.New("trigger signal delivery requires a provider source")
+				}
+				if !nodeIDName.MatchString(v.Spec.Delivery.Node) {
+					return errors.New("trigger signal delivery node must match ^[a-z][a-z0-9_-]{0,62}$")
+				}
+			default:
+				return fmt.Errorf("trigger delivery mode %q is unsupported", v.Spec.Delivery.Mode)
+			}
 		}
 	case *Repository:
 		if strings.TrimSpace(v.Spec.CloneURL) == "" {

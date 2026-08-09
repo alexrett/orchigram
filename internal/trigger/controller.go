@@ -31,6 +31,7 @@ type Provider interface {
 type Acceptor interface {
 	AcceptTrigger(context.Context, string, uint64, string, string, string, json.RawMessage, bool) (store.Receipt, error)
 	AcceptProviderTrigger(context.Context, string, uint64, string, string, string, json.RawMessage, string) (store.Receipt, error)
+	AcceptProviderSignal(context.Context, string, uint64, string, string, string, string, string, json.RawMessage, string) (store.Receipt, error)
 }
 
 type subscription struct {
@@ -290,6 +291,13 @@ func (c *Controller) watchProvider(ctx context.Context, trigger resource.Trigger
 			watchErr := c.provider.WatchTrigger(ctx, trigger.Spec.Provider.Plugin, trigger.Metadata.UID, trigger.Metadata.Namespace, trigger.Spec.Provider.Config, cursor, state.CursorAt, func(event *pluginv1alpha1.TriggerEvent) error {
 				if event.GetProviderEventId() == "" || event.GetCursor() == "" || !json.Valid(event.GetPayloadJson()) {
 					return errors.New("provider event identity, cursor, and JSON payload are required")
+				}
+				if trigger.Spec.Delivery != nil && trigger.Spec.Delivery.Mode == "signal" {
+					if event.GetTargetRunUid() == "" {
+						return errors.New("signal delivery requires a provider target Run UID")
+					}
+					_, acceptErr := c.acceptor.AcceptProviderSignal(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, event.GetProviderEventId(), trigger.Spec.Flow, trigger.Metadata.Namespace, event.GetTargetRunUid(), trigger.Spec.Delivery.Node, event.GetPayloadJson(), event.GetCursor())
+					return acceptErr
 				}
 				_, acceptErr := c.acceptor.AcceptProviderTrigger(ctx, trigger.Metadata.UID, trigger.Metadata.Generation, event.GetProviderEventId(), trigger.Spec.Flow, trigger.Metadata.Namespace, event.GetPayloadJson(), event.GetCursor())
 				return acceptErr

@@ -13,6 +13,15 @@ or rejects the stale occurrence without persisting a receipt, provider cursor,
 plan, or outbox row. Duplicate provider delivery keeps its existing receipt and
 advances its cursor only while the current Trigger generation remains valid.
 
+Provider signal delivery uses the same acknowledgement rule without compiling
+mutable Flow state. The receipt, provider cursor, target Run/node, payload, and
+signal outbox command commit atomically after the store verifies the active
+Run's pinned Flow UID and `core.event` node. A crash after workflow signal
+delivery but before outbox completion may redeliver the command; the interpreter
+deduplicates its stable provider event ID before evaluating edges. Signals sent
+before the wait channel is reached are retained by durable workflow history,
+and pending waits resume after daemon restart.
+
 Each non-core plan node pins the installed plugin name, version, bundle digest,
 negotiated protocol, canonical action schemas, and installed contract digest.
 It also snapshots the UID, generation, resource
@@ -81,7 +90,7 @@ agent calls. The bounded provider `Cancel` RPC runs before the streaming RPC is
 cancelled, and command providers terminate the process group with `SIGTERM`
 followed by bounded `SIGKILL` escalation.
 
-Approvals, retry timers, plan versions, provider cursors, physical attempts,
+Approvals, external event waits, retry timers, plan versions, provider cursors, physical attempts,
 plugin event sequences, artifact metadata, and run events are durable. TUI
 state is not. On upgrade, an existing run remains pinned to its interpreter
 version or becomes visibly blocked; it is never silently reinterpreted by

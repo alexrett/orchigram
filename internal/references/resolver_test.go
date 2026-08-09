@@ -118,6 +118,42 @@ spec: {type: command, executable: fake-agent, secretRefs: [token]}
 	}
 }
 
+func TestResolverValidatesSignalDeliveryAgainstCoreEventNode(t *testing.T) {
+	t.Parallel()
+	flowDocument := decodeReferenceDocument(t, `apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: target}
+spec:
+  nodes:
+    - {id: review, uses: core.event}
+    - {id: implement, uses: core.noop}
+`)
+	lookup := fixtureLookup{"Flow/default/target": flowDocument}
+	for name, node := range map[string]string{"valid": "review", "wrong action": "implement", "missing": "absent"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			trigger := decodeReferenceDocument(t, `apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata: {name: reviews}
+spec:
+  flow: target
+  provider: {plugin: github}
+  delivery: {mode: signal, node: `+node+`}
+`)
+			diagnostics := New(lookup, &fixtureProvider{}).Diagnostics(context.Background(), trigger)
+			if name == "valid" {
+				if len(diagnostics) != 0 {
+					t.Fatalf("valid diagnostics=%+v", diagnostics)
+				}
+				return
+			}
+			if len(diagnostics) != 1 || diagnostics[0].Path != "spec.delivery.node" {
+				t.Fatalf("diagnostics=%+v", diagnostics)
+			}
+		})
+	}
+}
+
 func decodeReferenceDocument(t *testing.T, source string) resource.Document {
 	t.Helper()
 	document, err := resource.DecodeStrict([]byte(source))

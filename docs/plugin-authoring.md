@@ -85,6 +85,13 @@ against the immutable event schema before durable acceptance and acknowledgement
 Schema failures stop the watch with path/code diagnostics and never include the
 rejected config, event payload, or secret values.
 
+Normal Trigger events leave `target_run_uid` empty and start a new pinned Run.
+When an operator explicitly configures `delivery.mode: signal`, the provider
+must populate `target_run_uid` from a trustworthy provider correlation (for
+example an Orchigram marker already reconciled into a pull request). The daemon,
+not the plugin, validates the active Run, Flow UID, configured `core.event` node,
+and current Trigger generation before committing or acknowledging the signal.
+
 The daemon canonicalizes and stores the negotiated contract with the immutable
 plugin installation. Enable and later process restarts must reproduce the same
 contract digest. Flow compilation pins the selected action schemas into the

@@ -126,12 +126,34 @@ func (o *Orchestrator) AcceptProviderTrigger(ctx context.Context, triggerUID str
 	return o.store.AcceptProviderTriggerWithPlan(ctx, triggerUID, triggerGeneration, occurrenceID, flowName, namespace, input, cursor, plan)
 }
 
+// AcceptProviderSignal persists a provider occurrence for one active pinned
+// Run. No mutable Flow compilation participates in this resume boundary.
+func (o *Orchestrator) AcceptProviderSignal(ctx context.Context, triggerUID string, triggerGeneration uint64, occurrenceID, flowName, namespace, runUID, nodeID string, input json.RawMessage, cursor string) (store.Receipt, error) {
+	receipt, err := o.store.AcceptProviderSignal(ctx, triggerUID, triggerGeneration, occurrenceID, flowName, namespace, runUID, nodeID, input, cursor)
+	if err == nil {
+		o.notify()
+	}
+	return receipt, err
+}
+
 // ReconcileOne dispatches at most one durable outbox command.
 func (o *Orchestrator) ReconcileOne(ctx context.Context) error {
-	command, err := o.store.ClaimStart(ctx, o.claimStaleAfter)
+	command, err := o.store.ClaimNext(ctx, o.claimStaleAfter)
 	if err != nil {
 		return err
 	}
+	switch command.Type {
+	case "start-run":
+		return o.reconcileStart(ctx, store.OutboxCommand{ID: command.ID, Payload: *command.Start, Attempts: command.Attempts})
+	case "signal-run":
+		return o.reconcileSignal(ctx, store.SignalCommand{ID: command.ID, Payload: *command.Signal, Attempts: command.Attempts})
+	default:
+		return fmt.Errorf("unsupported outbox command type %q", command.Type)
+	}
+}
+
+func (o *Orchestrator) reconcileStart(ctx context.Context, command store.OutboxCommand) error {
+	var err error
 	var plan flow.ExecutionPlan
 	if command.Payload.PlanHash != "" {
 		plan, err = o.store.GetPlan(ctx, command.Payload.PlanHash)
@@ -173,6 +195,18 @@ func (o *Orchestrator) ReconcileOne(ctx context.Context) error {
 		return nil
 	}
 	if err := o.engine.Start(ctx, command.Payload.RunUID, plan, command.Payload.Input); err != nil {
+		_ = o.store.RetryOutbox(ctx, command.ID, err, time.Second)
+		return err
+	}
+	if err := o.hit(BoundaryAfterEngine); err != nil {
+		return err
+	}
+	return o.store.CompleteOutbox(ctx, command.ID)
+}
+
+func (o *Orchestrator) reconcileSignal(ctx context.Context, command store.SignalCommand) error {
+	signal := engine.EventSignal{ProviderEventID: command.Payload.ProviderEventID, Payload: command.Payload.Payload}
+	if err := o.engine.SignalEvent(ctx, command.Payload.RunUID, command.Payload.NodeID, signal); err != nil {
 		_ = o.store.RetryOutbox(ctx, command.ID, err, time.Second)
 		return err
 	}

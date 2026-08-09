@@ -235,9 +235,9 @@ func phaseForRunEvent(eventType string) string {
 	switch eventType {
 	case "run.accepted":
 		return "pending"
-	case "node.started", "node.completed", "node.failed", "node.skipped", "approval.approved":
+	case "node.started", "node.completed", "node.failed", "node.skipped", "approval.approved", "event.received":
 		return "running"
-	case "approval.waiting":
+	case "approval.waiting", "event.waiting", "event.duplicate":
 		return "waiting"
 	case "approval.rejected", "run.rejected":
 		return "rejected"

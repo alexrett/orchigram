@@ -690,6 +690,13 @@ func coreActionContract(node resource.FlowNode) ActionContract {
 			InputSchema:  json.RawMessage(`{"type":"object","additionalProperties":true}`),
 			OutputSchema: json.RawMessage(`{"type":"object","properties":{"approved":{"type":"boolean"},"state":{"type":"string"},"reason":{"type":"string"}},"required":["approved","state","reason"],"additionalProperties":false}`),
 		}
+	case "core.event":
+		return ActionContract{
+			Digest:       "core.event/v1",
+			ConfigSchema: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
+			InputSchema:  json.RawMessage(`{"type":"object","additionalProperties":true}`),
+			OutputSchema: json.RawMessage(`{"type":"object","additionalProperties":true}`),
+		}
 	case "core.noop":
 		output := any(map[string]any{"ok": true})
 		if configured, exists := node.With["result"]; exists {

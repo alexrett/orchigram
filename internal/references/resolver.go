@@ -60,6 +60,9 @@ func (r *Resolver) Diagnostics(ctx context.Context, document resource.Document) 
 			return []flow.Diagnostic{{Path: "spec", Code: "invalid", Message: "Trigger cannot be decoded"}}
 		}
 		diagnostics = append(diagnostics, r.require(ctx, namespace, "Flow", trigger.Spec.Flow, "spec.flow")...)
+		if trigger.Spec.Delivery != nil && trigger.Spec.Delivery.Mode == "signal" {
+			diagnostics = append(diagnostics, r.signalTarget(ctx, namespace, trigger.Spec.Flow, trigger.Spec.Delivery.Node)...)
+		}
 		if trigger.Spec.Webhook != nil {
 			diagnostics = append(diagnostics, r.require(ctx, namespace, "SecretRef", trigger.Spec.Webhook.BearerSecretRef, "spec.webhook.bearerSecretRef")...)
 		}
@@ -103,6 +106,32 @@ func (r *Resolver) Diagnostics(ctx context.Context, document resource.Document) 
 		return diagnostics[i].Code < diagnostics[j].Code
 	})
 	return diagnostics
+}
+
+func (r *Resolver) signalTarget(ctx context.Context, namespace, flowName, nodeID string) []flow.Diagnostic {
+	if r.resources == nil || strings.TrimSpace(flowName) == "" {
+		return nil
+	}
+	document, err := r.resources.Get(ctx, "Flow", namespace, flowName)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil // spec.flow already owns the missing-reference diagnostic.
+	}
+	if err != nil {
+		return []flow.Diagnostic{{Path: "spec.delivery.node", Code: "reference_unavailable", Message: "Flow signal target state is temporarily unavailable"}}
+	}
+	definition, err := resource.DecodeFlow(document.JSON)
+	if err != nil {
+		return []flow.Diagnostic{{Path: "spec.delivery.node", Code: "invalid_reference", Message: "referenced Flow cannot be decoded"}}
+	}
+	for _, node := range definition.Spec.Nodes {
+		if node.ID == nodeID {
+			if node.Uses == "core.event" {
+				return nil
+			}
+			return []flow.Diagnostic{{Path: "spec.delivery.node", Code: "invalid_reference", Message: fmt.Sprintf("Flow node %q must use core.event", nodeID)}}
+		}
+	}
+	return []flow.Diagnostic{{Path: "spec.delivery.node", Code: "reference_not_found", Message: fmt.Sprintf("Flow node %q is not available in Flow %q", nodeID, flowName)}}
 }
 
 func (r *Resolver) require(ctx context.Context, namespace, kind, name, path string) []flow.Diagnostic {

@@ -2,6 +2,7 @@ package trigger
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -153,6 +154,43 @@ type fakeProvider struct {
 	cancel    context.CancelFunc
 }
 
+type signalProvider struct {
+	accepted chan struct{}
+	cancel   context.CancelFunc
+}
+
+func (p *signalProvider) WatchTrigger(ctx context.Context, _, _, _ string, _ map[string]any, _ string, _ time.Time, accept func(*pluginv1alpha1.TriggerEvent) error) error {
+	event := &pluginv1alpha1.TriggerEvent{
+		ProviderEventId: "review-event-1", Cursor: "1", OccurredAt: timestamppb.Now(),
+		PayloadJson: []byte(`{"review":{"state":"changes_requested"}}`), TargetRunUid: "run-1",
+	}
+	if err := accept(event); err != nil {
+		return err
+	}
+	close(p.accepted)
+	p.cancel()
+	return ctx.Err()
+}
+
+type signalAcceptor struct {
+	runUID  string
+	nodeID  string
+	payload json.RawMessage
+}
+
+func (*signalAcceptor) AcceptTrigger(context.Context, string, uint64, string, string, string, json.RawMessage, bool) (store.Receipt, error) {
+	return store.Receipt{}, errors.New("unexpected start delivery")
+}
+
+func (*signalAcceptor) AcceptProviderTrigger(context.Context, string, uint64, string, string, string, json.RawMessage, string) (store.Receipt, error) {
+	return store.Receipt{}, errors.New("unexpected provider start delivery")
+}
+
+func (a *signalAcceptor) AcceptProviderSignal(_ context.Context, _ string, _ uint64, _, _, _ string, runUID, nodeID string, payload json.RawMessage, _ string) (store.Receipt, error) {
+	a.runUID, a.nodeID, a.payload = runUID, nodeID, append(json.RawMessage(nil), payload...)
+	return store.Receipt{RunUID: runUID}, nil
+}
+
 type recoveringProvider struct {
 	mu         sync.Mutex
 	calls      int
@@ -269,6 +307,32 @@ spec:
 	receipts, err := state.TriggerReceipts(context.Background(), trigger.Metadata.UID, 10)
 	if err != nil || len(receipts) != 1 || receipts[0].OccurrenceID != "provider-event-1" {
 		t.Fatalf("receipts=%+v err=%v", receipts, err)
+	}
+}
+
+func TestProviderSignalDeliveryRoutesToExistingRunAndConfiguredEventNode(t *testing.T) {
+	t.Parallel()
+	state := openTriggerStore(t)
+	trigger := applyTrigger(t, state, `apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata: {name: reviews}
+spec:
+  flow: target
+  provider: {plugin: fake, config: {repository: example}}
+  delivery: {mode: signal, node: wait_review}
+`)
+	ctx, cancel := context.WithCancel(context.Background())
+	provider := &signalProvider{accepted: make(chan struct{}), cancel: cancel}
+	acceptor := &signalAcceptor{}
+	controller := NewController(state, provider, acceptor)
+	go controller.watchProvider(ctx, trigger)
+	select {
+	case <-provider.accepted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("provider signal was not accepted")
+	}
+	if acceptor.runUID != "run-1" || acceptor.nodeID != "wait_review" || string(acceptor.payload) != `{"review":{"state":"changes_requested"}}` {
+		t.Fatalf("signal target run=%q node=%q payload=%s", acceptor.runUID, acceptor.nodeID, acceptor.payload)
 	}
 }
 

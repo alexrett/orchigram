@@ -76,6 +76,29 @@ spec:
 	}
 }
 
+func TestCompilerAcceptsCoreEventReviewLoopWithDynamicPayload(t *testing.T) {
+	t.Parallel()
+	plan, diagnostics := compileYAML(t, `apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: review-loop, uid: flow-review, generation: 1}
+spec:
+  nodes:
+    - {id: review, uses: core.event, timeout: 24h, loop: {maxIterations: 3}}
+    - {id: rework, uses: core.noop, loop: {maxIterations: 3}}
+    - {id: ready, uses: core.noop}
+  edges:
+    - {from: review, to: rework, when: 'result.review.state == "changes_requested"'}
+    - {from: rework, to: review}
+    - {from: review, to: ready, when: 'result.review.state == "approved"'}
+`)
+	if HasErrors(diagnostics) || len(diagnostics) != 2 || diagnostics[0].Code != "dynamic_cel" || diagnostics[1].Code != "dynamic_cel" {
+		t.Fatalf("diagnostics=%+v", diagnostics)
+	}
+	if len(plan.Components) != 2 || len(plan.Components[1]) != 2 || plan.Components[1][0] != "review" || plan.Components[1][1] != "rework" {
+		t.Fatalf("components=%+v", plan.Components)
+	}
+}
+
 type testCapabilities struct{}
 
 func (testCapabilities) HasAction(action string) bool { return action == "exec.run" }
