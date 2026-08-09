@@ -391,6 +391,37 @@ spec:
 	}
 }
 
+func TestFlowCASStopsAtStatusRevisionRetryBound(t *testing.T) {
+	t.Parallel()
+	documentJSON := []byte(`apiVersion: orchigram.dev/v1alpha1
+kind: Flow
+metadata: {name: demo, namespace: default, uid: flow-uid, resourceVersion: 10, generation: 2}
+spec:
+  nodes: [{id: start, uses: core.noop}]
+`)
+	document := &controlv1alpha1.ResourceDocument{
+		Key:             &controlv1alpha1.ResourceKey{Kind: "Flow", Namespace: "default", Name: "demo", Uid: "flow-uid"},
+		ResourceVersion: 10, Generation: 2, Json: documentJSON,
+	}
+	definition, err := resource.DecodeFlow(documentJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition.Spec.Nodes[0].Name = "must-not-apply"
+	resources := &statusBumpResourceClient{documentJSON: documentJSON, currentVersion: 10, conflicts: maxFlowStatusRevisionRetries}
+	client := &clientpkg.Client{Resources: resources}
+	notifications := tview.NewTextView()
+	if applyFlowDefinition(context.Background(), client, document, definition, notifications) {
+		t.Fatal("Flow edit crossed the bounded status-revision retry limit")
+	}
+	if resources.applyAttempts != maxFlowStatusRevisionRetries || resources.getAttempts != maxFlowStatusRevisionRetries-1 || document.GetResourceVersion() != 10 || document.GetGeneration() != 2 {
+		t.Fatalf("applyAttempts=%d getAttempts=%d document=%+v", resources.applyAttempts, resources.getAttempts, document)
+	}
+	if !strings.Contains(notifications.GetText(false), "CAS conflict") {
+		t.Fatalf("notification=%q", notifications.GetText(false))
+	}
+}
+
 type statusBumpResourceClient struct {
 	controlv1alpha1.ResourceServiceClient
 	documentJSON   []byte

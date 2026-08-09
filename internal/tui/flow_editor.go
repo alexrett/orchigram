@@ -24,6 +24,10 @@ type actionConfigField struct {
 	required bool
 }
 
+// maxFlowStatusRevisionRetries bounds recovery from server-owned status writes
+// without ever retrying across a desired-state generation or replacement UID.
+const maxFlowStatusRevisionRetries = 8
+
 func openFlowNodeForm(ctx context.Context, application *tview.Application, pages *tview.Pages, client *clientpkg.Client, document *controlv1alpha1.ResourceDocument, planNode flow.PlanNode, notifications *tview.TextView, returnFocus tview.Primitive) {
 	definition, err := resource.DecodeFlow(document.GetJson())
 	if err != nil {
@@ -232,10 +236,12 @@ func applyFlowDefinition(ctx context.Context, client *clientpkg.Client, document
 		return false
 	}
 	var applied *controlv1alpha1.ApplyResponse
-	const maxStatusRevisionRetries = 8
-	for attempt := 0; attempt < maxStatusRevisionRetries; attempt++ {
+	for attempt := 0; attempt < maxFlowStatusRevisionRetries; attempt++ {
 		applied, err = client.Resources.Apply(operationContext, request)
 		if err == nil || status.Code(err) != codes.Aborted {
+			break
+		}
+		if attempt+1 >= maxFlowStatusRevisionRetries {
 			break
 		}
 		current, getErr := client.Resources.Get(operationContext, &controlv1alpha1.GetRequest{Key: cloneMessage(document.GetKey())})
@@ -252,7 +258,7 @@ func applyFlowDefinition(ctx context.Context, client *clientpkg.Client, document
 			break
 		}
 		request = &controlv1alpha1.ApplyRequest{Document: encoded, ExpectedResourceVersion: current.GetResourceVersion()}
-		if attempt+1 < maxStatusRevisionRetries {
+		if attempt+1 < maxFlowStatusRevisionRetries {
 			if !waitForFlowCASRetry(operationContext, min(time.Duration(1<<attempt)*time.Millisecond, 25*time.Millisecond)) {
 				err = operationContext.Err()
 				break
