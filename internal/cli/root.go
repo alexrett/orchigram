@@ -50,17 +50,7 @@ func NewRoot() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return withClient(cmd.Context(), opts, func(client *clientpkg.Client, contextName string) error {
-				contexts, err := contextcfg.Load(opts.contexts)
-				if err != nil {
-					return err
-				}
-				if opts.socket != "" {
-					contextName = "direct"
-					contexts = contextcfg.File{Current: contextName, Contexts: map[string]contextcfg.Context{contextName: {Socket: opts.socket}}}
-				}
-				return tui.RunWithContexts(cmd.Context(), client, contextName, contexts)
-			})
+			return runTUI(cmd.Context(), opts)
 		},
 	}
 	root.Version = version.String()
@@ -86,6 +76,61 @@ func NewRoot() *cobra.Command {
 		newInstallCommand(),
 	)
 	return root
+}
+
+func runTUI(ctx context.Context, opts *options) error {
+	if opts.socket != "" {
+		return withClient(ctx, opts, func(client *clientpkg.Client, _ string) error {
+			contexts := contextcfg.File{Current: "direct", Contexts: map[string]contextcfg.Context{"direct": {Socket: opts.socket}}}
+			return tui.RunWithContexts(ctx, client, "direct", contexts)
+		})
+	}
+	contexts, err := contextcfg.Load(opts.contexts)
+	if err != nil {
+		return err
+	}
+	contextName := opts.contextName
+	if contextName == "" {
+		contextName = contexts.Current
+	}
+	return runTUIContextLoop(ctx, opts.contexts, contexts, contextName, contexttransport.Connect, tui.RunWithContexts)
+}
+
+func runTUIContextLoop(
+	ctx context.Context,
+	contextsPath string,
+	contexts contextcfg.File,
+	contextName string,
+	connect func(context.Context, contextcfg.Context) (*contexttransport.Connection, error),
+	run func(context.Context, *clientpkg.Client, string, contextcfg.File) error,
+) error {
+	for {
+		selected, exists := contexts.Contexts[contextName]
+		if !exists {
+			return fmt.Errorf("context %q is not defined", contextName)
+		}
+		connection, connectErr := connect(ctx, selected)
+		if connectErr != nil {
+			return connectErr
+		}
+		runErr := run(ctx, connection.Client, contextName, contexts)
+		closeErr := connection.Close()
+		var switchRequest *tui.ContextSwitchError
+		if !errors.As(runErr, &switchRequest) {
+			return errors.Join(runErr, closeErr)
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if _, exists := contexts.Contexts[switchRequest.Name]; !exists {
+			return fmt.Errorf("context %q is not defined", switchRequest.Name)
+		}
+		contexts.Current = switchRequest.Name
+		if err := contextcfg.Save(contextsPath, contexts); err != nil {
+			return err
+		}
+		contextName = switchRequest.Name
+	}
 }
 
 func newSystemCommand(opts *options) *cobra.Command {

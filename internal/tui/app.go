@@ -56,7 +56,7 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 	events := tview.NewTextView().SetDynamicColors(true)
 	events.SetBorder(true).SetTitle(" Notifications ")
 	liveStatus := tview.NewTextView().SetDynamicColors(true)
-	help := tview.NewTextView().SetDynamicColors(true).SetText(" [yellow]:[-] commands  [yellow]/[-] filter  [yellow]?[-] help  [yellow]Enter[-] inspect  [yellow]g[-] graph  [yellow]e/t/f/l[-] events/attempts/artifacts/logs  [yellow]y/E[-] YAML/edit  [yellow]a/r/c[-] decide/cancel  [yellow]q[-] quit")
+	help := tview.NewTextView().SetDynamicColors(true).SetText(" [yellow]:/[-] commands/filter  [yellow]?[-] help  [yellow]Enter[-] inspect  [yellow]g[-] graph  [yellow]n/x/E[-] create/delete/edit  [yellow]S[-] start  [yellow]i[-] install  [yellow]e/t/f/l[-] evidence  [yellow]a/r/c[-] decide/cancel  [yellow]q[-] quit")
 	navigation := tview.NewList().ShowSecondaryText(false).SetUseStyleTags(false, false)
 	navigation.SetBorder(true).SetTitle(" Resources ")
 	live := newLiveController(client)
@@ -70,6 +70,7 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 	visibleEntryKeys := []string{}
 	currentFilter := ""
 	activeNavigationKey := ""
+	switchContext := ""
 	rebuild := func(filter string) {
 		currentFilter = strings.ToLower(strings.TrimSpace(filter))
 		preserveKey := activeNavigationKey
@@ -99,10 +100,30 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 	setInspector := func(node flow.PlanNode) {
 		inspector.SetText(fmt.Sprintf("[yellow::b]%s[-:-:-]\n\n[gray]ID[-]       %s\n[gray]Action[-]   %s\n[gray]Timeout[-]  %s\n[gray]Retries[-]  %d\n", escape(node.Name), escape(node.ID), escape(node.Uses), escape(node.Timeout), node.RetryLimit))
 	}
+	setEdgeInspector := func(edge flow.PlanEdge, _ int) {
+		condition := edge.Condition
+		if condition == "" {
+			condition = "always"
+		}
+		inspector.SetText(fmt.Sprintf("[yellow::b]Edge[-:-:-]\n\n[gray]From[-]       %s\n[gray]To[-]         %s\n[gray]Condition[-]  %s\n", escape(edge.From), escape(edge.To), escape(condition)))
+	}
 	graph.SetOnSelect(setInspector).SetOnOpen(func(node flow.PlanNode) {
-		modal := tview.NewModal().SetText(fmt.Sprintf("%s\n\nID: %s\nAction: %s\nTimeout: %s", node.Name, node.ID, node.Uses, node.Timeout)).AddButtons([]string{"Close"})
+		if currentRun == "" && currentResource != nil && currentResource.GetKey().GetKind() == "Flow" {
+			openFlowNodeForm(ctx, application, pages, client, currentResource, node, events, graph)
+			return
+		}
+		modal := tview.NewModal().SetText(tview.Escape(fmt.Sprintf("%s\n\nID: %s\nAction: %s\nTimeout: %s", node.Name, node.ID, node.Uses, node.Timeout))).AddButtons([]string{"Close"})
 		modal.SetDoneFunc(func(_ int, _ string) { pages.RemovePage("node"); application.SetFocus(graph) })
 		pages.AddPage("node", centered(modal, 60, 14), true, true)
+		application.SetFocus(modal)
+	}).SetOnSelectEdge(setEdgeInspector).SetOnOpenEdge(func(edge flow.PlanEdge, index int) {
+		if currentRun == "" && currentResource != nil && currentResource.GetKey().GetKind() == "Flow" {
+			openFlowEdgeForm(ctx, application, pages, client, currentResource, edge, index, events, graph)
+			return
+		}
+		modal := tview.NewModal().SetText(tview.Escape(fmt.Sprintf("Edge\n\nFrom: %s\nTo: %s\nCondition: %s", edge.From, edge.To, valueOr(edge.Condition, "always")))).AddButtons([]string{"Close"})
+		modal.SetDoneFunc(func(_ int, _ string) { pages.RemovePage("edge"); application.SetFocus(graph) })
+		pages.AddPage("edge", centered(modal, 68, 14), true, true)
 		application.SetFocus(modal)
 	})
 
@@ -149,6 +170,20 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 					transport = "OpenSSH StreamLocal to " + selected.SSH.Destination + ":" + selected.SSH.Socket
 				}
 				inspector.SetText(fmt.Sprintf("[yellow::b]Context %s[-:-:-]\n\n%s\n\nThis process is connected to the marked context.", escape(name), escape(transport)))
+				if name != contextName {
+					modal := tview.NewModal().SetText(tview.Escape(fmt.Sprintf("Switch from %s to %s?\n\nThe current transport will close and the stateless TUI will reconnect.", contextName, name))).AddButtons([]string{"Connect", "Cancel"})
+					modal.SetDoneFunc(func(buttonIndex int, _ string) {
+						pages.RemovePage("context-switch")
+						if buttonIndex == 0 {
+							switchContext = name
+							application.Stop()
+							return
+						}
+						application.SetFocus(navigation)
+					})
+					pages.AddPage("context-switch", centered(modal, 70, 13), true, true)
+					application.SetFocus(modal)
+				}
 			})
 		}
 
@@ -166,17 +201,13 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 				case "Flow":
 					add(key, label, func() {
 						currentRun, currentResource = "", cloneMessage(document)
-						flowResource, decodeErr := resource.DecodeFlow(document.GetJson())
-						if decodeErr != nil {
-							events.SetText("[red]" + escape(decodeErr.Error()))
-							return
-						}
-						plan, diagnostics := flow.NewCompiler(nil).Compile(flowResource)
-						if flow.HasErrors(diagnostics) {
-							events.SetText("[red]" + escape(diagnostics[0].Message))
+						plan, compileErr := compileFlowPlan(ctx, client, document)
+						if compileErr != nil {
+							events.SetText("[red]" + escape(compileErr.Error()))
 							return
 						}
 						graph.SetPlan(plan)
+						events.SetText("[green]Opened Flow/" + escape(document.GetKey().GetName()))
 						if selectedNode, ok := graph.Selected(); ok {
 							setInspector(selectedNode)
 						}
@@ -230,7 +261,7 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 			add(key, fmt.Sprintf("  %s:%s [%s]", plugin.GetName(), plugin.GetVersion(), plugin.GetState()), func() {
 				currentRun, currentResource = "", nil
 				inspector.SetText(fmt.Sprintf("[yellow::b]Plugin %s[-:-:-]\n\nVersion: %s\nState: %s\nDigest: %s\nCapabilities: %s", escape(plugin.GetName()), escape(plugin.GetVersion()), escape(plugin.GetState()), escape(plugin.GetDigest()), escape(strings.Join(plugin.GetCapabilities(), ", "))))
-				openPluginDetail(ctx, application, pages, client, plugin, events, navigation)
+				openPluginDetail(ctx, application, pages, client, plugin, sortedPlugins(snapshot), events, navigation)
 			})
 		}
 		add("heading/resources/SecretRef", "SecretRefs", nil)
@@ -274,24 +305,26 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 				if updated := snapshot.Resources[key]; updated != nil {
 					currentResource = cloneMessage(updated)
 					if currentResource.GetKey().GetKind() == "Flow" && currentResource.GetGeneration() != selectedGeneration {
-						flowResource, decodeErr := resource.DecodeFlow(currentResource.GetJson())
-						if decodeErr != nil {
-							events.SetText("[red]Unable to decode the updated Flow")
-						} else if plan, diagnostics := flow.NewCompiler(nil).Compile(flowResource); flow.HasErrors(diagnostics) {
-							events.SetText("[red]The updated Flow is invalid")
+						plan, compileErr := compileFlowPlan(ctx, client, currentResource)
+						if compileErr != nil {
+							events.SetText("[red]Unable to compile the updated Flow: " + escape(compileErr.Error()))
 						} else {
 							graph.SetPlan(plan)
 							if selectedNode, ok := graph.Selected(); ok {
 								setInspector(selectedNode)
+							} else if selectedEdge, index, ok := graph.SelectedEdge(); ok {
+								setEdgeInspector(selectedEdge, index)
 							}
 						}
 					} else if currentResource.GetKey().GetKind() != "Flow" {
 						showResourceInspector(inspector, currentResource)
 					}
 				} else {
+					deleted := currentResource.GetKey()
 					currentResource = nil
 					activeNavigationKey = ""
 					inspector.SetText("[yellow]The selected resource was deleted")
+					events.SetText("[yellow]Deleted " + escape(deleted.GetKind()+"/"+resourceDisplayName(deleted)))
 				}
 			}
 			if currentRun != "" {
@@ -311,14 +344,10 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 	rebuild("")
 	showLiveStatus(liveStatus, latest, "")
 	if flows := resourcesForKind(latest, "Flow"); len(flows) > 0 {
-		flowResource, decodeErr := resource.DecodeFlow(flows[0].GetJson())
-		if decodeErr == nil {
-			plan, diagnostics := flow.NewCompiler(nil).Compile(flowResource)
-			if !flow.HasErrors(diagnostics) {
-				graph.SetPlan(plan)
-				if selectedNode, ok := graph.Selected(); ok {
-					setInspector(selectedNode)
-				}
+		if plan, compileErr := compileFlowPlan(ctx, client, flows[0]); compileErr == nil {
+			graph.SetPlan(plan)
+			if selectedNode, ok := graph.Selected(); ok {
+				setInspector(selectedNode)
 			}
 		}
 	}
@@ -386,6 +415,22 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 			case 'g':
 				application.SetFocus(graph)
 				return nil
+			case 'n':
+				openCreateResource(ctx, application, pages, client, events, navigation)
+				return nil
+			case 'x':
+				if currentResource != nil {
+					openDeleteResource(ctx, application, pages, client, currentResource, events, navigation)
+					return nil
+				}
+			case 'S':
+				if currentResource != nil && currentResource.GetKey().GetKind() == "Flow" {
+					openStartFlow(ctx, application, pages, client, currentResource, events, graph)
+					return nil
+				}
+			case 'i':
+				openPluginInstall(ctx, application, pages, client, events, navigation)
+				return nil
 			case 'e':
 				if currentRun != "" {
 					openRunEvents(application, pages, latest, currentRun, graph)
@@ -420,7 +465,7 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 					return nil
 				}
 			case '?':
-				modal := tview.NewModal().SetText("Orchigram keys\n\n: command palette\n/ filter resources\nEnter: inspect or drill down\nh/j/k/l or arrows: select graph node\nw/a/s/d: pan graph (d describes a selected resource)\na/r: approve or reject selected run\nc: cancel selected run\ng: graph\ne: structured events, t: attempts, f: artifacts, l: logs\ny: YAML, E: edit form\nEsc: go back, q: quit").AddButtons([]string{"Close"})
+				modal := tview.NewModal().SetText("Orchigram keys\n\n: command palette, / filter\nEnter: inspect, edit selected Flow node/edge, or switch context\nTab/Shift-Tab: select graph nodes and edges\nh/j/k/l or arrows: directional graph navigation\nH/J/K/L: pan graph\nn: create resource, x: CAS delete, E: edit form\nS: start selected Flow, i: install plugin bundle\na/r: approve or reject selected run, c: cancel\ne: events, t: attempts, f: artifacts, l: logs\ny: YAML, g: graph\nEsc: go back, q: quit").AddButtons([]string{"Close"})
 				modal.SetDoneFunc(func(_ int, _ string) { pages.RemovePage("help"); application.SetFocus(graph) })
 				pages.AddPage("help", centered(modal, 58, 16), true, true)
 				application.SetFocus(modal)
@@ -433,12 +478,23 @@ func runWithApplicationContext(ctx context.Context, client *clientpkg.Client, ap
 	defer stopLive()
 	live.run(liveContext, handleSnapshot)
 	go func() { <-ctx.Done(); application.QueueUpdateDraw(application.Stop) }()
-	return application.SetRoot(pages, true).SetFocus(navigation).Run()
+	if err := application.SetRoot(pages, true).SetFocus(navigation).Run(); err != nil {
+		return err
+	}
+	if switchContext != "" {
+		return &ContextSwitchError{Name: switchContext}
+	}
+	return nil
 }
 
-func openPluginDetail(ctx context.Context, application *tview.Application, pages *tview.Pages, client *clientpkg.Client, plugin *controlv1alpha1.PluginInfo, events *tview.TextView, returnFocus tview.Primitive) {
-	modal := tview.NewModal().SetText(fmt.Sprintf("Plugin %s\n\nVersion: %s\nState: %s\nCapabilities: %s", plugin.GetName(), plugin.GetVersion(), plugin.GetState(), strings.Join(plugin.GetCapabilities(), ", "))).AddButtons([]string{"Doctor", "Enable", "Disable", "Close"})
+func openPluginDetail(ctx context.Context, application *tview.Application, pages *tview.Pages, client *clientpkg.Client, plugin *controlv1alpha1.PluginInfo, plugins []*controlv1alpha1.PluginInfo, events *tview.TextView, returnFocus tview.Primitive) {
+	modal := tview.NewModal().SetText(tview.Escape(fmt.Sprintf("Plugin %s\n\nVersion: %s\nState: %s\nCapabilities: %s", plugin.GetName(), plugin.GetVersion(), plugin.GetState(), strings.Join(plugin.GetCapabilities(), ", ")))).AddButtons([]string{"Doctor", "Activate", "Disable", "Rollback", "Close"})
 	modal.SetDoneFunc(func(buttonIndex int, _ string) {
+		if buttonIndex == 3 {
+			pages.RemovePage("plugin-detail")
+			openPluginRollback(ctx, application, pages, client, plugin, plugins, events, returnFocus)
+			return
+		}
 		operationContext, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 		var err error
@@ -466,7 +522,7 @@ func openPluginDetail(ctx context.Context, application *tview.Application, pages
 		pages.RemovePage("plugin-detail")
 		application.SetFocus(returnFocus)
 	})
-	pages.AddPage("plugin-detail", centered(modal, 82, 18), true, true)
+	pages.AddPage("plugin-detail", centered(modal, 76, 18), true, true)
 	application.SetFocus(modal)
 }
 
@@ -618,7 +674,7 @@ func openResourceForm(application *tview.Application, pages *tview.Pages, client
 		pages.RemovePage("resource-form")
 		application.SetFocus(returnFocus)
 	})
-	pages.AddPage("resource-form", centered(form, 82, min(28, len(fields)+8)), true, true)
+	pages.AddPage("resource-form", centered(form, 76, min(28, len(fields)+8)), true, true)
 	application.SetFocus(form)
 }
 

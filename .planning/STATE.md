@@ -2,10 +2,10 @@
 
 Status: active recovery milestone
 Current milestone: v0.1.0 First Real Release
-Current phase: 9 of 12
-Progress: 1/5 release phases
+Current phase: 10 of 12
+Progress: 2/5 release phases
 Last activity: 2026-08-09
-Current focus: complete keyboard-only TUI mutations and interactive graph editing on the live model
+Current focus: implement durable GitHub pull-request review events and same-branch changes-requested rework
 
 ## Reality check
 
@@ -57,12 +57,19 @@ The sixth Phase 9 gate now passes live resource tombstones, revision/sequence
 resume, daemon-socket restart recovery, run overlays and historical replay, and
 distinct event/attempt/artifact/log views in the same terminal process.
 
+The final Phase 9 gate now passes strict keyboard create/edit/CAS/delete/start,
+approval/rejection/cancellation, real plugin upload/activation/rollback/disable,
+and context reconnect paths. The same daemon-compiled graph supports node,
+forward/backward/self-loop edge selection and schema-backed edits by keyboard
+or mouse at supported sizes; a real 80x24 PTY test creates a Flow through the
+shipped binary. Phase 9 is complete.
+
 ## Active phase gate
 
-Phase 9 is complete only when typed plugin schemas and references fail before
-storage, the declared API/CLI contracts are executable, and a keyboard-only
-operator can edit and run the same interactive graph projection while watches,
-reconnect, attempt evidence, and artifacts remain live.
+Phase 10 is complete only when stable GitHub issue and pull-request review
+events drive one durable public issue-to-PR workflow through changes-requested
+rework, repeated checks, later approval, merge-ready notification, and a
+human-controlled merge without duplicate mutations or leaked credentials.
 
 ## Blockers
 

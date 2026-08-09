@@ -31,29 +31,50 @@ type Graph struct {
 	rects    map[string]nodeRect
 	order    []string
 	selected string
-	offsetX  int
-	offsetY  int
-	onOpen   func(flow.PlanNode)
-	onSelect func(flow.PlanNode)
-	status   map[string]string
+	// selectedEdge is -1 while a node is selected.
+	selectedEdge int
+	offsetX      int
+	offsetY      int
+	onOpen       func(flow.PlanNode)
+	onOpenEdge   func(flow.PlanEdge, int)
+	onSelect     func(flow.PlanNode)
+	onSelectEdge func(flow.PlanEdge, int)
+	status       map[string]string
 }
 
 // NewGraph constructs an empty focusable graph.
 func NewGraph() *Graph {
-	return &Graph{Box: tview.NewBox().SetBorder(true).SetTitle(" Graph "), rects: map[string]nodeRect{}, status: map[string]string{}}
+	return &Graph{Box: tview.NewBox().SetBorder(true).SetTitle(" Graph "), rects: map[string]nodeRect{}, selectedEdge: -1, status: map[string]string{}}
 }
 
 // SetPlan replaces the immutable definition and recalculates layout.
 func (g *Graph) SetPlan(plan flow.ExecutionPlan) *Graph {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	previousNode := g.selected
+	var previousEdge flow.PlanEdge
+	hadEdge := g.selectedEdge >= 0 && g.selectedEdge < len(g.plan.Edges)
+	if hadEdge {
+		previousEdge = g.plan.Edges[g.selectedEdge]
+	}
 	g.plan = plan
 	g.status = map[string]string{}
 	g.rects, g.order = layout(plan)
-	if len(g.order) > 0 {
+	g.selected, g.selectedEdge = "", -1
+	if _, exists := g.rects[previousNode]; previousNode != "" && exists {
+		g.selected = previousNode
+	} else if hadEdge {
+		for index, edge := range plan.Edges {
+			if edge == previousEdge {
+				g.selectedEdge = index
+				break
+			}
+		}
+	} else if len(g.order) > 0 {
 		g.selected = g.order[0]
-	} else {
-		g.selected = ""
+	}
+	if g.selected == "" && g.selectedEdge < 0 && len(g.order) > 0 {
+		g.selected = g.order[0]
 	}
 	g.offsetX, g.offsetY = 0, 0
 	return g
@@ -69,13 +90,28 @@ func (g *Graph) SetStatus(nodeID, status string) {
 // SetOnOpen registers Enter/double-click drill-down.
 func (g *Graph) SetOnOpen(callback func(flow.PlanNode)) *Graph { g.onOpen = callback; return g }
 
+// SetOnOpenEdge registers Enter/double-click drill-down for an edge.
+func (g *Graph) SetOnOpenEdge(callback func(flow.PlanEdge, int)) *Graph {
+	g.onOpenEdge = callback
+	return g
+}
+
 // SetOnSelect registers selection inspection.
 func (g *Graph) SetOnSelect(callback func(flow.PlanNode)) *Graph { g.onSelect = callback; return g }
+
+// SetOnSelectEdge registers edge selection inspection.
+func (g *Graph) SetOnSelectEdge(callback func(flow.PlanEdge, int)) *Graph {
+	g.onSelectEdge = callback
+	return g
+}
 
 // Selected returns the current node.
 func (g *Graph) Selected() (flow.PlanNode, bool) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
+	if g.selectedEdge >= 0 {
+		return flow.PlanNode{}, false
+	}
 	for _, node := range g.plan.Nodes {
 		if node.ID == g.selected {
 			return node, true
@@ -84,21 +120,32 @@ func (g *Graph) Selected() (flow.PlanNode, bool) {
 	return flow.PlanNode{}, false
 }
 
+// SelectedEdge returns the current edge and its stable plan index.
+func (g *Graph) SelectedEdge() (flow.PlanEdge, int, bool) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if g.selectedEdge < 0 || g.selectedEdge >= len(g.plan.Edges) {
+		return flow.PlanEdge{}, -1, false
+	}
+	return g.plan.Edges[g.selectedEdge], g.selectedEdge, true
+}
+
 // Draw renders clipped boxes and ASCII edges into the current viewport.
 func (g *Graph) Draw(screen tcell.Screen) {
 	g.DrawForSubclass(screen, g)
 	x, y, width, height := g.GetInnerRect()
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	for _, edge := range g.plan.Edges {
+	graphRight := rightmost(g.rects)
+	for index, edge := range g.plan.Edges {
 		from, fromOK := g.rects[edge.From]
 		to, toOK := g.rects[edge.To]
 		if !fromOK || !toOK {
 			continue
 		}
-		fromX, fromY := from.x+from.width-g.offsetX, from.y+from.height/2-g.offsetY
-		toX, toY := to.x-g.offsetX, to.y+to.height/2-g.offsetY
-		drawEdge(screen, x, y, width, height, fromX, fromY, toX, toY)
+		from.x, from.y = from.x-g.offsetX, from.y-g.offsetY
+		to.x, to.y = to.x-g.offsetX, to.y-g.offsetY
+		drawEdge(screen, x, y, width, height, from, to, graphRight-g.offsetX, index, index == g.selectedEdge)
 	}
 	for _, id := range g.order {
 		rect := g.rects[id]
@@ -106,7 +153,7 @@ func (g *Graph) Draw(screen tcell.Screen) {
 		if !ok {
 			continue
 		}
-		drawNode(screen, x, y, width, height, rect.x-g.offsetX, rect.y-g.offsetY, node, id == g.selected, g.status[id])
+		drawNode(screen, x, y, width, height, rect.x-g.offsetX, rect.y-g.offsetY, node, g.selectedEdge < 0 && id == g.selected, g.status[id])
 	}
 }
 
@@ -130,13 +177,13 @@ func (g *Graph) InputHandler() func(*tcell.EventKey, func(tview.Primitive)) {
 				g.moveDirectional(0, -1)
 			case 'l':
 				g.moveDirectional(1, 0)
-			case 'a':
+			case 'H':
 				g.pan(-4, 0)
-			case 'd':
+			case 'L':
 				g.pan(4, 0)
-			case 'w':
+			case 'K':
 				g.pan(0, -2)
-			case 's':
+			case 'J':
 				g.pan(0, 2)
 			}
 		default:
@@ -152,14 +199,33 @@ func (g *Graph) MouseHandler() func(tview.MouseAction, *tcell.EventMouse, func(t
 		switch action { //nolint:exhaustive // Unsupported mouse actions are intentionally ignored.
 		case tview.MouseLeftClick, tview.MouseLeftDoubleClick:
 			g.mu.Lock()
+			selected := false
 			for id, rect := range g.rects {
 				drawX, drawY := innerX+rect.x-g.offsetX, innerY+rect.y-g.offsetY
 				if x >= drawX && x < drawX+rect.width && y >= drawY && y < drawY+rect.height {
 					g.selected = id
+					g.selectedEdge = -1
+					selected = true
 					break
 				}
 			}
+			if !selected {
+				localX, localY := x-innerX+g.offsetX, y-innerY+g.offsetY
+				graphRight := rightmost(g.rects)
+				for index, edge := range g.plan.Edges {
+					from, fromOK := g.rects[edge.From]
+					to, toOK := g.rects[edge.To]
+					if fromOK && toOK && edgeContains(from, to, graphRight, index, localX, localY) {
+						g.selected, g.selectedEdge = "", index
+						selected = true
+						break
+					}
+				}
+			}
 			g.mu.Unlock()
+			if !selected {
+				return false, nil
+			}
 			g.notifySelection()
 			if action == tview.MouseLeftDoubleClick {
 				g.open()
@@ -185,25 +251,45 @@ func (g *Graph) MouseHandler() func(tview.MouseAction, *tcell.EventMouse, func(t
 
 func (g *Graph) step(delta int) {
 	g.mu.Lock()
-	if len(g.order) == 0 {
+	count := len(g.order) + len(g.plan.Edges)
+	if count == 0 {
 		g.mu.Unlock()
 		return
 	}
 	index := 0
-	for i, id := range g.order {
-		if id == g.selected {
-			index = i
-			break
+	if g.selectedEdge >= 0 {
+		index = len(g.order) + g.selectedEdge
+	} else {
+		for i, id := range g.order {
+			if id == g.selected {
+				index = i
+				break
+			}
 		}
 	}
-	index = (index + delta + len(g.order)) % len(g.order)
-	g.selected = g.order[index]
+	index = (index + delta + count) % count
+	if index < len(g.order) {
+		g.selected, g.selectedEdge = g.order[index], -1
+	} else {
+		g.selected, g.selectedEdge = "", index-len(g.order)
+	}
 	g.mu.Unlock()
 	g.notifySelection()
 }
 
 func (g *Graph) moveDirectional(dx, dy int) {
 	g.mu.Lock()
+	if g.selectedEdge >= 0 && g.selectedEdge < len(g.plan.Edges) {
+		edge := g.plan.Edges[g.selectedEdge]
+		g.selected = edge.To
+		if dx < 0 || dy < 0 {
+			g.selected = edge.From
+		}
+		g.selectedEdge = -1
+		g.mu.Unlock()
+		g.notifySelection()
+		return
+	}
 	current, ok := g.rects[g.selected]
 	if !ok {
 		g.mu.Unlock()
@@ -230,6 +316,7 @@ func (g *Graph) moveDirectional(dx, dy int) {
 	}
 	if best != "" {
 		g.selected = best
+		g.selectedEdge = -1
 	}
 	g.mu.Unlock()
 	g.notifySelection()
@@ -243,11 +330,23 @@ func (g *Graph) pan(dx, dy int) {
 }
 
 func (g *Graph) open() {
+	if edge, index, ok := g.SelectedEdge(); ok {
+		if g.onOpenEdge != nil {
+			g.onOpenEdge(edge, index)
+		}
+		return
+	}
 	if node, ok := g.Selected(); ok && g.onOpen != nil {
 		g.onOpen(node)
 	}
 }
 func (g *Graph) notifySelection() {
+	if edge, index, ok := g.SelectedEdge(); ok {
+		if g.onSelectEdge != nil {
+			g.onSelectEdge(edge, index)
+		}
+		return
+	}
 	if node, ok := g.Selected(); ok && g.onSelect != nil {
 		g.onSelect(node)
 	}
@@ -360,10 +459,16 @@ func horizontal(index, width int) rune {
 	return '─'
 }
 
-func drawEdge(screen tcell.Screen, vx, vy, vw, vh, fromX, fromY, toX, toY int) {
+func drawEdge(screen tcell.Screen, vx, vy, vw, vh int, from, to nodeRect, graphRight, index int, selected bool) {
+	color := tcell.ColorGray
+	if selected {
+		color = tcell.ColorYellow
+	}
+	fromX, fromY := from.x+from.width, from.y+from.height/2
+	toX, toY := to.x, to.y+to.height/2
 	if toX > fromX {
 		for x := fromX; x < toX; x++ {
-			put(screen, vx, vy, vw, vh, x, fromY, '─', tcell.ColorGray)
+			put(screen, vx, vy, vw, vh, x, fromY, '─', color)
 		}
 		if toY != fromY {
 			step := 1
@@ -371,11 +476,75 @@ func drawEdge(screen tcell.Screen, vx, vy, vw, vh, fromX, fromY, toX, toY int) {
 				step = -1
 			}
 			for y := fromY; y != toY; y += step {
-				put(screen, vx, vy, vw, vh, toX-1, y, '│', tcell.ColorGray)
+				put(screen, vx, vy, vw, vh, toX-1, y, '│', color)
 			}
 		}
-		put(screen, vx, vy, vw, vh, toX-1, toY, '▶', tcell.ColorGray)
+		put(screen, vx, vy, vw, vh, toX-1, toY, '▶', color)
+		return
 	}
+	gutterX := graphRight + 2 + index*2
+	for x := fromX; x <= gutterX; x++ {
+		put(screen, vx, vy, vw, vh, x, fromY, '─', color)
+	}
+	if from == to {
+		returnY := from.y + from.height - 2
+		for y := min(fromY, returnY); y <= max(fromY, returnY); y++ {
+			put(screen, vx, vy, vw, vh, gutterX, y, '│', color)
+		}
+		for x := fromX; x <= gutterX; x++ {
+			put(screen, vx, vy, vw, vh, x, returnY, '─', color)
+		}
+		put(screen, vx, vy, vw, vh, fromX, returnY, '◀', color)
+		return
+	}
+	targetY := to.y + 1
+	if index%2 == 1 {
+		targetY = to.y + to.height - 2
+	}
+	for y := min(fromY, targetY); y <= max(fromY, targetY); y++ {
+		put(screen, vx, vy, vw, vh, gutterX, y, '│', color)
+	}
+	targetRight := to.x + to.width
+	for x := targetRight; x <= gutterX; x++ {
+		put(screen, vx, vy, vw, vh, x, targetY, '─', color)
+	}
+	put(screen, vx, vy, vw, vh, targetRight, targetY, '◀', color)
+}
+
+func edgeContains(from, to nodeRect, graphRight, index, x, y int) bool {
+	fromX, fromY := from.x+from.width, from.y+from.height/2
+	toX, toY := to.x, to.y+to.height/2
+	if toX > fromX {
+		if y == fromY && x >= fromX && x < toX {
+			return true
+		}
+		lowY, highY := min(fromY, toY), max(fromY, toY)
+		return x == toX-1 && y >= lowY && y <= highY
+	}
+	gutterX := graphRight + 2 + index*2
+	if y == fromY && x >= fromX && x <= gutterX {
+		return true
+	}
+	if from == to {
+		returnY := from.y + from.height - 2
+		return x == gutterX && y >= min(fromY, returnY) && y <= max(fromY, returnY) ||
+			y == returnY && x >= fromX && x <= gutterX
+	}
+	targetRight := to.x + to.width
+	targetY := to.y + 1
+	if index%2 == 1 {
+		targetY = to.y + to.height - 2
+	}
+	return x == gutterX && y >= min(fromY, targetY) && y <= max(fromY, targetY) ||
+		y == targetY && x >= targetRight && x <= gutterX
+}
+
+func rightmost(rects map[string]nodeRect) int {
+	result := 0
+	for _, rect := range rects {
+		result = max(result, rect.x+rect.width)
+	}
+	return result
 }
 
 func put(screen tcell.Screen, vx, vy, vw, vh, x, y int, r rune, color tcell.Color) {
