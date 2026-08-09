@@ -36,6 +36,11 @@ jobs:
           args: release --clean --parallelism 1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+      - name: Attest checksummed release artifacts
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
         with:
-          subject-path: "dist/*"
+          subject-checksums: dist/checksums.txt
+      - name: Attest release checksum manifest
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: dist/checksums.txt
