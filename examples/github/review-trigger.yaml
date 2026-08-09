@@ -1,0 +1,20 @@
+apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata:
+  name: github-pull-request-reviews
+spec:
+  flow: github-issue-to-pr
+  provider:
+    plugin: github
+    source: github.reviews
+    config:
+      owner: alexrett
+      repository: orchigram-e2e
+      pollInterval: 30s
+      replayExisting: false
+      tokenSecret: token
+      secretRefs:
+        token: github-e2e-token
+  delivery:
+    mode: signal
+    node: wait_review

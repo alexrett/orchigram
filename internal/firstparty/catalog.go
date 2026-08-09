@@ -21,7 +21,7 @@ var catalog = []Plugin{
 	{Name: "exec", Command: "orchigram-plugin-exec", Capabilities: []string{"task.exec.run"}, Actions: execActionDescriptors()},
 	{Name: "github", Command: "orchigram-plugin-github", Capabilities: []string{
 		"trigger.github.issues", "trigger.github.reviews", pluginsdk.ActivationFenceCapability, "task.github.issue.get", "task.github.issue.comment",
-		"task.github.workspace.checkout", "task.github.workspace.commit-push", "task.github.pr.ensure",
+		"task.github.workspace.checkout", "task.github.workspace.commit-push", "task.github.pr.ensure", "task.github.commit.checks.wait",
 	}, Actions: githubActionDescriptors(), Triggers: githubTriggerDescriptors()},
 	{Name: "http", Command: "orchigram-plugin-http", Capabilities: []string{"task.http.request"}, Actions: httpActionDescriptors()},
 }

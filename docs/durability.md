@@ -28,6 +28,14 @@ ID. Pull-request closure between persistence and restart therefore cannot hide
 an unacknowledged event: polling includes marked closed PRs and resumes after
 the last durably acknowledged review tuple.
 
+GitHub check waiting is a repeatable read-only activity. It always queries an
+exact approved head SHA and reloads the pull request on every poll. A changed
+head returns a typed `stale` result to the Flow instead of making the newer PR
+merge-ready. The activity can be restarted without creating an external side
+effect. Pending observations are emitted as Run events; cancellation or the
+pinned node timeout stops polling. A failed check fails the node, while a
+successful snapshot is validated against the action's pinned output schema.
+
 Each non-core plan node pins the installed plugin name, version, bundle digest,
 negotiated protocol, canonical action schemas, and installed contract digest.
 It also snapshots the UID, generation, resource

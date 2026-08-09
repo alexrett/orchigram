@@ -6,11 +6,12 @@ run/node marker, waits for durable TUI approval, implements and tests the
 change, pushes a deterministic branch, and creates or reconciles a pull
 request. It never merges and never pushes the default branch.
 
-In v0.1, revisions are ordinary operator Git/GitHub pushes to the existing
-branch and pull request; Orchigram does not automate review events. A new
-provider-triggered Run has a new Run UID and therefore derives a new
-deterministic branch. Only normal GitHub review and merge controls can merge a
-pull request.
+The review Trigger resumes the same Run. `CHANGES_REQUESTED` sends top-level
+and inline feedback to the implementation agent, reruns the configured tests,
+and pushes the same deterministic branch. Stale approvals keep waiting. A
+current-head approval advances only after the named GitHub check runs and any
+legacy commit statuses pass. Orchigram then publishes a reconciled merge-ready
+comment; only normal GitHub controls and a human can merge the pull request.
 
 The example names the dedicated `alexrett/orchigram-e2e` repository from the
 v0.1 acceptance plan. Create it as a private test repository before running a
@@ -29,10 +30,13 @@ orchigram apply -f examples/github/planner-profile.yaml
 orchigram apply -f examples/github/implementer-profile.yaml
 orchigram apply -f examples/github/issue-to-pr-flow.yaml
 orchigram apply -f examples/github/ready-trigger.yaml
+orchigram apply -f examples/github/review-trigger.yaml
 ```
 
 Real execution is an explicit operator gate: first create a disposable issue,
 then add the `orchigram:ready` label. Rejecting the approval prevents the
 implementation, tests, commit, push, and PR nodes from running. Comments and
 PRs reconcile by hidden marker; the pushed branch is
-`orchigram/issue-{number}-{runShortID}`.
+`orchigram/issue-{number}-{runShortID}`. Apply both Triggers before adding the
+label, and ensure the `required` check names in the Flow match the target
+repository.

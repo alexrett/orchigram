@@ -28,7 +28,7 @@ spec:
     required: [repository, issue]
     additionalProperties: false
   policies:
-    timeout: 2h
+    timeout: 336h
     maxParallel: 1
   nodes:
     - id: fetch_issue
@@ -144,7 +144,7 @@ spec:
         mappings:
           - {from: nodes.checkout.branch, to: /head}
     - id: final_status
-      name: Publish final issue status
+      name: Publish merge-ready issue status
       uses: github.issue.comment
       with:
         owner: alexrett
@@ -152,9 +152,77 @@ spec:
         tokenSecret: token
         secretRefs: {token: github-e2e-token}
         number: 1
-        body: "Orchigram completed the run and reconciled PR ${nodes.create_pr.url}."
+        body: |-
+          Orchigram verified current-head approval and the configured GitHub
+          checks for PR ${nodes.create_pr.url}. It is merge-ready, but Orchigram
+          has not merged it; a human owns the final merge decision.
         mappings:
           - {from: nodes.fetch_issue.issue.number, to: /number}
+    - id: wait_review
+      name: Wait for submitted pull-request review
+      uses: core.event
+      timeout: 168h
+      loop: {maxIterations: 8}
+    - id: rework
+      name: Address requested review changes
+      uses: agent-command.run
+      timeout: 45m
+      with:
+        profile: github-implementer
+        workspace: .
+        prompt: |-
+          Address the GitHub review for issue #${nodes.fetch_issue.issue.number}.
+
+          Review state: ${nodes.wait_review.review.state}
+          Reviewer: ${nodes.wait_review.review.author}
+          Review body:
+          ${nodes.wait_review.review.body}
+
+          Inline comments as JSON:
+          ${nodes.wait_review.review.comments}
+
+          Modify only the supplied workspace. Do not commit, push, merge,
+          change credentials, or bypass tests.
+        mappings:
+          - {from: nodes.checkout.workspace, to: /workspace}
+    - id: retest
+      name: Rerun configured test gate
+      uses: exec.run
+      timeout: 20m
+      with:
+        argv: [go, test, ./...]
+        directory: .
+        mappings:
+          - {from: nodes.checkout.workspace, to: /directory}
+    - id: repush
+      name: Push reviewed changes to the same branch
+      uses: github.workspace.commit-push
+      timeout: 5m
+      with:
+        workspace: .
+        branch: orchigram/issue-1-placeholder
+        message: "Address review ${nodes.wait_review.review.id} for issue #${nodes.fetch_issue.issue.number}"
+        tokenSecret: token
+        secretRefs: {token: github-e2e-token}
+        mappings:
+          - {from: nodes.checkout.workspace, to: /workspace}
+          - {from: nodes.checkout.branch, to: /branch}
+    - id: wait_checks
+      name: Wait for current-head GitHub checks
+      uses: github.commit.checks.wait
+      timeout: 60m
+      with:
+        owner: alexrett
+        repository: orchigram-e2e
+        tokenSecret: token
+        secretRefs: {token: github-e2e-token}
+        ref: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        pullNumber: 1
+        required: [test]
+        pollInterval: 10s
+        mappings:
+          - {from: nodes.wait_review.pull.head_sha, to: /ref}
+          - {from: nodes.create_pr.number, to: /pullNumber}
   edges:
     - {from: fetch_issue, to: checkout}
     - {from: checkout, to: plan}
@@ -164,4 +232,13 @@ spec:
     - {from: implement, to: tests}
     - {from: tests, to: push}
     - {from: push, to: create_pr}
-    - {from: create_pr, to: final_status}
+    - {from: create_pr, to: wait_review}
+    - {from: wait_review, to: rework, when: 'result.review.state == "CHANGES_REQUESTED" && result.review.commit_id == result.pull.head_sha'}
+    - {from: rework, to: retest}
+    - {from: retest, to: repush}
+    - {from: repush, to: wait_review}
+    - {from: wait_review, to: wait_review, when: 'result.review.state == "CHANGES_REQUESTED" && result.review.commit_id != result.pull.head_sha'}
+    - {from: wait_review, to: wait_review, when: 'result.review.state == "APPROVED" && result.review.commit_id != result.pull.head_sha'}
+    - {from: wait_review, to: wait_checks, when: 'result.review.state == "APPROVED" && result.review.commit_id == result.pull.head_sha'}
+    - {from: wait_checks, to: wait_review, when: 'result.state == "stale"'}
+    - {from: wait_checks, to: final_status, when: 'result.state == "success"'}

@@ -36,6 +36,7 @@ const (
 )
 
 var orchigramRunMarker = regexp.MustCompile(`<!-- orchigram:run=([A-Za-z0-9][A-Za-z0-9._:-]{0,127});node=[A-Za-z0-9][A-Za-z0-9._:-]{0,127};idempotency=[0-9a-f]{64} -->`)
+var gitObjectID = regexp.MustCompile(`^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$`)
 
 // Capabilities are declared by the first-party GitHub bundle.
 var Capabilities = func() []string {
@@ -104,6 +105,14 @@ type pullRequestConfig struct {
 	Body  string `json:"body,omitempty"`
 }
 
+type checkWaitConfig struct {
+	repositoryConfig
+	Ref          string   `json:"ref"`
+	PullNumber   int      `json:"pullNumber"`
+	Required     []string `json:"required"`
+	PollInterval string   `json:"pollInterval,omitempty"`
+}
+
 type issue struct {
 	Number  int    `json:"number"`
 	Title   string `json:"title"`
@@ -144,16 +153,72 @@ type reviewRecord struct {
 	} `json:"user"`
 }
 
+type reviewComment struct {
+	ID           int64  `json:"id"`
+	Body         string `json:"body"`
+	Path         string `json:"path"`
+	Line         *int   `json:"line"`
+	OriginalLine *int   `json:"original_line"`
+	Side         string `json:"side"`
+	HTMLURL      string `json:"html_url"`
+}
+
+type reviewCommentPayload struct {
+	ID      int64  `json:"id"`
+	Body    string `json:"body"`
+	Path    string `json:"path"`
+	Line    int    `json:"line"`
+	Side    string `json:"side"`
+	HTMLURL string `json:"html_url"`
+}
+
 type reviewCursor struct {
 	SubmittedAt time.Time `json:"submittedAt"`
 	ReviewID    int64     `json:"reviewID"`
 }
 
 type submittedReview struct {
-	Cursor reviewCursor
-	RunUID string
-	Pull   pullRecord
-	Review reviewRecord
+	Cursor   reviewCursor
+	RunUID   string
+	Pull     pullRecord
+	Review   reviewRecord
+	Comments []reviewCommentPayload
+}
+
+type checkRunRecord struct {
+	Name       string `json:"name"`
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
+	DetailsURL string `json:"details_url"`
+	HeadSHA    string `json:"head_sha"`
+}
+
+type commitStatusRecord struct {
+	Context     string `json:"context"`
+	State       string `json:"state"`
+	Description string `json:"description"`
+	TargetURL   string `json:"target_url"`
+}
+
+type checkSummary struct {
+	Name       string `json:"name"`
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
+	URL        string `json:"url"`
+}
+
+type statusSummary struct {
+	Context     string `json:"context"`
+	State       string `json:"state"`
+	Description string `json:"description"`
+	URL         string `json:"url"`
+}
+
+type checkSnapshot struct {
+	HeadSHA  string          `json:"headSha"`
+	State    string          `json:"state"`
+	Checks   []checkSummary  `json:"checks"`
+	Statuses []statusSummary `json:"statuses"`
 }
 
 // ValidateAction validates action-specific JSON without network access.
@@ -196,6 +261,12 @@ func (*Runtime) ValidateAction(_ context.Context, action string, configJSON json
 		if err == nil && (config.Head == "" || config.Base == "" || config.Title == "") {
 			err = errors.New("head, base, and title are required")
 		}
+	case "github.commit.checks.wait":
+		var config checkWaitConfig
+		err = decodeStrict(configJSON, &config)
+		if err == nil {
+			err = validateCheckWait(config)
+		}
 	default:
 		err = fmt.Errorf("unsupported action %q", action)
 	}
@@ -223,6 +294,8 @@ func (r *Runtime) Execute(ctx context.Context, request pluginsdk.TaskRequest, si
 		output, err = r.commitPush(ctx, request, sink)
 	case "github.pr.ensure":
 		output, err = r.ensurePullRequest(ctx, request)
+	case "github.commit.checks.wait":
+		output, err = r.waitForCommitChecks(ctx, request, sink)
 	default:
 		err = fmt.Errorf("unsupported action %q", request.Action)
 	}
@@ -386,6 +459,7 @@ func (r *Runtime) watchReviews(stream pluginv1alpha1.TriggerProvider_WatchServer
 				"review": map[string]any{
 					"id": event.Review.ID, "state": strings.ToUpper(event.Review.State), "body": event.Review.Body,
 					"author": event.Review.User.Login, "submitted_at": event.Review.SubmittedAt.UTC().Format(time.RFC3339Nano), "commit_id": event.Review.CommitID,
+					"comments": event.Comments,
 				},
 			})
 			if marshalErr != nil {
@@ -456,7 +530,11 @@ func (r *Runtime) listSubmittedReviews(ctx context.Context, config reviewWatchCo
 					if !reviewCursorAfter(eventCursor, cursor) || (!activatedAt.IsZero() && review.SubmittedAt.Before(activatedAt)) {
 						continue
 					}
-					result = append(result, submittedReview{Cursor: eventCursor, RunUID: runUID, Pull: pull, Review: review})
+					comments, commentErr := r.listReviewComments(ctx, config, token, pull.Number, review.ID)
+					if commentErr != nil {
+						return nil, commentErr
+					}
+					result = append(result, submittedReview{Cursor: eventCursor, RunUID: runUID, Pull: pull, Review: review, Comments: comments})
 				}
 			}
 			if reviewsNext != "" {
@@ -473,6 +551,36 @@ func (r *Runtime) listSubmittedReviews(ctx context.Context, config reviewWatchCo
 		}
 		return result[i].Cursor.SubmittedAt.Before(result[j].Cursor.SubmittedAt)
 	})
+	return result, nil
+}
+
+func (r *Runtime) listReviewComments(ctx context.Context, config reviewWatchConfig, token []byte, pullNumber int, reviewID int64) ([]reviewCommentPayload, error) {
+	base := apiBase(config.APIBase)
+	next := fmt.Sprintf("%s/repos/%s/%s/pulls/%d/reviews/%d/comments?per_page=100", base, url.PathEscape(config.Owner), url.PathEscape(config.Repository), pullNumber, reviewID)
+	result := []reviewCommentPayload{}
+	for page := 0; next != "" && page < 100; page++ {
+		var comments []reviewComment
+		headers, err := r.getJSON(ctx, next, token, &comments)
+		if err != nil {
+			return nil, err
+		}
+		next = nextLink(headers.Get("Link"))
+		for _, comment := range comments {
+			if comment.ID <= 0 || strings.TrimSpace(comment.Path) == "" {
+				return nil, status.Errorf(codes.FailedPrecondition, "GitHub review comment for review %d is missing required identity fields", reviewID)
+			}
+			line := 0
+			if comment.Line != nil {
+				line = *comment.Line
+			} else if comment.OriginalLine != nil {
+				line = *comment.OriginalLine
+			}
+			result = append(result, reviewCommentPayload{ID: comment.ID, Body: comment.Body, Path: comment.Path, Line: line, Side: comment.Side, HTMLURL: comment.HTMLURL})
+		}
+	}
+	if next != "" {
+		return nil, status.Errorf(codes.ResourceExhausted, "GitHub comment pagination for review %d exceeds 100 pages", reviewID)
+	}
 	return result, nil
 }
 
@@ -709,6 +817,243 @@ func (r *Runtime) ensurePullRequest(ctx context.Context, request pluginsdk.TaskR
 		return nil, err
 	}
 	return map[string]any{"number": created.Number, "url": created.HTMLURL, "reconciled": false, "marker": marker}, nil
+}
+
+func validateCheckWait(config checkWaitConfig) error {
+	if err := validateRepository(config.repositoryConfig); err != nil {
+		return err
+	}
+	if !gitObjectID.MatchString(config.Ref) {
+		return errors.New("ref must be an exact 40- or 64-character Git object ID")
+	}
+	if config.PullNumber <= 0 {
+		return errors.New("positive pullNumber is required")
+	}
+	if len(config.Required) == 0 {
+		return errors.New("at least one required check name is required")
+	}
+	seen := map[string]bool{}
+	for _, name := range config.Required {
+		if strings.TrimSpace(name) == "" || name != strings.TrimSpace(name) {
+			return errors.New("required check names must be non-empty and must not have surrounding whitespace")
+		}
+		if seen[name] {
+			return fmt.Errorf("required check name %q is duplicated", name)
+		}
+		seen[name] = true
+	}
+	if config.PollInterval != "" {
+		interval, err := time.ParseDuration(config.PollInterval)
+		if err != nil || interval <= 0 {
+			return errors.New("pollInterval must be positive")
+		}
+	}
+	return nil
+}
+
+func (r *Runtime) waitForCommitChecks(ctx context.Context, request pluginsdk.TaskRequest, sink pluginsdk.EventSink) (any, error) {
+	var config checkWaitConfig
+	if err := decodeStrict(request.Config, &config); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if err := validateCheckWait(config); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	token, err := secret(request.Secrets, config.TokenSecret)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	interval := 5 * time.Second
+	if config.PollInterval != "" {
+		interval, _ = time.ParseDuration(config.PollInterval)
+	}
+	for {
+		currentHead, headErr := r.pullRequestHead(ctx, config, token)
+		if headErr != nil {
+			return nil, headErr
+		}
+		if !strings.EqualFold(currentHead, config.Ref) {
+			snapshot := checkSnapshot{HeadSHA: strings.ToLower(config.Ref), State: "stale", Checks: []checkSummary{}, Statuses: []statusSummary{}}
+			if err := sink.Emit("github.checks.stale", snapshot); err != nil {
+				return nil, err
+			}
+			return snapshot, nil
+		}
+		snapshot, snapshotErr := r.commitCheckSnapshot(ctx, config, token)
+		if snapshotErr != nil {
+			return nil, snapshotErr
+		}
+		snapshot.State = evaluateCheckSnapshot(snapshot, config.Required)
+		if snapshot.State == "success" {
+			finalHead, finalHeadErr := r.pullRequestHead(ctx, config, token)
+			if finalHeadErr != nil {
+				return nil, finalHeadErr
+			}
+			if !strings.EqualFold(finalHead, config.Ref) {
+				snapshot.State = "stale"
+				if err := sink.Emit("github.checks.stale", snapshot); err != nil {
+					return nil, err
+				}
+				return snapshot, nil
+			}
+			if err := sink.Emit("github.checks.succeeded", snapshot); err != nil {
+				return nil, err
+			}
+			return snapshot, nil
+		}
+		if snapshot.State == "failure" {
+			if err := sink.Emit("github.checks.failed", snapshot); err != nil {
+				return nil, err
+			}
+			return nil, status.Error(codes.FailedPrecondition, "required GitHub checks or commit statuses failed")
+		}
+		if err := sink.Emit("github.checks.pending", snapshot); err != nil {
+			return nil, err
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (r *Runtime) pullRequestHead(ctx context.Context, config checkWaitConfig, token []byte) (string, error) {
+	endpoint := fmt.Sprintf("%s/repos/%s/%s/pulls/%d", apiBase(config.APIBase), url.PathEscape(config.Owner), url.PathEscape(config.Repository), config.PullNumber)
+	var pull struct {
+		State string `json:"state"`
+		Head  struct {
+			SHA string `json:"sha"`
+		} `json:"head"`
+	}
+	if _, err := r.getJSON(ctx, endpoint, token, &pull); err != nil {
+		return "", err
+	}
+	if pull.State != "open" || !gitObjectID.MatchString(pull.Head.SHA) {
+		return "", status.Error(codes.FailedPrecondition, "GitHub pull request is not open with a valid head SHA")
+	}
+	return pull.Head.SHA, nil
+}
+
+func (r *Runtime) commitCheckSnapshot(ctx context.Context, config checkWaitConfig, token []byte) (checkSnapshot, error) {
+	base := apiBase(config.APIBase)
+	checksNext := fmt.Sprintf("%s/repos/%s/%s/commits/%s/check-runs?filter=latest&per_page=100", base, url.PathEscape(config.Owner), url.PathEscape(config.Repository), url.PathEscape(config.Ref))
+	checks := []checkSummary{}
+	resolvedSHA := ""
+	for page := 0; checksNext != "" && page < 100; page++ {
+		var payload struct {
+			CheckRuns []checkRunRecord `json:"check_runs"`
+		}
+		headers, err := r.getJSON(ctx, checksNext, token, &payload)
+		if err != nil {
+			return checkSnapshot{}, err
+		}
+		checksNext = nextLink(headers.Get("Link"))
+		for _, run := range payload.CheckRuns {
+			if strings.TrimSpace(run.Name) == "" || strings.TrimSpace(run.Status) == "" {
+				return checkSnapshot{}, status.Error(codes.FailedPrecondition, "GitHub returned a check run without a name or status")
+			}
+			if run.HeadSHA != "" {
+				if resolvedSHA != "" && !strings.EqualFold(resolvedSHA, run.HeadSHA) {
+					return checkSnapshot{}, status.Error(codes.FailedPrecondition, "GitHub returned check runs for different head commits")
+				}
+				resolvedSHA = run.HeadSHA
+			}
+			checks = append(checks, checkSummary{Name: run.Name, Status: strings.ToLower(run.Status), Conclusion: strings.ToLower(run.Conclusion), URL: run.DetailsURL})
+		}
+	}
+	if checksNext != "" {
+		return checkSnapshot{}, status.Error(codes.ResourceExhausted, "GitHub check-run pagination exceeds 100 pages")
+	}
+
+	statusesNext := fmt.Sprintf("%s/repos/%s/%s/commits/%s/status?per_page=100", base, url.PathEscape(config.Owner), url.PathEscape(config.Repository), url.PathEscape(config.Ref))
+	statuses := []statusSummary{}
+	combinedState := ""
+	for page := 0; statusesNext != "" && page < 100; page++ {
+		var payload struct {
+			State    string               `json:"state"`
+			SHA      string               `json:"sha"`
+			Statuses []commitStatusRecord `json:"statuses"`
+		}
+		headers, err := r.getJSON(ctx, statusesNext, token, &payload)
+		if err != nil {
+			return checkSnapshot{}, err
+		}
+		statusesNext = nextLink(headers.Get("Link"))
+		if combinedState == "" {
+			combinedState = strings.ToLower(payload.State)
+		}
+		if payload.SHA != "" {
+			if resolvedSHA != "" && !strings.EqualFold(resolvedSHA, payload.SHA) {
+				return checkSnapshot{}, status.Error(codes.FailedPrecondition, "GitHub checks and commit statuses resolved to different head commits")
+			}
+			resolvedSHA = payload.SHA
+		}
+		for _, item := range payload.Statuses {
+			if strings.TrimSpace(item.Context) == "" || strings.TrimSpace(item.State) == "" {
+				return checkSnapshot{}, status.Error(codes.FailedPrecondition, "GitHub returned a commit status without a context or state")
+			}
+			statuses = append(statuses, statusSummary{Context: item.Context, State: strings.ToLower(item.State), Description: item.Description, URL: item.TargetURL})
+		}
+	}
+	if statusesNext != "" {
+		return checkSnapshot{}, status.Error(codes.ResourceExhausted, "GitHub commit-status pagination exceeds 100 pages")
+	}
+	if resolvedSHA == "" {
+		resolvedSHA = strings.ToLower(config.Ref)
+	}
+	if !strings.EqualFold(resolvedSHA, config.Ref) {
+		return checkSnapshot{}, status.Error(codes.FailedPrecondition, "GitHub resolved checks for a different commit than the requested head SHA")
+	}
+	if len(statuses) > 0 && combinedState != "" {
+		statuses = append(statuses, statusSummary{Context: "github/combined-status", State: combinedState})
+	}
+	sort.Slice(checks, func(i, j int) bool { return checks[i].Name < checks[j].Name })
+	sort.Slice(statuses, func(i, j int) bool { return statuses[i].Context < statuses[j].Context })
+	return checkSnapshot{HeadSHA: strings.ToLower(resolvedSHA), State: "pending", Checks: checks, Statuses: statuses}, nil
+}
+
+func evaluateCheckSnapshot(snapshot checkSnapshot, required []string) string {
+	byName := make(map[string][]checkSummary, len(snapshot.Checks))
+	for _, check := range snapshot.Checks {
+		byName[check.Name] = append(byName[check.Name], check)
+	}
+	pending := false
+	for _, name := range required {
+		checks := byName[name]
+		if len(checks) == 0 {
+			pending = true
+			continue
+		}
+		for _, check := range checks {
+			if check.Status != "completed" {
+				pending = true
+				continue
+			}
+			switch check.Conclusion {
+			case "success", "neutral", "skipped":
+			default:
+				return "failure"
+			}
+		}
+	}
+	for _, commitStatus := range snapshot.Statuses {
+		switch commitStatus.State {
+		case "success":
+		case "failure", "error":
+			return "failure"
+		case "pending":
+			pending = true
+		default:
+			return "failure"
+		}
+	}
+	if pending {
+		return "pending"
+	}
+	return "success"
 }
 
 func (r *Runtime) getJSON(ctx context.Context, endpoint string, token []byte, target any) (http.Header, error) {

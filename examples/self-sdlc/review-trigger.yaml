@@ -1,0 +1,20 @@
+apiVersion: orchigram.dev/v1alpha1
+kind: Trigger
+metadata:
+  name: self-sdlc-pull-request-reviews
+spec:
+  flow: self-sdlc-issue-to-pr
+  provider:
+    plugin: github
+    source: github.reviews
+    config:
+      owner: REPLACE_WITH_GITHUB_OWNER
+      repository: REPLACE_WITH_REPOSITORY
+      pollInterval: 30s
+      replayExisting: false
+      tokenSecret: token
+      secretRefs:
+        token: self-sdlc-github-token
+  delivery:
+    mode: signal
+    node: wait_review
