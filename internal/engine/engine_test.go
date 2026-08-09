@@ -109,24 +109,6 @@ func TestRemoveFinishedRunPrunesOnlyFrameworkHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForPhase(ctx, t, state, payload.RunUID, "succeeded")
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		instance, findErr := adapter.findInstance(ctx, payload.RunUID)
-		if findErr != nil {
-			t.Fatal(findErr)
-		}
-		frameworkState, stateErr := adapter.client.GetWorkflowInstanceState(ctx, instance)
-		if stateErr != nil {
-			t.Fatal(stateErr)
-		}
-		if frameworkState == core.WorkflowInstanceStateFinished {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("framework state remained %v", frameworkState)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
 	if err := adapter.RemoveFinishedRun(ctx, payload.RunUID); err != nil {
 		t.Fatal(err)
 	}

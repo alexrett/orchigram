@@ -295,14 +295,31 @@ func (a *Adapter) Reconcile(ctx context.Context) error {
 func (a *Adapter) RemoveFinishedRun(ctx context.Context, runUID string) error {
 	a.lifecycle.Lock()
 	defer a.lifecycle.Unlock()
-	instance, err := a.findInstance(ctx, runUID)
-	if errors.Is(err, store.ErrNotFound) {
-		return nil
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		instance, err := a.findInstance(ctx, runUID)
+		if errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		state, err := a.client.GetWorkflowInstanceState(ctx, instance)
+		if err != nil {
+			return err
+		}
+		if state == core.WorkflowInstanceStateFinished {
+			return a.client.RemoveWorkflowInstance(ctx, instance)
+		}
+		if time.Now().After(deadline) {
+			return errors.New("workflow instance did not become terminal within the retention deadline")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
-	if err != nil {
-		return err
-	}
-	return a.client.RemoveWorkflowInstance(ctx, instance)
 }
 
 // Describe returns the framework-independent run projection.
