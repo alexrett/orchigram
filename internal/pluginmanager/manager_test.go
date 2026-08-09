@@ -36,6 +36,37 @@ import (
 
 const conformanceVersion = "0.1.0"
 
+func TestAcceptedCancellationWaitsForTerminalCallRelease(t *testing.T) {
+	done := make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	released := make(chan bool, 1)
+	go func() { released <- awaitProviderCallTermination(ctx, done) }()
+	select {
+	case result := <-released:
+		t.Fatalf("accepted cancellation returned before terminal release: %t", result)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(done)
+	select {
+	case result := <-released:
+		if !result {
+			t.Fatal("terminal call release was reported as a timeout")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("terminal call release did not unblock cancellation")
+	}
+}
+
+func TestAcceptedCancellationWaitIsBounded(t *testing.T) {
+	done := make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if awaitProviderCallTermination(ctx, done) {
+		t.Fatal("non-cooperative call was reported as released")
+	}
+}
+
 func TestMain(m *testing.M) {
 	if os.Getenv(pluginsdk.Handshake.MagicCookieKey) == pluginsdk.Handshake.MagicCookieValue {
 		executable, _ := os.Executable()
